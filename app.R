@@ -3701,6 +3701,24 @@ cutrun_tabular_data_rows <- function(path) {
   as.integer(max(lines - 1, 0))
 }
 
+write_cutrun_project_summary <- function(project, kind = c("peak_calling", "differential")) {
+  kind <- match.arg(kind)
+  out_dir <- file.path(project$data_dir, "cutrun_summaries")
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  if (identical(kind, "peak_calling")) {
+    table <- cutrun_seacr_peak_summary_table(project)
+    tsv <- file.path(out_dir, "peak_calling_summary.tsv")
+    utils::write.table(table, tsv, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+    xlsx <- file.path(out_dir, "peak_calling_summary.xlsx")
+    if (requireNamespace("openxlsx", quietly = TRUE)) write_cutrun_peak_summary_xlsx(project, xlsx)
+    return(list(tsv = tsv, xlsx = if (file.exists(xlsx)) xlsx else "", rows = NROW(table)))
+  }
+  table <- cutrun_diffbind_summary_table(project)
+  tsv <- file.path(out_dir, "differential_peak_comparison_summary.tsv")
+  utils::write.table(table, tsv, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  list(tsv = tsv, xlsx = "", rows = NROW(table))
+}
+
 cutrun_diffbind_result_dirs <- function(project) {
   root <- file.path(project$data_dir, "cutrun_diffbind")
   if (!dir.exists(root)) return(character(0))
@@ -11510,6 +11528,7 @@ server <- function(input, output, session) {
           )),
           div(class = "tool-body",
             tags$p(class = "muted small-note", "Columns are added automatically as new peak callers/settings are completed and are removed if their output folders are deleted."),
+            actionButton("run_cutrun_peak_calling_summary", "Generate/update peak-calling summary", class = "btn-primary"),
             downloadButton("download_cutrun_peak_calling_run_summary", "Download peak-calling summary"), br(), br(),
             table_output("cutrun_peak_calling_run_summary")
           )
@@ -11538,6 +11557,7 @@ server <- function(input, output, session) {
           )),
           div(class = "tool-body",
             tags$p(class = "muted small-note", "This is a project-wide summary; it remains available while other MACS2, SEACR, or shared-overlap DiffBind jobs are running."),
+            actionButton("run_cutrun_diffbind_summary", "Generate/update differential-peak summary", class = "btn-primary"),
             downloadButton("download_cutrun_diffbind_run_summary", "Download comparison summary"), br(), br(),
             table_output("cutrun_diffbind_run_summary")
           )
@@ -12168,6 +12188,26 @@ server <- function(input, output, session) {
       samples = samples
     )
   })
+  observeEvent(input$run_cutrun_peak_calling_summary, {
+    result <- tryCatch(write_cutrun_project_summary(current_project(), "peak_calling"), error = function(e) e)
+    if (inherits(result, "error")) {
+      showNotification(paste("Could not create peak-calling summary:", conditionMessage(result)), type = "error", duration = NULL)
+    } else {
+      files <- c(result$tsv, result$xlsx)
+      files <- files[nzchar(files)]
+      showNotification(paste("Peak-calling summary updated:", paste(files, collapse = " | ")), type = "message", duration = 10)
+      safe_refresh_progress_now("CUT&RUN peak-calling summary")
+    }
+  }, ignoreInit = TRUE)
+  observeEvent(input$run_cutrun_diffbind_summary, {
+    result <- tryCatch(write_cutrun_project_summary(current_project(), "differential"), error = function(e) e)
+    if (inherits(result, "error")) {
+      showNotification(paste("Could not create differential-peak summary:", conditionMessage(result)), type = "error", duration = NULL)
+    } else {
+      showNotification(paste("Differential-peak summary updated:", result$tsv), type = "message", duration = 10)
+      safe_refresh_progress_now("CUT&RUN differential-peak summary")
+    }
+  }, ignoreInit = TRUE)
   observeEvent(input$run_peak_annotation, {
     inputs <- peak_annotation_input_files(current_project())
     run_submission(
