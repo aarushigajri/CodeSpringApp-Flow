@@ -1127,5 +1127,28 @@ assert(identical(app_env$pipeline_order(counts_project), c("Design matrix", "DES
 modeled_design <- app_env$deseq_design_for_column(counts_project, "treatment", "batch")
 modeled_df <- read.delim(modeled_design, check.names = FALSE)
 assert(identical(names(modeled_df), c("sample", "batch", "treatment", "filename")), "selected covariates are retained and the comparison variable is modeled last")
+dir.create(file.path(counts_only_root, "deseq2"), recursive = TRUE, showWarnings = FALSE)
+writeLines(
+  "DESCRIPTION\tS1\tS2\tS3",
+  file.path(counts_only_root, "deseq2", "normalized_counts_Treated_vs_Control(ref).txt")
+)
+completed_deseq <- app_env$completed_deseq_comparison_catalog(counts_project)
+assert(
+  NROW(completed_deseq) == 1L &&
+    identical(completed_deseq$compare_col[[1]], "treatment") &&
+    identical(completed_deseq$comparison[[1]], "Treated") &&
+    identical(completed_deseq$reference[[1]], "Control"),
+  "GSEA discovers completed DESeq2 comparisons and maps them to the correct design column"
+)
+assert(
+  grepl("Comparisons (select one or more)", app_text, fixed = TRUE) &&
+    grepl("vapply(comparisons, function(comparison)", app_text, fixed = TRUE),
+  "DESeq2 supports submitting multiple selected comparisons as independent jobs"
+)
+assert(
+  grepl("Completed DESeq2 comparison", app_text, fixed = TRUE) &&
+    grepl("completed_deseq_comparison_catalog(current_project())", app_text, fixed = TRUE),
+  "GSEA has an independent dropdown populated from completed DESeq2 runs"
+)
 
 cat("CodeSpringApp fake-data helper smoke tests passed.\n")

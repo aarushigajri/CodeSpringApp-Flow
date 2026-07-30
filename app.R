@@ -5749,6 +5749,48 @@ resolve_comparison_inputs <- function(project, compare_col = NULL, reference = N
   list(compare_col = compare_col, reference = reference, comparison = comparison, values = vals)
 }
 
+completed_deseq_comparison_catalog <- function(project) {
+  deseq_dir <- file.path(project$data_dir, "deseq2")
+  files <- if (dir.exists(deseq_dir)) {
+    list.files(deseq_dir, pattern = "^normalized_counts_.*\\(ref\\)\\.txt$", full.names = TRUE)
+  } else {
+    character(0)
+  }
+  if (!length(files)) return(data.frame())
+  design <- project_design_df(project)
+  compare_cols <- design_compare_columns(project)
+  rows <- lapply(files, function(path) {
+    hit <- regmatches(basename(path), regexec("^normalized_counts_(.*)_vs_(.*)\\(ref\\)\\.txt$", basename(path)))[[1]]
+    if (length(hit) != 3L) return(NULL)
+    comparison <- hit[[2]]
+    reference <- hit[[3]]
+    candidates <- compare_cols[vapply(compare_cols, function(column) {
+      all(c(reference, comparison) %in% as.character(design[[column]]))
+    }, logical(1))]
+    compare_col <- if (length(candidates) == 1L) candidates[[1]] else ""
+    key <- paste(compare_col, reference, comparison, sep = "\r")
+    label <- if (nzchar(compare_col)) {
+      format_comparison_label(compare_col, comparison, reference)
+    } else {
+      paste(comparison, "vs", reference)
+    }
+    data.frame(
+      key = key,
+      label = label,
+      compare_col = compare_col,
+      reference = reference,
+      comparison = comparison,
+      path = path,
+      stringsAsFactors = FALSE
+    )
+  })
+  rows <- Filter(NROW, rows)
+  if (!length(rows)) return(data.frame())
+  out <- do.call(rbind, rows)
+  out <- out[!duplicated(out$key), , drop = FALSE]
+  out[order(out$label), , drop = FALSE]
+}
+
 sample_progress_step_table <- function(progress_df, step) {
   if (!NROW(progress_df) || !"step" %in% names(progress_df)) return(NULL)
   hit <- progress_df[progress_df$step == step, , drop = FALSE]
@@ -11842,16 +11884,25 @@ server <- function(input, output, session) {
     if (!selected_col %in% cols) selected_col <- cols[[1]]
     vals <- design_compare_values(p, selected_col)
     ref <- input$deseq_reference %||% if (length(vals)) vals[[1]] else ""
-    comp <- input$deseq_comparison %||% if (length(vals) > 1) vals[[2]] else ref
     ref <- selected_choice(ref, vals, if (length(vals)) vals[[1]] else "")
-    comp <- selected_choice(comp, vals, if (length(vals) > 1) vals[[2]] else ref)
+    comparison_choices <- vals[vals != ref]
+    requested_comparisons <- unique(as.character(input$deseq_comparisons %||% input$deseq_comparison %||% character(0)))
+    selected_comparisons <- intersect(requested_comparisons, comparison_choices)
+    if (!length(selected_comparisons) && length(comparison_choices)) selected_comparisons <- comparison_choices[[1]]
     covariate_choices <- deseq_model_columns(p, selected_col)
     selected_covariates <- intersect(input$deseq_model_cols %||% character(0), covariate_choices)
     formula_text <- paste(c(selected_covariates, selected_col), collapse = " + ")
     tagList(
       selectInput("deseq_compare_col", "Comparison column", choices = cols, selected = selected_col, selectize = FALSE),
       selectInput("deseq_reference", "Reference/baseline", choices = vals, selected = ref, selectize = FALSE),
-      selectInput("deseq_comparison", "Comparison", choices = vals, selected = comp, selectize = FALSE),
+      selectizeInput(
+        "deseq_comparisons",
+        "Comparisons (select one or more)",
+        choices = comparison_choices,
+        selected = selected_comparisons,
+        multiple = TRUE,
+        options = list(plugins = list("remove_button"), closeAfterSelect = TRUE)
+      ),
       if (length(covariate_choices)) checkboxGroupInput(
         "deseq_model_cols",
         "Additional variables to model",
@@ -11859,7 +11910,7 @@ server <- function(input, output, session) {
         selected = selected_covariates
       ) else NULL,
       tags$p(class = "read-source-note", tags$strong("DESeq2 design: "), code(paste0("~ ", formula_text))),
-      tags$p(class = "muted small-note", "The comparison variable is always modeled last. Select batch, sex, donor, or other metadata columns here when they should be adjusted for.")
+      tags$p(class = "muted small-note", "The comparison variable is always modeled last. Select batch, sex, donor, or other metadata columns here when they should be adjusted for. One independent DESeq2 job is submitted for every selected comparison.")
     )
   })
 
@@ -11870,17 +11921,14 @@ server <- function(input, output, session) {
 
   output$gsea_run_controls_ui <- renderUI({
     p <- current_project()
-    resolved <- tryCatch(
-      resolve_comparison_inputs(p, input$deseq_compare_col, input$deseq_reference, input$deseq_comparison),
-      error = function(e) e
-    )
-    if (inherits(resolved, "error")) return(div(class = "empty-box", conditionMessage(resolved)))
+    progress_refresh()
+    catalog <- completed_deseq_comparison_catalog(p)
+    if (!NROW(catalog)) return(div(class = "empty-box", "Run and complete at least one DESeq2 comparison before running GSEA."))
+    choices <- stats::setNames(catalog$key, catalog$label)
+    selected_run <- selected_choice(input$gsea_deseq_comparison, choices, catalog$key[[1]])
     geneset <- selected_choice(input$gsea_geneset, GSEAPY_GENESET_OPTIONS, "MSigDB_Hallmark_2020")
     tagList(
-      tags$p(class = "read-source-note",
-        tags$strong("Uses the DESeq2 comparison above: "),
-        paste(resolved$comparison, "vs", resolved$reference)
-      ),
+      selectInput("gsea_deseq_comparison", "Completed DESeq2 comparison", choices = choices, selected = selected_run, selectize = FALSE),
       selectInput("gsea_geneset", "Gene-set database", choices = GSEAPY_GENESET_OPTIONS, selected = geneset, selectize = FALSE)
     )
   })
@@ -12244,45 +12292,52 @@ server <- function(input, output, session) {
     run_submission("featureCounts", submit_featurecounts_jobs(current_project(), input$feature_attr, samples), paste("STAR BAM; feature", input$feature_attr), samples = samples)
   })
   observeEvent(input$run_deseq2, {
-    if (identical(input$deseq_reference, input$deseq_comparison)) {
-      msg <- "ERROR: Not submitted. Reference and comparison must be different."
+    comparisons <- unique(as.character(input$deseq_comparisons %||% character(0)))
+    comparisons <- comparisons[nzchar(comparisons) & comparisons != input$deseq_reference]
+    if (!length(comparisons)) {
+      msg <- "ERROR: Not submitted. Select at least one comparison different from the reference."
       run_message(msg)
       set_tool_message("DESeq2", "")
       finish_submit_refresh()
     } else {
       run_submission(
         "DESeq2",
-        submit_deseq2_job(
-          current_project(),
-          input$deseq_compare_col,
-          input$deseq_reference,
-          input$deseq_comparison,
-          "NoRedundant",
-          FALSE,
-          input$deseq_model_cols %||% character(0)
-        ),
+        paste(vapply(comparisons, function(comparison) {
+          submit_deseq2_job(
+            current_project(),
+            input$deseq_compare_col,
+            input$deseq_reference,
+            comparison,
+            "NoRedundant",
+            FALSE,
+            input$deseq_model_cols %||% character(0)
+          )
+        }, character(1)), collapse = "\n"),
         paste(
           input$deseq_compare_col,
-          input$deseq_comparison,
+          paste(comparisons, collapse = ", "),
           "vs",
           input$deseq_reference,
+          paste0("(", length(comparisons), " independent comparison job(s))"),
           paste0("model ~ ", paste(c(input$deseq_model_cols %||% character(0), input$deseq_compare_col), collapse = " + "))
         )
       )
     }
   })
   observeEvent(input$run_gsea, {
-    resolved <- tryCatch(
-      resolve_comparison_inputs(current_project(), input$deseq_compare_col, input$deseq_reference, input$deseq_comparison),
-      error = function(e) e
-    )
-    if (inherits(resolved, "error")) {
-      msg <- paste("ERROR submitting GSEA:", conditionMessage(resolved))
+    catalog <- completed_deseq_comparison_catalog(current_project())
+    selected_run <- as.character(input$gsea_deseq_comparison %||% "")
+    selected <- catalog[catalog$key == selected_run, , drop = FALSE]
+    if (!NROW(selected)) {
+      msg <- "ERROR submitting GSEA: Choose a completed DESeq2 comparison."
       run_message(msg)
       set_tool_message("GSEA", "")
       finish_submit_refresh()
-    } else if (identical(resolved$reference, resolved$comparison)) {
-      msg <- "ERROR: Not submitted. Reference and comparison must be different."
+    } else if (!nzchar(selected$compare_col[[1]])) {
+      msg <- paste(
+        "ERROR submitting GSEA: Could not uniquely match this completed DESeq2 result to a design-matrix comparison column.",
+        "Make sure only one metadata column contains both selected group names."
+      )
       run_message(msg)
       set_tool_message("GSEA", "")
       finish_submit_refresh()
@@ -12290,8 +12345,14 @@ server <- function(input, output, session) {
       geneset <- selected_choice(input$gsea_geneset, GSEAPY_GENESET_OPTIONS, "MSigDB_Hallmark_2020")
       run_submission(
         "GSEA",
-        submit_gseapy_job(current_project(), resolved$compare_col, resolved$reference, resolved$comparison, geneset),
-        paste(resolved$compare_col, resolved$comparison, "vs", resolved$reference, geneset)
+        submit_gseapy_job(
+          current_project(),
+          selected$compare_col[[1]],
+          selected$reference[[1]],
+          selected$comparison[[1]],
+          geneset
+        ),
+        paste(selected$compare_col[[1]], selected$comparison[[1]], "vs", selected$reference[[1]], geneset)
       )
     }
   })
