@@ -5196,6 +5196,15 @@ cutrun_results_explorer_ui <- function() {
               tabPanel("Gene Annotation", peak_annotation_results_ui())
             )
           ),
+          tabPanel("Peak-Calling Summary",
+            br(),
+            div(class = "cutrun-section-heading",
+              tags$h4("Project-wide peak-calling summary"),
+              tags$p("One row per target sample. This table automatically combines all completed SEACR configurations, MACS2 calls, and shared peak-overlap sets."),
+              downloadButton("download_cutrun_peak_calling_explorer_summary", "Download peak-calling summary")
+            ),
+            table_output("cutrun_peak_calling_explorer_summary")
+          ),
           tabPanel("Genome Browser", genome_browser_ui()),
           tabPanel("Differential Peak Results & Summary",
             br(),
@@ -11494,6 +11503,17 @@ server <- function(input, output, session) {
         tool_panel("Peak QC", status, "Build SEACR consensus peaks, a consensus peak count matrix, and FRiP summaries.",
           tags$p(class = "muted small-note", "Run after SEACR. Peak QC uses the normalization/stringency combination selected above and stores its outputs in a matching subfolder."),
           "run_cutrun_peakqc", "Submit Peak QC"),
+        tags$details(
+          class = "tool-panel",
+          tags$summary(div(class = "tool-summary",
+            div(tags$strong("Peak-Calling Summary"), tags$span("Ravinder-style per-sample peak counts across every SEACR configuration, MACS2, and shared-overlap output."))
+          )),
+          div(class = "tool-body",
+            tags$p(class = "muted small-note", "Columns are added automatically as new peak callers/settings are completed and are removed if their output folders are deleted."),
+            downloadButton("download_cutrun_peak_calling_run_summary", "Download peak-calling summary"), br(), br(),
+            table_output("cutrun_peak_calling_run_summary")
+          )
+        ),
         tool_panel("Differential Peaks", status, "Build mark-specific reproducible consensus peaks and test differential binding with DiffBind/DESeq2.",
           tagList(
             uiOutput("cutrun_diffbind_reference_ui"),
@@ -11537,17 +11557,6 @@ server <- function(input, output, session) {
             tags$p(class = "muted small-note", "Shared peaks are ranked by combined caller evidence rank for the Genome Browser. SEACR signal and MACS2 q-values remain caller-specific evidence rather than being combined as incompatible p-values.")
           ),
           "run_cutrun_peak_overlap", "Submit selected peak overlaps", show_sample_progress = FALSE, show_job_actions = FALSE),
-        tags$details(
-          class = "tool-panel",
-          tags$summary(div(class = "tool-summary",
-            div(tags$strong("Peak-Calling Summary"), tags$span("Ravinder-style per-sample peak counts across every SEACR configuration, MACS2, and shared-overlap output."))
-          )),
-          div(class = "tool-body",
-            tags$p(class = "muted small-note", "Columns are added automatically as new peak callers/settings are completed and are removed if their output folders are deleted."),
-            downloadButton("download_cutrun_peak_calling_run_summary", "Download peak-calling summary"), br(), br(),
-            table_output("cutrun_peak_calling_run_summary")
-          )
-        ),
         tool_panel("Peak Annotation", status, "Annotate every completed CUT&RUN MACS2 and differential peak file with nearby genes.", tagList(
           tags$p(class = "muted small-note", "This project-level final step scans all completed samples and differential comparisons. Both all-peak and significant differential result files are annotated."),
           tags$p(class = "muted small-note", "Peak statistics are shown as explicit columns—including differential p.value and FDR when available—and a project summary records every source and annotated file.")
@@ -13151,6 +13160,10 @@ server <- function(input, output, session) {
     progress_refresh()
     cutrun_seacr_peak_summary_table(current_project())
   }, page_length = 25, scroll_y = "420px")
+  output$cutrun_peak_calling_explorer_summary <- render_csl_table({
+    progress_refresh()
+    cutrun_seacr_peak_summary_table(current_project())
+  }, page_length = 50, scroll_y = "620px")
   output$cutrun_frip_plot <- renderPlot({
     progress_refresh()
     df <- cutrun_seacr_frip_table(current_project())
@@ -13488,6 +13501,10 @@ server <- function(input, output, session) {
     content = function(file) utils::write.table(cutrun_seacr_peak_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
   output$download_cutrun_peak_calling_run_summary <- downloadHandler(
+    filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_peak_calling_summary.tsv"),
+    content = function(file) utils::write.table(cutrun_seacr_peak_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  )
+  output$download_cutrun_peak_calling_explorer_summary <- downloadHandler(
     filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_peak_calling_summary.tsv"),
     content = function(file) utils::write.table(cutrun_seacr_peak_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
