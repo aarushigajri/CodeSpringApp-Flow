@@ -1072,4 +1072,41 @@ assert(identical(app_env$peak_annotation_status(atac_project, data.frame()), "Co
 assert(NROW(app_env$peak_annotation_summary_table(atac_project)) == 1L, "annotation summary is available to the Results Explorer")
 assert(annotated_peak %in% unname(app_env$peak_annotation_result_files(atac_project)), "annotated peak tables are discoverable in Results Explorer")
 
+counts_upload <- file.path(root, "uploaded_counts.csv")
+write.csv(data.frame(
+  Gene = c("GeneA", "GeneA", "GeneB"),
+  Chr = c("chr1", "chr1", "chr2"),
+  Length = c(100, 100, 200),
+  S1 = c(1.5, 2.4, 0),
+  S2 = c(3.5, 1.4, 5),
+  S3 = c(2, 2, 7),
+  check.names = FALSE
+), counts_upload, row.names = FALSE, quote = FALSE)
+counts_only_root <- file.path(root, "counts-only", "data")
+count_result <- app_env$standardize_uploaded_count_matrix(
+  counts_upload,
+  file.path(counts_only_root, "counts", "count_matrix.txt")
+)
+standardized_counts <- read.delim(count_result$path, check.names = FALSE)
+assert(identical(count_result$samples, c("S1", "S2", "S3")), "counts upload preserves numeric sample column names")
+assert(NROW(standardized_counts) == 2L && standardized_counts$S1[standardized_counts$Geneid == "GeneA"] == 4, "counts upload rounds half-up and sums duplicate genes")
+counts_design <- app_env$write_counts_only_design(
+  count_result$samples,
+  file.path(counts_only_root, "manifest", "design_matrix.txt"),
+  metadata_cols = "treatment, batch"
+)
+counts_design_df <- read.delim(counts_design, check.names = FALSE)
+counts_design_df$treatment <- c("Control", "Control", "Treated")
+counts_design_df$batch <- c("B1", "B2", "B1")
+write.table(counts_design_df, counts_design, sep = "\t", row.names = FALSE, quote = FALSE)
+counts_project <- list(
+  id = "rna/counts-only", name = "counts-only", analysis_key = "rna", analysis = "RNA-seq",
+  counts_only = TRUE, design_matrix_path = counts_design, data_dir = counts_only_root,
+  results_root = root, fastq_dir = "", fastq_dirs = character(0), paired_end = TRUE, genome = "mouse"
+)
+assert(identical(app_env$pipeline_order(counts_project), c("Design matrix", "DESeq2", "GSEA")), "counts-only projects expose only design, DESeq2, and GSEA")
+modeled_design <- app_env$deseq_design_for_column(counts_project, "treatment", "batch")
+modeled_df <- read.delim(modeled_design, check.names = FALSE)
+assert(identical(names(modeled_df), c("sample", "batch", "treatment", "filename")), "selected covariates are retained and the comparison variable is modeled last")
+
 cat("CodeSpringApp fake-data helper smoke tests passed.\n")

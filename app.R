@@ -608,6 +608,7 @@ legacy_project_from_config <- function(path) {
     fastq_dirs = fastq_dirs,
     design_matrix_path = design_path_from_dir(inpath_design),
     external_results = tolower(vals$external_results %||% "false") %in% c("true", "t", "yes", "y", "1"),
+    counts_only = tolower(vals$counts_only %||% "false") %in% c("true", "t", "yes", "y", "1"),
     source_config = normalizePath(path, winslash = "/", mustWork = FALSE),
     source = "CodeSpringLab config"
   )
@@ -694,6 +695,7 @@ new_project_from_inputs <- function(input) {
   project_name <- clean_name(input$new_project_name %||% paste0("new_", key, "_project"), paste0("new_", key, "_project"))
   label <- input$new_project_name %||% project_name
   existing_results <- identical(input$new_project_mode %||% "new", "existing_results")
+  counts_only <- identical(key, "rna") && identical(input$new_project_mode %||% "new", "counts_upload")
   if (existing_results) {
     data_dir <- normalizePath(path.expand(trimws(input$new_existing_results_path %||% "")), winslash = "/", mustWork = FALSE)
     results_root <- dirname(data_dir)
@@ -711,7 +713,7 @@ new_project_from_inputs <- function(input) {
     }
     design_path <- normalizePath(path.expand(design_path), winslash = "/", mustWork = FALSE)
     fastq_mode <- tolower(input$new_fastq_location_mode %||% "one")
-    fastq_dirs <- if (identical(fastq_mode, "multiple")) parse_fastq_dirs(input$new_fastq_dirs %||% "") else parse_fastq_dirs(input$new_fastq_dir %||% "")
+    fastq_dirs <- if (counts_only) character(0) else if (identical(fastq_mode, "multiple")) parse_fastq_dirs(input$new_fastq_dirs %||% "") else parse_fastq_dirs(input$new_fastq_dir %||% "")
   }
   fastq_dir <- if (length(fastq_dirs)) fastq_dirs[[1]] else ""
   paired <- !tolower(input$new_paired_end %||% "paired") %in% c("single", "se", "n", "no", "false")
@@ -730,6 +732,7 @@ new_project_from_inputs <- function(input) {
     fastq_dirs = fastq_dirs,
     design_matrix_path = design_path,
     external_results = existing_results,
+    counts_only = counts_only,
     source_config = "",
     source = "new project"
   )
@@ -886,7 +889,8 @@ write_project_config <- function(project) {
     sprintf("genome = %s", deparse(project$genome)),
     sprintf("genome_version = %s", deparse(genome_reference_key(project))),
     sprintf("pairing = %s", deparse(if (isTRUE(project$paired_end)) "y" else "n")),
-    sprintf("external_results = %s", deparse(isTRUE(project$external_results)))
+    sprintf("external_results = %s", deparse(isTRUE(project$external_results))),
+    sprintf("counts_only = %s", deparse(isTRUE(project$counts_only)))
   )
   if (is_atac_project(project)) {
     ref <- atac_reference_resources(project)
@@ -1513,17 +1517,116 @@ design_compare_values <- function(project, col) {
   sort(vals)
 }
 
-deseq_design_for_column <- function(project, compare_col) {
+deseq_model_columns <- function(project, compare_col = "") {
+  cols <- design_compare_columns(project)
+  cols <- setdiff(cols, trimws(as.character(compare_col %||% "")))
+  df <- project_design_df(project)
+  cols[vapply(cols, function(column) {
+    values <- trimws(as.character(df[[column]]))
+    length(unique(values[!is.na(values) & nzchar(values)])) > 1
+  }, logical(1))]
+}
+
+deseq_design_for_column <- function(project, compare_col, model_cols = character(0)) {
   df <- project_design_df(project)
   if (!NROW(df)) stop("No design matrix found.")
   if (!compare_col %in% names(df)) stop("Selected comparison column is not in design matrix: ", compare_col)
+  model_cols <- unique(trimws(as.character(model_cols %||% character(0))))
+  model_cols <- model_cols[nzchar(model_cols)]
+  invalid <- setdiff(model_cols, names(df))
+  if (length(invalid)) stop("Selected model variable(s) are not in the design matrix: ", paste(invalid, collapse = ", "))
+  model_cols <- setdiff(model_cols, compare_col)
+  model_cols <- model_cols[vapply(model_cols, function(column) {
+    values <- trimws(as.character(df[[column]]))
+    length(unique(values[!is.na(values) & nzchar(values)])) > 1
+  }, logical(1))]
   if (!"filename" %in% names(df)) df$filename <- df$sample
-  keep <- df[, c("sample", compare_col, "filename"), drop = FALSE]
-  out_dir <- file.path(project$data_dir, "manifest", paste0("deseq2_", clean_name(compare_col, "comparison")))
+  keep <- df[, c("sample", model_cols, compare_col, "filename"), drop = FALSE]
+  model_slug <- if (length(model_cols)) paste(clean_name(model_cols), collapse = "_") else "unadjusted"
+  out_dir <- file.path(project$data_dir, "manifest", paste0("deseq2_", clean_name(compare_col, "comparison"), "__", model_slug))
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   out <- file.path(out_dir, "design_matrix.txt")
   utils::write.table(keep, out, sep = "\t", row.names = FALSE, quote = FALSE)
   out
+}
+
+read_uploaded_table <- function(path) {
+  if (!nzchar(path %||% "") || !file.exists(path)) stop("Uploaded file is unavailable.")
+  first_line <- readLines(path, n = 1L, warn = FALSE)
+  commas <- if (length(first_line)) lengths(regmatches(first_line, gregexpr(",", first_line, fixed = TRUE))) else 0L
+  tabs <- if (length(first_line)) lengths(regmatches(first_line, gregexpr("\t", first_line, fixed = TRUE))) else 0L
+  separator <- if (commas > tabs) "," else "\t"
+  utils::read.table(
+    path,
+    header = TRUE,
+    sep = separator,
+    check.names = FALSE,
+    stringsAsFactors = FALSE,
+    quote = "\"",
+    comment.char = ""
+  )
+}
+
+standardize_uploaded_count_matrix <- function(path, output_path) {
+  counts <- read_uploaded_table(path)
+  if (NCOL(counts) < 3L) stop("The count matrix needs one gene column and at least two sample columns.")
+  names(counts)[1] <- "Geneid"
+  annotation_names <- c("Chr", "Start", "End", "Strand", "Length", "gene_name", "GeneName", "description", "Description")
+  candidates <- setdiff(names(counts), c("Geneid", annotation_names))
+  numeric_counts <- lapply(counts[candidates], function(column) suppressWarnings(as.numeric(as.character(column))))
+  valid <- vapply(seq_along(candidates), function(i) {
+    original <- counts[[candidates[[i]]]]
+    converted <- numeric_counts[[i]]
+    all(is.na(original) | trimws(as.character(original)) == "" | is.finite(converted))
+  }, logical(1))
+  sample_cols <- candidates[valid]
+  if (length(sample_cols) < 2L) stop("Could not identify at least two numeric sample columns in the uploaded count matrix.")
+  matrix_values <- as.data.frame(numeric_counts[match(sample_cols, candidates)], check.names = FALSE)
+  safe_sample_cols <- clean_name(sample_cols)
+  if (any(!nzchar(safe_sample_cols)) || anyDuplicated(safe_sample_cols)) {
+    stop("Sample columns must remain unique after spaces and punctuation are made filesystem-safe.")
+  }
+  names(matrix_values) <- safe_sample_cols
+  if (any(!is.finite(as.matrix(matrix_values)), na.rm = TRUE) || any(as.matrix(matrix_values) < 0, na.rm = TRUE)) {
+    stop("Counts must be finite, non-negative numbers.")
+  }
+  matrix_values[is.na(matrix_values)] <- 0
+  matrix_values[] <- lapply(matrix_values, function(column) floor(column + 0.5))
+  genes <- trimws(as.character(counts$Geneid))
+  keep <- !is.na(genes) & nzchar(genes)
+  if (!any(keep)) stop("The first column does not contain usable gene identifiers.")
+  standardized <- stats::aggregate(matrix_values[keep, , drop = FALSE], by = list(Geneid = genes[keep]), FUN = sum)
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.table(standardized, output_path, sep = "\t", row.names = FALSE, quote = FALSE)
+  list(path = output_path, samples = safe_sample_cols, genes = NROW(standardized))
+}
+
+write_counts_only_design <- function(samples, output_path, uploaded_design = NULL, metadata_cols = "treatment") {
+  samples <- unique(trimws(as.character(samples)))
+  samples <- samples[nzchar(samples)]
+  if (length(samples) < 2L) stop("At least two count-matrix samples are required.")
+  if (!is.null(uploaded_design) && nzchar(uploaded_design %||% "") && file.exists(uploaded_design)) {
+    design <- read_uploaded_table(uploaded_design)
+    if (!NROW(design)) stop("The uploaded design matrix is empty.")
+    if (!"sample" %in% names(design)) names(design)[1] <- "sample"
+    design$sample <- trimws(as.character(design$sample))
+    missing <- setdiff(samples, design$sample)
+    extra <- setdiff(design$sample, samples)
+    if (length(missing)) stop("Design matrix is missing count sample(s): ", paste(missing, collapse = ", "))
+    if (length(extra)) stop("Design matrix contains sample(s) absent from counts: ", paste(extra, collapse = ", "))
+    design <- design[match(samples, design$sample), , drop = FALSE]
+    design$filename <- design$sample
+    design <- design[, c("sample", setdiff(names(design), c("sample", "filename", "include", "status")), "filename"), drop = FALSE]
+  } else {
+    metadata_cols <- parse_metadata_cols(metadata_cols, list(analysis_key = "rna"))
+    if (!length(metadata_cols)) metadata_cols <- "treatment"
+    design <- data.frame(sample = samples, stringsAsFactors = FALSE, check.names = FALSE)
+    for (column in metadata_cols) design[[column]] <- ""
+    design$filename <- design$sample
+  }
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.table(design, output_path, sep = "\t", row.names = FALSE, quote = FALSE)
+  output_path
 }
 
 atac_diffbind_design <- function(project, compare_col, subset_col = "", subset_value = "") {
@@ -3150,6 +3253,7 @@ pipeline_order <- function(project = NULL) {
   if (!is.null(project) && is_cutrun_project(project)) return(cutrun_pipeline_order())
   if (!is.null(project) && is_atac_project(project)) return(atac_pipeline_order())
   if (!is.null(project) && is_chip_project(project)) return(chip_pipeline_order())
+  if (!is.null(project) && isTRUE(project$counts_only)) return(c("Design matrix", "DESeq2", "GSEA"))
   rna_pipeline_order()
 }
 
@@ -8469,7 +8573,7 @@ featurecounts_matrix_job_active <- function(jobs, matrix_path) {
   NROW(hit) > 0 && any(hit$slurm_state %in% active_states)
 }
 
-submit_deseq2_job <- function(project, compare_col, reference, comparison, redundant = "NoRedundant", gene_name_counts = FALSE) {
+submit_deseq2_job <- function(project, compare_col, reference, comparison, redundant = "NoRedundant", gene_name_counts = FALSE, model_cols = character(0)) {
   count_matrix <- file.path(project$data_dir, "counts", "count_matrix.txt")
   active_msg <- active_upstream_message(project, "featureCounts", "DESeq2")
   if (nzchar(active_msg)) {
@@ -8501,7 +8605,9 @@ submit_deseq2_job <- function(project, compare_col, reference, comparison, redun
     count_matrix <- gene_matrix
     input_mode <- paste(input_mode, "gene-name aggregated counts", sep = " - ")
   }
-  design_matrix <- deseq_design_for_column(project, compare_col)
+  design_matrix <- deseq_design_for_column(project, compare_col, model_cols)
+  model_label <- paste(c(model_cols, compare_col), collapse = " + ")
+  input_mode <- paste(input_mode, paste0("model: ~ ", model_label), sep = " - ")
   submit_sbatch(project, "DESeq2", script, c(rscript, count_matrix, design_matrix, outdir, reference, comparison, redundant, project$name), "deseq2", input_mode, target = file.path(outdir, sprintf("DEG_%s_vs_%s(ref).txt", comparison, reference)), dependency_ids = dependency_ids)
 }
 
@@ -8704,6 +8810,7 @@ write_native_shiny_config <- function(project) {
     sprintf("design_matrix_path <- %s", deparse(project$design_matrix_path)),
     sprintf("genome_species <- %s", deparse(genome_species(project))),
     sprintf("genome_version <- %s", deparse(genome_reference_key(project))),
+    sprintf("counts_only <- %s", deparse(isTRUE(project$counts_only))),
     sprintf("selected_gtf_path <- %s", deparse(resources$gtf %||% "")),
     sprintf("app_dir <- %s", deparse(file.path(SCRIPTS_DIR, "Shiny"))),
     sprintf("logo_search_dirs <- c(%s)", paste(vapply(c(SCRIPTS_DIR, file.path(SCRIPTS_DIR, "Shiny")), deparse, character(1)), collapse = ", "))
@@ -8764,7 +8871,13 @@ load_native_rnaseq_viewer <- function(project) {
 
 run_step_meta <- function(project = NULL) {
   steps <- pipeline_order(project)
-  descriptions <- if (!is.null(project) && is_cutrun_project(project)) {
+  descriptions <- if (!is.null(project) && isTRUE(project$counts_only)) {
+    c(
+      "Review or complete sample metadata for the uploaded count matrix.",
+      "Run differential expression with the selected DESeq2 model.",
+      "Run pathway analysis from the matching DESeq2 result."
+    )
+  } else if (!is.null(project) && is_cutrun_project(project)) {
     c(
       "Create or load design_matrix.txt.",
       "Trim adapters and short reads.",
@@ -8826,7 +8939,14 @@ pipeline_stepper_ui <- function(project, status = NULL) {
     mode <- status$input[hit] %||% ""
     detail <- if ("detail" %in% names(status)) status$detail[hit] %||% "" else ""
     cls <- status_css_key(st)
-    div(class = paste("pipeline-step", cls),
+    panel_id <- paste0("tool_panel_", tolower(clean_name(meta$step[i])))
+    div(
+        class = paste("pipeline-step pipeline-step-clickable", cls),
+        tabindex = "0",
+        role = "button",
+        title = paste("Open", meta$step[i], "progress"),
+        onclick = sprintf("window.cslOpenPipelineStep && window.cslOpenPipelineStep(%s);", jsonlite::toJSON(panel_id, auto_unbox = TRUE)),
+        onkeydown = sprintf("if(event.key==='Enter'||event.key===' '){event.preventDefault();window.cslOpenPipelineStep && window.cslOpenPipelineStep(%s);}", jsonlite::toJSON(panel_id, auto_unbox = TRUE)),
         div(class = "step-index", meta$order[i]),
         div(class = "step-main",
             tags$strong(meta$step[i]),
@@ -9340,6 +9460,9 @@ body { background:#eef3f8; color:#17202f; }
 .design-matrix-table .form-group { margin-bottom:0; }
 .pipeline-stepper { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin:12px 0 18px 0; }
 .pipeline-step { border:1px solid #d8dde8; border-radius:8px; padding:10px; display:flex; gap:10px; align-items:center; background:#fff4f3; }
+.pipeline-step-clickable { cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; }
+.pipeline-step-clickable:hover, .pipeline-step-clickable:focus { transform:translateY(-1px); box-shadow:0 5px 14px rgba(35,65,95,.16); outline:2px solid #87b7e5; outline-offset:1px; }
+.tool-panel.pipeline-step-focus { box-shadow:0 0 0 3px rgba(44,123,229,.35), 0 10px 24px rgba(35,65,95,.18); }
 .pipeline-step.complete { background:#def7e8; border-color:#8fd8ad; }
 .pipeline-step.active { background:#fff4d6; border-color:#f0c36d; }
 .pipeline-step.partial { background:#fff8d6; border-color:#e4c75e; }
@@ -9870,6 +9993,26 @@ ui <- fluidPage(
           }, 150);
         }
       });
+      window.cslOpenPipelineStep = function(panelId) {
+        var runTab = $('a[data-value=\"Run Pipeline\"]');
+        if (!runTab.length) {
+          runTab = $('a[data-toggle=\"tab\"]').filter(function() {
+            return $(this).text().trim() === 'Run Pipeline';
+          });
+        }
+        if (runTab.length) runTab.first().tab('show');
+        window.setTimeout(function() {
+          var panel = document.getElementById(panelId);
+          if (!panel) return;
+          panel.open = true;
+          try {
+            window.sessionStorage.setItem(cslToolPanelKey(panel), 'open');
+          } catch (error) {}
+          panel.scrollIntoView({behavior: 'smooth', block: 'start'});
+          panel.classList.add('pipeline-step-focus');
+          window.setTimeout(function() { panel.classList.remove('pipeline-step-focus'); }, 1600);
+        }, 120);
+      };
       function cslToolPanelKey(panel) {
         var project = ($('#project_id').val() || 'no-project').toString();
         return 'codespring-tool-panel:' + project + ':' + (panel.id || 'panel');
@@ -10013,15 +10156,11 @@ ui <- fluidPage(
                                  if (file.exists(LOGO_CSL_PATH)) tags$img(src = file.path("csl_logo", basename(LOGO_CSL_PATH))) else NULL))
                  )),
         tabPanel("Design Matrix", br(), h3("Design Matrix Builder"),
-                 tags$p(class = "muted", "If no design_matrix.txt was provided during setup, build it here: scan the raw FASTQ folder, then edit include/sample/metadata cells directly. Filenames stay on the right so run steps know which reads belong to each sample."),
+                 uiOutput("design_matrix_help_ui"),
                  fluidRow(
                    column(7, textInput("metadata_cols", "Metadata columns", value = "treatment", placeholder = "cell_type, condition, replicate")),
                    column(5, br(),
-                          div(class = "button-row",
-                              actionButton("scan_fastqs", "Scan FASTQ folder", class = "btn-primary"),
-                              actionButton("add_metadata_col", "Update metadata columns", class = "btn-default"),
-                              actionButton("add_design_rows", "Add 5 blank rows", class = "btn-default")
-                          ))
+                          uiOutput("design_matrix_actions_ui"))
                  ),
                  uiOutput("design_editor_ui"),
                  br(),
@@ -10476,7 +10615,11 @@ server <- function(input, output, session) {
       radioButtons("new_paired_end", "Reads", choices = c("Paired-end" = "paired", "Single-end" = "single"), selected = "paired"),
       radioButtons(
         "new_project_mode", "Project source",
-        choices = c("Start a new analysis" = "new", "Open completed results (read-only)" = "existing_results"),
+        choices = c(
+          "Start from FASTQs" = "new",
+          if (identical(new_analysis_key, "rna")) c("Upload a count matrix" = "counts_upload"),
+          "Open completed results (read-only)" = "existing_results"
+        ),
         selected = "new"
       ),
       conditionalPanel(
@@ -10488,7 +10631,7 @@ server <- function(input, output, session) {
         )
       ),
       conditionalPanel(
-        "input.new_project_mode != 'existing_results'",
+        "input.new_project_mode == 'new'",
       radioButtons(
         "new_fastq_location_mode", "Where are the raw FASTQs?",
         choices = c("One folder" = "one", "Multiple folders (treat as one input pool)" = "multiple"),
@@ -10509,15 +10652,30 @@ server <- function(input, output, session) {
           tags$p(class = "muted", "Add each sequencing-run folder separately. The saved folders are scanned as one input pool. Source FASTQs are read-only inputs; Cutadapt, Bowtie2, and all later steps write only beneath the project results folder.")
       )),
       div(class = "new-project-path-control",
-          textInput("new_results_root", "Results root", value = DEFAULT_RESULTS_ROOT, placeholder = "Where CodeSpringApp should write project results"),
-          actionButton("browse_new_results_root", "Browse server", class = "btn-default")
-      ),
-      div(class = "new-project-path-control",
           textInput("new_design_matrix_path", "Design matrix folder", value = default_design_dir, placeholder = "Optional; folder containing or receiving design_matrix.txt"),
           actionButton("browse_new_design_matrix_path", "Browse server", class = "btn-default"),
           tags$p(class = "muted", "Leave this blank to create the design matrix in the Design Matrix tab after the project is created.")
       ),
-      checkboxInput("new_clear_existing_results", "Clear existing results if this project folder already exists", value = FALSE),
+      ),
+      conditionalPanel(
+        "input.new_project_mode == 'counts_upload'",
+        div(
+          class = "read-source-note",
+          tags$strong("Counts-only RNA-seq mode"),
+          tags$p("Upload a CSV or tab-delimited matrix with genes in the first column and samples in the remaining numeric columns. Counts are checked, rounded half-up, duplicate gene rows are summed, and the standardized matrix is saved as counts/count_matrix.txt.")
+        ),
+        fileInput("new_counts_file", "Count matrix", accept = c(".txt", ".tsv", ".csv")),
+        fileInput("new_counts_design_file", "Design matrix (optional)", accept = c(".txt", ".tsv", ".csv")),
+        textInput("new_counts_metadata_cols", "Metadata columns if no design is uploaded", value = "treatment", placeholder = "treatment, batch, sex"),
+        tags$p(class = "muted", "Without a design file, sample names are taken from the count-matrix column names. Complete the metadata values in the Design Matrix tab before running DESeq2.")
+      ),
+      conditionalPanel(
+        "input.new_project_mode != 'existing_results'",
+        div(class = "new-project-path-control",
+            textInput("new_results_root", "Results root", value = DEFAULT_RESULTS_ROOT, placeholder = "Where CodeSpringApp should write project results"),
+            actionButton("browse_new_results_root", "Browse server", class = "btn-default")
+        ),
+        checkboxInput("new_clear_existing_results", "Clear existing results if this project folder already exists", value = FALSE)
       ),
       actionButton("create_project_config", "Create project", class = "btn-primary"),
       textOutput("create_project_status")
@@ -10650,7 +10808,7 @@ server <- function(input, output, session) {
         div(class = "project-meta-row",
             span(class = "meta-chip", paste("Species", genome_species(p))),
             span(class = "meta-chip ref-chip", project_reference_label(p)),
-            span(class = "meta-chip", if (isTRUE(p$paired_end)) "Paired-end" else "Single-end")
+            span(class = "meta-chip", if (isTRUE(p$counts_only)) "Counts-only" else if (isTRUE(p$paired_end)) "Paired-end" else "Single-end")
         ),
         div(class = "path-list compact-path-list",
             div(class = "path-item", span("Data"), code(p$data_dir))
@@ -10681,6 +10839,35 @@ server <- function(input, output, session) {
     div(class = "config-card",
         div(class = "eyebrow", "Imported CodeSpringLab project file"),
         code(p$source_config)
+    )
+  })
+
+  output$design_matrix_help_ui <- renderUI({
+    if (isTRUE(current_project()$counts_only)) {
+      tags$p(
+        class = "muted",
+        "Samples came from the uploaded count-matrix column names. Add metadata columns, fill their values for every sample, and save the design before running DESeq2."
+      )
+    } else {
+      tags$p(
+        class = "muted",
+        "If no design_matrix.txt was provided during setup, scan the raw FASTQ folder, then edit include/sample/metadata cells directly. Filenames stay on the right so run steps know which reads belong to each sample."
+      )
+    }
+  })
+
+  output$design_matrix_actions_ui <- renderUI({
+    if (isTRUE(current_project()$counts_only)) {
+      return(div(
+        class = "button-row",
+        actionButton("add_metadata_col", "Update metadata columns", class = "btn-primary")
+      ))
+    }
+    div(
+      class = "button-row",
+      actionButton("scan_fastqs", "Scan FASTQ folder", class = "btn-primary"),
+      actionButton("add_metadata_col", "Update metadata columns", class = "btn-default"),
+      actionButton("add_design_rows", "Add 5 blank rows", class = "btn-default")
     )
   })
 
@@ -10750,10 +10937,6 @@ server <- function(input, output, session) {
           "\nOpen Results Explorer → Genome Browser to review the BigWigs and differential peaks."
         )
       } else {
-      fastq_dirs <- project_fastq_dirs(p)
-      if (!length(fastq_dirs)) stop("Choose at least one raw FASTQ folder before creating the project.")
-      missing_fastq_dirs <- fastq_dirs[!dir.exists(fastq_dirs)]
-      if (length(missing_fastq_dirs)) stop("These raw FASTQ folders do not exist: ", paste(missing_fastq_dirs, collapse = ", "))
       result_dir <- project_result_dir(p)
       if (dir_has_contents(result_dir)) {
         if (!isTRUE(input$new_clear_existing_results)) {
@@ -10771,7 +10954,36 @@ server <- function(input, output, session) {
         prune_project_job_history(p)
       }
       example_design_copied <- ""
-      if (is_bundled_example_design(p$design_matrix_path)) {
+      counts_message <- ""
+      if (isTRUE(p$counts_only)) {
+        upload <- input$new_counts_file
+        if (is.null(upload) || !NROW(upload) || !file.exists(upload$datapath[[1]])) {
+          stop("Choose a count matrix before creating a counts-only project.")
+        }
+        count_result <- standardize_uploaded_count_matrix(
+          upload$datapath[[1]],
+          file.path(p$data_dir, "counts", "count_matrix.txt")
+        )
+        design_upload <- input$new_counts_design_file
+        design_path <- if (!is.null(design_upload) && NROW(design_upload)) design_upload$datapath[[1]] else NULL
+        p$design_matrix_path <- file.path(p$data_dir, "manifest", "design_matrix.txt")
+        write_counts_only_design(
+          count_result$samples,
+          p$design_matrix_path,
+          uploaded_design = design_path,
+          metadata_cols = input$new_counts_metadata_cols %||% "treatment"
+        )
+        counts_message <- paste0(
+          "Standardized count matrix: ", count_result$genes, " genes × ",
+          length(count_result$samples), " samples\nDesign matrix: ", p$design_matrix_path
+        )
+      } else {
+        fastq_dirs <- project_fastq_dirs(p)
+        if (!length(fastq_dirs)) stop("Choose at least one raw FASTQ folder before creating the project.")
+        missing_fastq_dirs <- fastq_dirs[!dir.exists(fastq_dirs)]
+        if (length(missing_fastq_dirs)) stop("These raw FASTQ folders do not exist: ", paste(missing_fastq_dirs, collapse = ", "))
+      }
+      if (!isTRUE(p$counts_only) && is_bundled_example_design(p$design_matrix_path)) {
         source_design <- p$design_matrix_path
         destination_design <- file.path(p$data_dir, "manifest", "design_matrix.txt")
         dir.create(dirname(destination_design), recursive = TRUE, showWarnings = FALSE)
@@ -10791,6 +11003,7 @@ server <- function(input, output, session) {
       paste(c(
         if (nzchar(cleanup)) cleanup,
         paste("Created project:", p$name),
+        if (nzchar(counts_message)) counts_message,
         if (nzchar(example_design_copied)) example_design_copied,
         paste("Saved project file:", cfg)
       ), collapse = "\n")
@@ -11182,6 +11395,19 @@ server <- function(input, output, session) {
         tool_panel("Differential Peaks", status, "Build the DiffBind consensus peakset, test differential accessibility, and annotate the resulting peaks with HOMER in the same job.", tagList(uiOutput("atac_diffbind_controls_ui"), tags$p(class = "muted small-note", "Requires at least two biological replicates per selected condition.")), "run_atac_diffbind", "Submit DiffBind", data.frame())
       ))
     }
+    if (isTRUE(p$counts_only)) {
+      return(div(class = "run-grid",
+        tool_panel("DESeq2", status, "Run differential expression from the uploaded, standardized count matrix.",
+          tagList(
+            uiOutput("deseq_controls_ui"),
+            uiOutput("deseq_project_summary_ui")
+          ),
+          "run_deseq2", "Run DESeq2", data.frame()),
+        tool_panel("GSEA", status, "Run pathway analysis from the matching DESeq2 result.",
+          tagList(uiOutput("gsea_run_controls_ui"), uiOutput("gsea_project_summary_ui")),
+          "run_gsea", "Run GSEA", data.frame())
+      ))
+    }
     div(class = "run-grid",
       tool_panel("Cutadapt", status, "Trim adapters and short reads from raw FASTQs.",
         tagList(
@@ -11405,10 +11631,21 @@ server <- function(input, output, session) {
     comp <- input$deseq_comparison %||% if (length(vals) > 1) vals[[2]] else ref
     ref <- selected_choice(ref, vals, if (length(vals)) vals[[1]] else "")
     comp <- selected_choice(comp, vals, if (length(vals) > 1) vals[[2]] else ref)
+    covariate_choices <- deseq_model_columns(p, selected_col)
+    selected_covariates <- intersect(input$deseq_model_cols %||% character(0), covariate_choices)
+    formula_text <- paste(c(selected_covariates, selected_col), collapse = " + ")
     tagList(
       selectInput("deseq_compare_col", "Comparison column", choices = cols, selected = selected_col, selectize = FALSE),
       selectInput("deseq_reference", "Reference/baseline", choices = vals, selected = ref, selectize = FALSE),
-      selectInput("deseq_comparison", "Comparison", choices = vals, selected = comp, selectize = FALSE)
+      selectInput("deseq_comparison", "Comparison", choices = vals, selected = comp, selectize = FALSE),
+      if (length(covariate_choices)) checkboxGroupInput(
+        "deseq_model_cols",
+        "Additional variables to model",
+        choices = covariate_choices,
+        selected = selected_covariates
+      ) else NULL,
+      tags$p(class = "read-source-note", tags$strong("DESeq2 design: "), code(paste0("~ ", formula_text))),
+      tags$p(class = "muted small-note", "The comparison variable is always modeled last. Select batch, sex, donor, or other metadata columns here when they should be adjusted for.")
     )
   })
 
@@ -11419,17 +11656,17 @@ server <- function(input, output, session) {
 
   output$gsea_run_controls_ui <- renderUI({
     p <- current_project()
-    cols <- design_compare_columns(p)
     resolved <- tryCatch(
-      resolve_comparison_inputs(p, input$gsea_compare_col, input$gsea_reference, input$gsea_comparison),
+      resolve_comparison_inputs(p, input$deseq_compare_col, input$deseq_reference, input$deseq_comparison),
       error = function(e) e
     )
     if (inherits(resolved, "error")) return(div(class = "empty-box", conditionMessage(resolved)))
     geneset <- selected_choice(input$gsea_geneset, GSEAPY_GENESET_OPTIONS, "MSigDB_Hallmark_2020")
     tagList(
-      selectInput("gsea_compare_col", "Comparison column", choices = cols, selected = resolved$compare_col, selectize = FALSE),
-      selectInput("gsea_reference", "Reference/baseline", choices = resolved$values, selected = resolved$reference, selectize = FALSE),
-      selectInput("gsea_comparison", "Comparison", choices = resolved$values, selected = resolved$comparison, selectize = FALSE),
+      tags$p(class = "read-source-note",
+        tags$strong("Uses the DESeq2 comparison above: "),
+        paste(resolved$comparison, "vs", resolved$reference)
+      ),
       selectInput("gsea_geneset", "Gene-set database", choices = GSEAPY_GENESET_OPTIONS, selected = geneset, selectize = FALSE)
     )
   })
@@ -11781,14 +12018,28 @@ server <- function(input, output, session) {
     } else {
       run_submission(
         "DESeq2",
-        submit_deseq2_job(current_project(), input$deseq_compare_col, input$deseq_reference, input$deseq_comparison, "NoRedundant", FALSE),
-        paste(input$deseq_compare_col, input$deseq_comparison, "vs", input$deseq_reference)
+        submit_deseq2_job(
+          current_project(),
+          input$deseq_compare_col,
+          input$deseq_reference,
+          input$deseq_comparison,
+          "NoRedundant",
+          FALSE,
+          input$deseq_model_cols %||% character(0)
+        ),
+        paste(
+          input$deseq_compare_col,
+          input$deseq_comparison,
+          "vs",
+          input$deseq_reference,
+          paste0("model ~ ", paste(c(input$deseq_model_cols %||% character(0), input$deseq_compare_col), collapse = " + "))
+        )
       )
     }
   })
   observeEvent(input$run_gsea, {
     resolved <- tryCatch(
-      resolve_comparison_inputs(current_project(), input$gsea_compare_col, input$gsea_reference, input$gsea_comparison),
+      resolve_comparison_inputs(current_project(), input$deseq_compare_col, input$deseq_reference, input$deseq_comparison),
       error = function(e) e
     )
     if (inherits(resolved, "error")) {
