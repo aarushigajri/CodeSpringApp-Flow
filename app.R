@@ -2368,7 +2368,15 @@ step_data_paths <- function(project, step, samples = NULL, method = "") {
     "Bowtie2" = file.path(data_dir, "bowtie2"),
     "SEACR" = file.path(data_dir, "seacr"),
     "Peak QC" = file.path(data_dir, "cutrun_peak_qc"),
+    "Peak-Calling Summary" = file.path(
+      data_dir, "cutrun_summaries",
+      c("peak_calling_summary.tsv", "peak_calling_summary.xlsx", "peak_calling_summary_COMPLETE")
+    ),
     "Differential Peaks" = file.path(data_dir, if (is_atac_project(project) || is_chip_project(project)) "diffbind" else "cutrun_diffbind"),
+    "Differential Peak Summary" = file.path(
+      data_dir, "cutrun_summaries",
+      c("differential_peak_comparison_summary.tsv", "differential_peak_comparison_summary.xlsx", "differential_summary_COMPLETE")
+    ),
     "Peak Annotation" = file.path(data_dir, "peak_annotation"),
     "MACS2 Peaks" = file.path(data_dir, "macs2"),
     "MACS2 (optional)" = file.path(data_dir, "macs2"),
@@ -3117,7 +3125,9 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
         if (count_files(file.path(data_dir, "bowtie2"), "_alignment_summary\\.txt$") > 0) "Complete" else "Not started",
         if (count_files(file.path(data_dir, "seacr"), "\\.bed$") + count_files(file.path(data_dir, "seacr"), "\\.bedgraph$") > 0) "Complete" else "Not started",
         if (count_files(file.path(data_dir, "cutrun_peak_qc"), "^seacr_consensus_peaks\\.bed$") > 0) "Complete" else "Not started",
+        if (file.exists(file.path(data_dir, "cutrun_summaries", "peak_calling_summary_COMPLETE"))) "Complete" else "Not started",
         if (file.exists(file.path(data_dir, "cutrun_diffbind", "_COMPLETE")) || count_files(file.path(data_dir, "cutrun_diffbind"), "^_COMPLETE$") > 0) "Complete" else "Not started",
+        if (file.exists(file.path(data_dir, "cutrun_summaries", "differential_summary_COMPLETE"))) "Complete" else "Not started",
         if (count_files(file.path(data_dir, "macs2"), "(narrowPeak|broadPeak|peaks\\.xls)$") > 0) "Complete" else "Not started",
         if (count_files(file.path(data_dir, "peak_overlap"), "_overlap_peaks_summary\\.txt$") > 0) "Complete" else "Not started",
         peak_annotation_status(project, jobs)
@@ -3129,7 +3139,9 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
         file.path(data_dir, "bowtie2"),
         file.path(data_dir, "seacr"),
         file.path(data_dir, "cutrun_peak_qc"),
+        file.path(data_dir, "cutrun_summaries"),
         file.path(data_dir, "cutrun_diffbind"),
+        file.path(data_dir, "cutrun_summaries"),
         file.path(data_dir, "macs2"),
         file.path(data_dir, "peak_overlap"),
         file.path(data_dir, "peak_annotation")
@@ -3266,7 +3278,11 @@ rna_pipeline_order <- function() {
 }
 
 cutrun_pipeline_order <- function() {
-  c("Design matrix", "Cutadapt", "FastQC", "Bowtie2", "SEACR", "Peak QC", "Differential Peaks", "MACS2 (optional)", "Peak Overlap", "Peak Annotation")
+  c(
+    "Design matrix", "Cutadapt", "FastQC", "Bowtie2", "SEACR", "Peak QC",
+    "Peak-Calling Summary", "Differential Peaks", "Differential Peak Summary",
+    "MACS2 (optional)", "Peak Overlap", "Peak Annotation"
+  )
 }
 
 atac_pipeline_order <- function() {
@@ -9113,7 +9129,9 @@ run_step_meta <- function(project = NULL) {
       "Align fragments with Bowtie2 and create BAM/bedGraph/bigWig outputs.",
       "Call sparse CUT&RUN peaks with SEACR.",
       "Build consensus SEACR peaks, peak counts, and FRiP summaries.",
+      "Summarize every completed peak caller and setting in one workbook.",
       "Build mark-specific consensus peaks and run DiffBind/DESeq2 differential binding.",
+      "Summarize every completed differential comparison in one workbook.",
       "Optional MACS2 peak calling for comparison or broad histone marks.",
       "Create per-sample overlap BEDs shared by two selected caller/settings.",
       "Annotate every completed MACS2 and differential peak file with nearby genes."
@@ -9377,6 +9395,33 @@ project_level_step_summary_ui <- function(project, jobs, step) {
   )
 }
 
+cutrun_summary_job_ui <- function(project, jobs, step, marker_name) {
+  marker <- file.path(project$data_dir, "cutrun_summaries", marker_name)
+  hit <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) {
+    jobs[canonical_job_step(jobs$step) == canonical_job_step(step), , drop = FALSE]
+  } else data.frame()
+  latest <- if (NROW(hit)) tail(hit, 1) else data.frame()
+  complete <- file.exists(marker)
+  if (!NROW(latest) && !complete) return(NULL)
+
+  state <- if (complete) "COMPLETED" else as.character(latest$slurm_state[[1]] %||% "Submitted")
+  active <- state %in% active_slurm_states()
+  failed <- state %in% c("CANCELLED", "CANCELLED+", "CA", "TIMEOUT", "FAILED", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY", "BOOT_FAIL")
+  label <- if (complete) "Complete" else if (active) {
+    if (state %in% c("PENDING", "CONFIGURING", "Submitted")) "Queued" else "Running"
+  } else if (failed) "Failed or cancelled" else state
+  bar_class <- if (complete) "summary-job-bar complete" else if (active) "summary-job-bar active" else if (failed) "summary-job-bar failed" else "summary-job-bar"
+  job_id <- if (NROW(latest) && "job_id" %in% names(latest)) trimws(as.character(latest$job_id[[1]] %||% "")) else ""
+  elapsed <- if (NROW(latest) && "elapsed" %in% names(latest)) trimws(as.character(latest$elapsed[[1]] %||% "")) else ""
+  details <- c(if (nzchar(job_id)) paste("Job", job_id), state, if (nzchar(elapsed)) paste("Elapsed", elapsed))
+
+  div(
+    class = paste("summary-job-status", if (active) "active" else if (complete) "complete" else if (failed) "failed" else ""),
+    div(class = "summary-job-heading", tags$strong(label), tags$span(paste(details, collapse = " · "))),
+    div(class = "summary-job-track", div(class = bar_class, style = "width:100%"))
+  )
+}
+
 list_result_files <- function(project, pattern = "\\.(txt|csv|tsv|html|png|pdf)$") {
   if (!dir.exists(project$data_dir)) return(character(0))
   list.files(project$data_dir, pattern = pattern, recursive = TRUE, full.names = TRUE)
@@ -9618,6 +9663,18 @@ body { background:#eef3f8; color:#17202f; }
 .tool-right small { color:#657084; }
 .tool-body { padding:0 16px 16px 16px; border-top:1px solid #edf1f6; }
 .tool-body .form-group { margin-bottom:10px; }
+.summary-job-status { margin:12px 0; padding:11px 12px; border:1px solid #d8dde8; border-radius:8px; background:#f7f9fc; }
+.summary-job-status.active { border-color:#f0c36d; background:#fff8e6; }
+.summary-job-status.complete { border-color:#8fd8ad; background:#eefaf3; }
+.summary-job-status.failed { border-color:#e5a397; background:#fff0ed; }
+.summary-job-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:8px; }
+.summary-job-heading span { color:#657084; font-size:12px; }
+.summary-job-track { height:10px; overflow:hidden; border-radius:999px; background:#e1e7ef; }
+.summary-job-bar { height:100%; border-radius:999px; background:#8b98a8; }
+.summary-job-bar.active { background:repeating-linear-gradient(135deg,#e4a31f 0,#e4a31f 10px,#f2bd50 10px,#f2bd50 20px); animation:summary-job-pulse 1.15s ease-in-out infinite alternate; }
+.summary-job-bar.complete { background:#27ae60; }
+.summary-job-bar.failed { background:#d55745; }
+@keyframes summary-job-pulse { from { opacity:.65; } to { opacity:1; } }
 .step-sample-selector { margin:0 0 14px 0; padding:10px 12px; background:#f6f9fc; border:1px solid #d8e1eb; border-radius:8px; }
 .step-sample-actions { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
 .step-sample-selector .form-group { margin-bottom:4px; }
@@ -11662,17 +11719,17 @@ server <- function(input, output, session) {
         tool_panel("Peak QC", status, "Build SEACR consensus peaks, a consensus peak count matrix, and FRiP summaries.",
           tags$p(class = "muted small-note", "Run after SEACR. Peak QC uses the normalization/stringency combination selected above and stores its outputs in a matching subfolder."),
           "run_cutrun_peakqc", "Submit Peak QC"),
-        tags$details(
-          class = "tool-panel",
-          tags$summary(div(class = "tool-summary",
-            div(tags$strong("Peak-Calling Summary"), tags$span("Ravinder-style per-sample peak counts across every SEACR configuration, MACS2, and shared-overlap output."))
-          )),
-          div(class = "tool-body",
+        tool_panel(
+          "Peak-Calling Summary", status,
+          "Ravinder-style per-sample peak counts across every SEACR configuration, MACS2, and shared-overlap output.",
+          tagList(
             tags$p(class = "muted small-note", "Columns are added automatically as new peak callers/settings are completed and are removed if their output folders are deleted."),
-            actionButton("run_cutrun_peak_calling_summary", "Generate/update peak-calling summary", class = "btn-primary"),
+            uiOutput("cutrun_peak_calling_summary_job_ui"),
             downloadButton("download_cutrun_peak_calling_run_summary", "Download peak-calling summary (.xlsx)"), br(), br(),
             table_output("cutrun_peak_calling_run_summary")
-          )
+          ),
+          "run_cutrun_peak_calling_summary", "Generate/update peak-calling summary",
+          show_sample_progress = FALSE
         ),
         tool_panel("Differential Peaks", status, "Build mark-specific reproducible consensus peaks and test differential binding with DiffBind/DESeq2.",
           tagList(
@@ -11691,17 +11748,17 @@ server <- function(input, output, session) {
             tags$p(class = "muted small-note", "Every eligible cell type/mark comparison is submitted as its own SLURM job. Native peak widths are preserved, and E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
           ),
           "run_cutrun_diffbind", "Submit all eligible comparisons"),
-        tags$details(
-          class = "tool-panel",
-          tags$summary(div(class = "tool-summary",
-            div(tags$strong("Differential Peak Summary"), tags$span("All completed DiffBind comparisons, sources, significant peaks, and result-file paths."))
-          )),
-          div(class = "tool-body",
+        tool_panel(
+          "Differential Peak Summary", status,
+          "All completed DiffBind comparisons, sources, significant peaks, and result-file paths.",
+          tagList(
             tags$p(class = "muted small-note", "This is a project-wide summary; it remains available while other MACS2, SEACR, or shared-overlap DiffBind jobs are running."),
-            actionButton("run_cutrun_diffbind_summary", "Generate/update differential-peak summary", class = "btn-primary"),
+            uiOutput("cutrun_diffbind_summary_job_ui"),
             downloadButton("download_cutrun_diffbind_run_summary", "Download comparison summary (.xlsx)"), br(), br(),
             table_output("cutrun_diffbind_run_summary")
-          )
+          ),
+          "run_cutrun_diffbind_summary", "Generate/update differential-peak summary",
+          show_sample_progress = FALSE
         ),
         tool_panel("MACS2 (optional)", status, "Optional MACS2 peak calling for comparison or broad histone-mark peaks.",
           tagList(
@@ -11843,6 +11900,20 @@ server <- function(input, output, session) {
     jobs <- job_history_state()
     if (!NROW(jobs)) jobs <- job_history(p)
     cutrun_diffbind_batch_status_ui(p, plan, jobs)
+  })
+
+  output$cutrun_peak_calling_summary_job_ui <- renderUI({
+    progress_refresh()
+    p <- current_project()
+    if (!is_cutrun_project(p)) return(NULL)
+    cutrun_summary_job_ui(p, job_history_state(), "Peak-Calling Summary", "peak_calling_summary_COMPLETE")
+  })
+
+  output$cutrun_diffbind_summary_job_ui <- renderUI({
+    progress_refresh()
+    p <- current_project()
+    if (!is_cutrun_project(p)) return(NULL)
+    cutrun_summary_job_ui(p, job_history_state(), "Differential Peak Summary", "differential_summary_COMPLETE")
   })
 
   output$atac_diffbind_controls_ui <- renderUI({

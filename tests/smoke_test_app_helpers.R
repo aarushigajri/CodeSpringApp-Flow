@@ -165,6 +165,32 @@ for (project_variant in list(
 )) {
   assert(identical(tail(app_env$pipeline_order(project_variant), 1), "Peak Annotation"), paste(project_variant$analysis, "ends with Peak Annotation"))
 }
+cutrun_project <- within(chip_project, { analysis_key <- "cutrun"; analysis <- "CUT&RUN" })
+assert(
+  all(c("Peak-Calling Summary", "Differential Peak Summary") %in% app_env$cutrun_pipeline_order()),
+  "CUT&RUN project summaries are first-class pipeline steps"
+)
+dir.create(file.path(root, "cutrun_summaries"), recursive = TRUE)
+file.create(
+  file.path(root, "cutrun_summaries", "peak_calling_summary_COMPLETE"),
+  file.path(root, "cutrun_summaries", "differential_summary_COMPLETE")
+)
+cutrun_summary_status <- app_env$project_status(cutrun_project, jobs = data.frame(), progress = data.frame(), active_states = list())
+assert(
+  all(cutrun_summary_status$status[cutrun_summary_status$step %in% c("Peak-Calling Summary", "Differential Peak Summary")] == "Complete"),
+  "CUT&RUN summary completion markers drive pipeline status"
+)
+summary_job_html <- as.character(app_env$cutrun_summary_job_ui(
+  cutrun_project,
+  data.frame(step = "Peak-Calling Summary", slurm_state = "RUNNING", job_id = "12345", elapsed = "00:01:02", stringsAsFactors = FALSE),
+  "Peak-Calling Summary",
+  "not_complete"
+))
+assert(
+  grepl("summary-job-bar active", summary_job_html, fixed = TRUE) &&
+    grepl("Job 12345", summary_job_html, fixed = TRUE),
+  "CUT&RUN summary jobs visibly show an active progress bar and SLURM job ID"
+)
 atac_project_variant <- within(chip_project, { analysis_key <- "atac"; analysis <- "ATAC-seq" })
 assert(identical(tail(app_env$pipeline_order(atac_project_variant), 1), "Differential Peaks"), "ATAC annotation runs inside MACS2 and DiffBind rather than as a final step")
 assert(identical(app_env$canonical_job_step("peak_annotation"), "Peak Annotation"), "peak annotation job labels canonicalize")
