@@ -668,6 +668,74 @@ writeLines(c(
 writeLines(c("sample\tS1", paste0("overlap_name\t", app_env$cutrun_peak_overlap_name(shared_seacr_id, shared_macs_id)), "source_a_peaks\t2", "source_b_peaks\t2", "overlap_peaks\t2", "minimum_reciprocal_overlap\t0", paste0("overlap_bed\t", shared_overlap_bed), paste0("ranking_tsv\t", shared_overlap_ranking)), shared_overlap_summary)
 shared_overlap_summary_table <- app_env$cutrun_peak_overlap_summary_table(seacr_selector_project)
 assert(NROW(shared_overlap_summary_table) == 1L && shared_overlap_summary_table[["Shared overlap peaks"]][[1]] == "2", "shared peak-overlap output produces a compact per-sample summary table")
+diffbind_design <- data.frame(
+  sample = c("S1", "S2", "S3", "S4"),
+  cell_type = "Model",
+  mark = "Creb",
+  target_class = "tf_or_other",
+  condition = c("A", "A", "B", "B"),
+  replicate = c(1, 2, 1, 2),
+  control_sample = "",
+  filename = paste0("S", 1:4, "_R1.fastq.gz,S", 1:4, "_R2.fastq.gz"),
+  stringsAsFactors = FALSE
+)
+write.table(diffbind_design, seacr_selector_design_path, sep = "\t", row.names = FALSE, quote = FALSE)
+for (sample in c("S2", "S3", "S4")) {
+  macs_dir <- file.path(seacr_selector_project$data_dir, "macs2", sample)
+  dir.create(macs_dir, recursive = TRUE, showWarnings = FALSE)
+  macs_peak <- file.path(macs_dir, paste0(sample, "_peaks.narrowPeak"))
+  writeLines(c("chr1\t100\t220\tpeak1\t100", "chr1\t400\t520\tpeak2\t100"), macs_peak)
+  writeLines(c(paste0("sample\t", sample), "qval\t0.01", "peak_type\tnarrow", paste0("peak_file\t", macs_peak), "peak_count\t2"), file.path(macs_dir, paste0(sample, "_macs2_summary.txt")))
+  overlap_bed <- app_env$cutrun_peak_overlap_bed(seacr_selector_project, shared_seacr_id, shared_macs_id, sample)
+  dir.create(dirname(overlap_bed), recursive = TRUE, showWarnings = FALSE)
+  writeLines(c("chr1\t150\t220", "chr1\t430\t500"), overlap_bed)
+  writeLines(c(
+    paste0("sample\t", sample),
+    paste0("overlap_name\t", app_env$cutrun_peak_overlap_name(shared_seacr_id, shared_macs_id)),
+    "source_a_peaks\t2", "source_b_peaks\t2", "overlap_peaks\t2",
+    paste0("overlap_bed\t", overlap_bed)
+  ), sub("\\.bed$", "_summary.txt", overlap_bed))
+}
+for (sample in paste0("S", 1:4)) {
+  bam <- app_env$cutrun_bowtie2_signal_bam(seacr_selector_project, sample)
+  dir.create(dirname(bam), recursive = TRUE, showWarnings = FALSE)
+  writeBin(as.raw(seq_len(64)), bam)
+}
+diffbind_sources <- app_env$cutrun_diffbind_peak_source_catalog(seacr_selector_project)
+shared_diffbind_id <- paste0("shared_", app_env$cutrun_peak_overlap_name(shared_seacr_id, shared_macs_id))
+assert(all(c(shared_macs_id, shared_diffbind_id) %in% diffbind_sources$source_id), "CUT&RUN DiffBind can select MACS2 or a completed shared-overlap peak source")
+assert(
+  identical(
+    app_env$cutrun_peak_source_file(seacr_selector_project, shared_diffbind_id, "S1", sources = diffbind_sources),
+    normalizePath(shared_overlap_bed)
+  ),
+  "shared-overlap DiffBind source resolves the selected per-sample BED"
+)
+two_rep_plan <- app_env$cutrun_diffbind_comparison_plan(seacr_selector_project, "A", 1L, shared_diffbind_id, 2L)
+assert(NROW(two_rep_plan) == 1L && isTRUE(two_rep_plan$eligible[[1]]) && two_rep_plan$comparison_replicates[[1]] == 2L && two_rep_plan$reference_replicates[[1]] == 2L, "CUT&RUN DiffBind accepts exactly two biological replicates per condition")
+strict_peak_plan <- app_env$cutrun_diffbind_comparison_plan(seacr_selector_project, "A", 1L, shared_diffbind_id, 3L)
+assert(NROW(strict_peak_plan) == 1L && !isTRUE(strict_peak_plan$eligible[[1]]) && grepl("Below 3 peaks", strict_peak_plan$reason[[1]], fixed = TRUE), "CUT&RUN DiffBind excludes comparisons when any selected source has fewer than the requested peaks")
+resolved_shared_sheet <- app_env$cutrun_diffbind_sample_sheet(seacr_selector_project, "A", 1L, "Model", "Creb", "B", shared_diffbind_id, 2L, "cpm")
+resolved_shared <- read.delim(resolved_shared_sheet, check.names = FALSE, stringsAsFactors = FALSE)
+assert(
+  NROW(resolved_shared) == 4L && all(resolved_shared$PeakCount == 2L) &&
+    all(grepl("/peak_overlap/", resolved_shared$Peaks, fixed = TRUE)),
+  "resolved CUT&RUN DiffBind sheet records the chosen shared-overlap paths and per-sample peak counts"
+)
+inferred_project <- seacr_selector_project
+inferred_project$data_dir <- file.path(root, "cutrun_inferred_results")
+inferred_project$design_matrix_path <- file.path(inferred_project$data_dir, "manifest", "design_matrix.txt")
+for (sample in c("AKPS_Creb-AA1", "AKPS_Creb-AA2", "AKPS_Creb-Veh1", "AKPS_Creb-Veh2", "AKPS_IgG_AA", "AKPS_IgG_Veh")) {
+  dir.create(file.path(inferred_project$data_dir, "bowtie2", sample), recursive = TRUE, showWarnings = FALSE)
+}
+inferred_design <- app_env$project_design_df(inferred_project)
+assert(
+  NROW(inferred_design) == 6L &&
+    all(c("AA", "Veh") %in% inferred_design$condition) &&
+    all(c("1", "2") %in% inferred_design$replicate) &&
+    sum(tolower(inferred_design$mark) == "igg") == 2L,
+  "completed CUT&RUN outputs without a saved manifest infer sample, condition, replicate, mark, and control metadata from sample folders"
+)
 shared_overlap_navigation <- app_env$cutrun_individual_peak_navigation(shared_overlap_bed, max_peaks = 2L)
 assert(
   identical(unname(shared_overlap_navigation$peaks[[1]]), "chr1:151-220") && grepl("combined rank 2", names(shared_overlap_navigation$peaks)[[1]], fixed = TRUE),

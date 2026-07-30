@@ -1452,6 +1452,7 @@ write_design_matrix <- function(project, df, metadata_cols) {
 
 project_design_df <- function(project) {
   df <- safe_read_table(project$design_matrix_path)
+  if (!NROW(df) && is_cutrun_project(project)) df <- cutrun_inferred_result_design(project)
   if (!NROW(df)) return(data.frame())
   if (!"sample" %in% names(df)) names(df)[1] <- "sample"
   df
@@ -1474,6 +1475,15 @@ design_editor_from_project <- function(project, metadata_cols = NULL) {
       df$status <- "saved"
       df <- df[, c("include", setdiff(names(df), c("include", "status")), "status"), drop = FALSE]
       if (is_chip_project(project)) df <- infer_chip_metadata(df)
+      return(ensure_design_metadata_columns(df, metadata_cols))
+    }
+  }
+  if (is_cutrun_project(project)) {
+    df <- cutrun_inferred_result_design(project)
+    if (NROW(df)) {
+      df$include <- TRUE
+      df$status <- "inferred from completed output folders"
+      df <- df[, c("include", setdiff(names(df), c("include", "status")), "status"), drop = FALSE]
       return(ensure_design_metadata_columns(df, metadata_cols))
     }
   }
@@ -2570,7 +2580,7 @@ tool_reference_summary <- function(project) {
       c("Tool", "Bowtie2", bowtie2_modules, "CUT&RUN fragment alignment and normalization", ref$label, "Defaults: MAPQ 30, max fragment 1000 bp, E. coli K-12 MG1655 spike-in normalization, keep target duplicates, deduplicate IgG/input controls, and remove mitochondrial fragments from peak-calling bedGraphs. CPM tracks are also written from the same fragments for visualization and comparison."),
       c("Tool", "SEACR", seacr_modules, "Recommended sparse CUT&RUN peak calling and FRiP QC", "Spike-in, CPM, or raw fragment bedGraphs and matched IgG/input control bedGraph", "With spike-in Bowtie2 normalization, the default SEACR non configuration uses spike-in-scaled tracks. The raw/norm configuration makes SEACR normalize the control internally. Each configuration is stored separately."),
       c("Tool", "Peak QC", "BEDTools module listed in CodeSpringLab script", "Consensus peaks, peak count matrix, and FRiP summary", "SEACR peak BED files and Bowtie2 BAM files", "Merges SEACR peaks across samples and counts fragments over consensus peaks."),
-      c("Tool", "DiffBind/DESeq2", diffbind_modules, "Mark-specific CUT&RUN differential binding", "SEACR peaks, target BAMs, and automatically resolved E. coli spike-in BAMs", "Analyzes each cell type/mark separately and compares every non-reference condition with the selected reference. At least two biological replicates are required in each condition. The ATAC-like default admits a peak supported by one or more replicates; stricter consensus support is available under Advanced. Native SEACR widths are preserved with summits=FALSE; IgG BAMs are not subtracted again."),
+      c("Tool", "DiffBind/DESeq2", diffbind_modules, "Mark-specific CUT&RUN differential binding", "Selected MACS2, shared-overlap, or SEACR peaks; target BAMs; and automatically resolved E. coli spike-in BAMs", "Analyzes each cell type/mark separately and compares every non-reference condition with the selected reference. At least two biological replicates are required in each condition, and every sample must meet the selected minimum peak count. The default consensus admits a peak supported by one or more replicates; stricter two-replicate support is available under Advanced. Native peak widths are preserved with summits=FALSE; IgG BAMs are not subtracted again."),
       c("Tool", "MACS2", macs2_modules, "Optional peak calling comparison", "Bowtie2 BAM and optional IgG/input control BAM", "Default q-value 0.01. Auto mode uses broad peaks for histone_broad targets and narrow peaks for histone_narrow or tf_or_other targets; a run-wide narrow or broad override remains available."),
       c("Tool", "Shared peak overlap", "BEDTools 2.30.0", "Per-sample intersection of two selected peak caller/settings", "Completed SEACR and/or MACS2 peak files", "Writes the exact shared genomic intervals as a merged three-column BED. Output folders encode both selected caller/settings; a reciprocal-overlap threshold can be selected, with 0 meaning any shared base.")
     )
@@ -6440,8 +6450,26 @@ submit_cutadapt_jobs <- function(project, adapter1, adapter2, min_length, sample
   paste(append_plan_message(messages, plan), collapse = "\n")
 }
 
+cutrun_inferred_result_design <- function(project) {
+  roots <- file.path(project$data_dir, c("bowtie2", "macs2"))
+  samples <- unique(unlist(lapply(roots[dir.exists(roots)], function(root) {
+    basename(list.dirs(root, recursive = FALSE, full.names = TRUE))
+  }), use.names = FALSE))
+  samples <- sort(trimws(samples))
+  samples <- samples[nzchar(samples) & !grepl("^(tmp|temp|logs?|summary|manifest)$", samples, ignore.case = TRUE)]
+  if (!length(samples)) return(data.frame())
+  design <- data.frame(
+    include = TRUE,
+    sample = samples,
+    filename = "",
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  infer_cutrun_metadata(design)
+}
+
 cutrun_design <- function(project) {
-  design <- safe_read_table(project$design_matrix_path)
+  design <- project_design_df(project)
   if (!NROW(design)) return(design)
   if (!"sample" %in% names(design)) names(design)[1] <- "sample"
   if ("include" %in% names(design)) {
@@ -6553,6 +6581,42 @@ cutrun_peak_source_catalog <- function(project) {
   value
 }
 
+# Differential binding can use any completed per-sample peak definition.
+# Shared-overlap outputs are intentionally added only here—not to the overlap
+# generator itself—so overlap results cannot recursively become overlap inputs.
+cutrun_diffbind_peak_source_catalog <- function(project) {
+  sources <- cutrun_peak_source_catalog(project)
+  overlap_root <- file.path(project$data_dir, "peak_overlap")
+  overlap_sets <- if (dir.exists(overlap_root)) {
+    dirs <- list.dirs(overlap_root, recursive = FALSE, full.names = TRUE)
+    dirs[vapply(dirs, function(path) {
+      length(list.files(path, pattern = "_overlap_peaks_summary\\.txt$", recursive = TRUE, full.names = TRUE)) > 0L
+    }, logical(1))]
+  } else character(0)
+  if (length(overlap_sets)) {
+    overlap_rows <- lapply(sort(overlap_sets), function(path) {
+      setting <- basename(path)
+      summaries <- list.files(path, pattern = "_overlap_peaks_summary\\.txt$", recursive = TRUE, full.names = TRUE)
+      completed <- sum(vapply(summaries, function(summary) {
+        values <- metric_file_to_named_list(summary)
+        peak_path <- trimws(as.character(values[["overlap_bed"]] %||% sub("_summary\\.txt$", ".bed", summary)))
+        file.exists(peak_path) && file_size_for(peak_path) > 0
+      }, logical(1)))
+      data.frame(
+        source_id = paste0("shared_", setting),
+        tool = "Shared overlap",
+        setting = setting,
+        label = paste0("Shared overlap — ", setting, " (", completed, " non-empty sample", if (completed == 1L) "" else "s", ")"),
+        stringsAsFactors = FALSE, check.names = FALSE
+      )
+    })
+    sources <- rbind(sources, do.call(rbind, overlap_rows))
+  }
+  if (!NROW(sources)) return(sources)
+  tool_rank <- match(sources$tool, c("MACS2", "Shared overlap", "SEACR"))
+  sources[order(tool_rank, sources$label), , drop = FALSE]
+}
+
 cutrun_peak_source_file <- function(project, source_id, sample, sources = NULL) {
   if (is.null(sources)) sources <- cutrun_peak_source_catalog(project)
   source <- sources[sources$source_id == source_id, , drop = FALSE]
@@ -6561,6 +6625,11 @@ cutrun_peak_source_file <- function(project, source_id, sample, sources = NULL) 
     method <- source$setting[[1]]
     stringency <- sub("^.*_(stringent|relaxed)$", "\\1", method)
     path <- file.path(project$data_dir, "seacr", method, sample, paste0(sample, ".", stringency, ".bed"))
+    return(if (file.exists(path) && file_size_for(path) > 0) normalizePath(path, winslash = "/", mustWork = TRUE) else "")
+  }
+  if (identical(source$tool[[1]], "Shared overlap")) {
+    setting <- source$setting[[1]]
+    path <- file.path(project$data_dir, "peak_overlap", setting, sample, paste0(sample, "_", setting, ".bed"))
     return(if (file.exists(path) && file_size_for(path) > 0) normalizePath(path, winslash = "/", mustWork = TRUE) else "")
   }
   macs_root <- file.path(project$data_dir, "macs2", sample)
@@ -6578,6 +6647,33 @@ cutrun_peak_source_files <- function(project, source_id, samples, sources = NULL
   if (is.null(sources)) sources <- cutrun_peak_source_catalog(project)
   samples <- unique(as.character(samples %||% character(0)))
   stats::setNames(vapply(samples, function(sample) cutrun_peak_source_file(project, source_id, sample, sources = sources), character(1)), samples)
+}
+
+cutrun_peak_source_total <- function(project, source_id, sample, sources = NULL) {
+  if (is.null(sources)) sources <- cutrun_diffbind_peak_source_catalog(project)
+  source <- sources[sources$source_id == source_id, , drop = FALSE]
+  if (!NROW(source)) return(NA_real_)
+  path <- cutrun_peak_source_file(project, source_id, sample, sources = sources)
+  if (!nzchar(path)) return(NA_real_)
+  if (identical(source$tool[[1]], "SEACR")) {
+    return(cutrun_seacr_peak_total(path))
+  }
+  if (identical(source$tool[[1]], "MACS2")) {
+    values <- metric_file_to_named_list(file.path(project$data_dir, "macs2", sample, paste0(sample, "_macs2_summary.txt")))
+    total <- suppressWarnings(as.numeric(values[["peak_count"]] %||% NA_character_))
+    if (is.finite(total)) return(total)
+  }
+  if (identical(source$tool[[1]], "Shared overlap")) {
+    values <- metric_file_to_named_list(sub("\\.bed$", "_summary.txt", path))
+    total <- suppressWarnings(as.numeric(values[["overlap_peaks"]] %||% NA_character_))
+    if (is.finite(total)) return(total)
+  }
+  length(tryCatch(readLines(path, warn = FALSE), error = function(e) character(0)))
+}
+
+cutrun_peak_source_label <- function(sources, source_id) {
+  hit <- sources[sources$source_id == source_id, , drop = FALSE]
+  if (NROW(hit)) as.character(hit$label[[1]]) else as.character(source_id %||% "")
 }
 
 cutrun_peak_overlap_name <- function(source_a, source_b) {
@@ -7621,11 +7717,18 @@ cutrun_diffbind_conditions <- function(project) {
   c(preferred, setdiff(sort(values), preferred))
 }
 
-cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_replicates = 1L) {
+cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_replicates = 1L, peak_source_id = "", min_peaks_per_sample = 100L) {
   design <- cutrun_target_design(project, include_controls = FALSE)
   reference_condition <- trimws(as.character(reference_condition %||% ""))
-  required <- max(2L, suppressWarnings(as.integer(min_replicates)))
+  required <- suppressWarnings(as.integer(min_replicates))
+  if (!is.finite(required) || required < 1L) required <- 1L
+  required <- max(2L, required)
+  min_peaks_per_sample <- suppressWarnings(as.integer(min_peaks_per_sample))
+  if (!is.finite(min_peaks_per_sample) || min_peaks_per_sample < 1L) min_peaks_per_sample <- 100L
+  sources <- cutrun_diffbind_peak_source_catalog(project)
+  peak_source_id <- trimws(as.character(peak_source_id %||% ""))
   if (!NROW(design) || !nzchar(reference_condition)) return(data.frame())
+  if (!nzchar(peak_source_id) || !peak_source_id %in% sources$source_id) return(data.frame())
   design$cell_type <- trimws(as.character(design$cell_type)); design$cell_type[!nzchar(design$cell_type)] <- "all"
   design$mark <- trimws(as.character(design$mark))
   design$condition <- trimws(as.character(design$condition))
@@ -7639,14 +7742,41 @@ cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_re
     for (comparison in comparisons) {
       n_reference <- if (reference_condition %in% names(tab)) as.integer(tab[[reference_condition]]) else 0L
       n_comparison <- as.integer(tab[[comparison]])
-      eligible <- n_reference >= required && n_comparison >= required
+      selected_rows <- group$condition %in% c(reference_condition, comparison)
+      selected_samples <- as.character(group$sample[selected_rows])
+      peak_counts <- stats::setNames(vapply(selected_samples, function(sample) {
+        cutrun_peak_source_total(project, peak_source_id, sample, sources = sources)
+      }, numeric(1)), selected_samples)
+      missing_peak_samples <- names(peak_counts)[!is.finite(peak_counts)]
+      low_peak_samples <- names(peak_counts)[is.finite(peak_counts) & peak_counts < min_peaks_per_sample]
+      replicate_ready <- n_reference >= required && n_comparison >= required
+      peaks_ready <- !length(missing_peak_samples) && !length(low_peak_samples)
+      eligible <- replicate_ready && peaks_ready
+      minimum_observed <- if (length(peak_counts) && any(is.finite(peak_counts))) min(peak_counts[is.finite(peak_counts)]) else NA_real_
+      reason <- if (!replicate_ready) {
+        sprintf("Needs at least %s biological replicates in both conditions", required)
+      } else if (length(missing_peak_samples)) {
+        paste("Missing selected peak source for:", paste(missing_peak_samples, collapse = ", "))
+      } else if (length(low_peak_samples)) {
+        paste0(
+          "Below ", min_peaks_per_sample, " peaks: ",
+          paste(paste0(low_peak_samples, " (", as.integer(peak_counts[low_peak_samples]), ")"), collapse = ", ")
+        )
+      } else {
+        "Ready"
+      }
       id <- paste(cell_type, mark, comparison, sep = "|||")
       rows[[length(rows) + 1L]] <- data.frame(
         id = id,
-        label = sprintf("%s — %s — %s vs %s (%s + %s reps)", cell_type, mark, comparison, reference_condition, n_comparison, n_reference),
+        label = sprintf(
+          "%s — %s — %s vs %s (%s + %s reps; minimum %s peaks/sample)",
+          cell_type, mark, comparison, reference_condition, n_comparison, n_reference,
+          if (is.finite(minimum_observed)) format(as.integer(minimum_observed), big.mark = ",") else "unavailable"
+        ),
         cell_type = cell_type, mark = mark, comparison = comparison, reference = reference_condition,
         comparison_replicates = n_comparison, reference_replicates = n_reference, eligible = eligible,
-        reason = if (eligible) "Ready" else sprintf("Needs at least %s replicates in both conditions", required),
+        peak_source = peak_source_id, minimum_peaks_observed = minimum_observed,
+        minimum_peaks_required = min_peaks_per_sample, reason = reason,
         stringsAsFactors = FALSE
       )
     }
@@ -7656,11 +7786,17 @@ cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_re
   out[order(!out$eligible, out$cell_type, out$mark, out$comparison), , drop = FALSE]
 }
 
-cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_replicates = 1L, cell_type = "", mark = "", comparison = "", seacr_norm = "non", seacr_stringency = "stringent", track = "cpm") {
+cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_replicates = 1L, cell_type = "", mark = "", comparison = "", peak_source_id = "", min_peaks_per_sample = 100L, track = "cpm") {
   design <- cutrun_target_design(project, include_controls = FALSE)
   if (!NROW(design)) stop("No non-control CUT&RUN samples were found in design_matrix.txt.")
   reference_condition <- trimws(as.character(reference_condition %||% ""))
   if (!nzchar(reference_condition)) stop("Choose a reference condition for differential peak analysis.")
+  min_peaks_per_sample <- suppressWarnings(as.integer(min_peaks_per_sample))
+  if (!is.finite(min_peaks_per_sample) || min_peaks_per_sample < 1L) min_peaks_per_sample <- 100L
+  sources <- cutrun_diffbind_peak_source_catalog(project)
+  peak_source_id <- trimws(as.character(peak_source_id %||% ""))
+  if (!nzchar(peak_source_id) || !peak_source_id %in% sources$source_id) stop("Choose a completed CUT&RUN peak source for differential analysis.")
+  peak_source_label <- cutrun_peak_source_label(sources, peak_source_id)
 
   blank_mark <- !nzchar(trimws(as.character(design$mark)))
   blank_condition <- !nzchar(trimws(as.character(design$condition)))
@@ -7688,7 +7824,9 @@ cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_repli
       Condition = trimws(as.character(design$condition[[i]])),
       Replicate = trimws(as.character(design$replicate[[i]])),
       bamReads = cutrun_bowtie2_signal_bam(project, sample),
-      Peaks = cutrun_seacr_peak_path(project, sample, seacr_norm, seacr_stringency, track),
+      Peaks = cutrun_peak_source_file(project, peak_source_id, sample, sources = sources),
+      PeakSource = peak_source_label,
+      PeakCount = cutrun_peak_source_total(project, peak_source_id, sample, sources = sources),
       Spikein = if (use_spikein) cutrun_spikein_bam(project, sample) else "",
       normalization_mode = if (use_spikein) "spikein" else "none",
       stringsAsFactors = FALSE
@@ -7705,10 +7843,17 @@ cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_repli
   missing_spike <- sheet$Spikein[spike_expected & (!file.exists(sheet$Spikein) | vapply(sheet$Spikein, file_size_for, numeric(1)) <= 0)]
   missing_inputs <- unique(c(missing_inputs, missing_spike))
   missing_inputs <- missing_inputs[nzchar(missing_inputs)]
-  if (length(missing_inputs)) stop(paste(c("Run Bowtie2 and SEACR successfully for every target sample first. Missing or empty inputs:", missing_inputs), collapse = "\n"))
+  if (length(missing_inputs)) stop(paste(c("Run Bowtie2 and the selected peak source successfully for every target sample first. Missing or empty inputs:", missing_inputs), collapse = "\n"))
+  invalid_peak_counts <- !is.finite(sheet$PeakCount) | sheet$PeakCount < min_peaks_per_sample
+  if (any(invalid_peak_counts)) {
+    detail <- paste0(sheet$SampleID[invalid_peak_counts], " (", ifelse(is.finite(sheet$PeakCount[invalid_peak_counts]), as.integer(sheet$PeakCount[invalid_peak_counts]), "unavailable"), ")")
+    stop("Every sample needs at least ", min_peaks_per_sample, " peaks from the selected source. Below threshold: ", paste(detail, collapse = ", "))
+  }
 
   group_key <- paste(sheet$CellType, sheet$Mark, sep = "__")
-  required_replicates <- max(2L, suppressWarnings(as.integer(min_replicates)))
+  required_replicates <- suppressWarnings(as.integer(min_replicates))
+  if (!is.finite(required_replicates) || required_replicates < 1L) required_replicates <- 1L
+  required_replicates <- max(2L, required_replicates)
   analyzable <- vapply(split(seq_len(NROW(sheet)), group_key), function(idx) {
     tab <- table(sheet$Condition[idx])
     length(tab) >= 2L && reference_condition %in% names(tab) && tab[[reference_condition]] >= required_replicates && any(tab[setdiff(names(tab), reference_condition)] >= required_replicates)
@@ -7719,16 +7864,24 @@ cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_repli
 
   out_dir <- file.path(project$data_dir, "manifest", "cutrun_diffbind")
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-  sheet_name <- if (nzchar(cell_type) || nzchar(mark) || nzchar(comparison)) clean_name(paste(cutrun_seacr_combo_key(seacr_norm, seacr_stringency, track), cell_type, mark, comparison, "vs", reference_condition, sep = "_"), "comparison") else paste0(cutrun_seacr_combo_key(seacr_norm, seacr_stringency, track), "_resolved_samples")
+  sheet_name <- if (nzchar(cell_type) || nzchar(mark) || nzchar(comparison)) clean_name(paste(peak_source_id, cell_type, mark, comparison, "vs", reference_condition, sep = "_"), "comparison") else paste0(clean_name(peak_source_id, "peak_source"), "_resolved_samples")
   path <- file.path(out_dir, paste0(sheet_name, ".tsv"))
   utils::write.table(sheet, path, sep = "\t", row.names = FALSE, quote = FALSE)
   path
 }
 
-submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison_ids, min_replicates = 1L, seacr_norm = "non", seacr_stringency = "stringent", track = "cpm") {
+submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison_ids, min_replicates = 1L, peak_source_id = "", min_peaks_per_sample = 100L, track = "cpm") {
   min_replicates <- suppressWarnings(as.integer(min_replicates))
   if (!is.finite(min_replicates) || min_replicates < 1L) min_replicates <- 1L
-  plan <- cutrun_diffbind_comparison_plan(project, reference_condition, min_replicates)
+  min_peaks_per_sample <- suppressWarnings(as.integer(min_peaks_per_sample))
+  if (!is.finite(min_peaks_per_sample) || min_peaks_per_sample < 1L) min_peaks_per_sample <- 100L
+  sources <- cutrun_diffbind_peak_source_catalog(project)
+  peak_source_id <- trimws(as.character(peak_source_id %||% ""))
+  if (!nzchar(peak_source_id) || !peak_source_id %in% sources$source_id) {
+    return(record_preflight_failure(project, "Differential Peaks", "Choose a completed MACS2, shared-overlap, or SEACR peak source.", "cutrun_diffbind"))
+  }
+  peak_source_label <- cutrun_peak_source_label(sources, peak_source_id)
+  plan <- cutrun_diffbind_comparison_plan(project, reference_condition, min_replicates, peak_source_id, min_peaks_per_sample)
   comparison_ids <- unique(as.character(comparison_ids %||% character(0)))
   selected <- plan[plan$id %in% comparison_ids & plan$eligible, , drop = FALSE]
   if (!NROW(selected)) return(record_preflight_failure(project, "Differential Peaks", "Select at least one eligible cell type/mark comparison.", "cutrun_diffbind"))
@@ -7748,7 +7901,7 @@ submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison
   messages <- character(0)
   for (i in seq_len(NROW(selected))) {
     spec <- selected[i, , drop = FALSE]
-    run_slug <- paste(cutrun_seacr_combo_key(seacr_norm, seacr_stringency, track), clean_name(spec$cell_type), clean_name(spec$mark), paste0(clean_name(spec$comparison), "_vs_", clean_name(reference_condition)), sep = "__")
+    run_slug <- paste(clean_name(peak_source_id, "peak_source"), clean_name(spec$cell_type), clean_name(spec$mark), paste0(clean_name(spec$comparison), "_vs_", clean_name(reference_condition)), sep = "__")
     outdir <- file.path(root, run_slug); dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
     target <- file.path(outdir, "_COMPLETE")
     if (file.exists(target)) {
@@ -7760,15 +7913,15 @@ submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison
     if (NROW(active)) {
       messages <- c(messages, paste(spec$label, "is already active; skipped.")); next
     }
-    sample_sheet <- tryCatch(cutrun_diffbind_sample_sheet(project, reference_condition, min_replicates, spec$cell_type, spec$mark, spec$comparison, seacr_norm, seacr_stringency, track), error = function(e) e)
+    sample_sheet <- tryCatch(cutrun_diffbind_sample_sheet(project, reference_condition, min_replicates, spec$cell_type, spec$mark, spec$comparison, peak_source_id, min_peaks_per_sample, track), error = function(e) e)
     if (inherits(sample_sheet, "error")) {
       messages <- c(messages, record_preflight_failure(project, "Differential Peaks", paste(spec$label, conditionMessage(sample_sheet), sep = ": "), "cutrun_diffbind")); next
     }
     messages <- c(messages, submit_sbatch(
       project, "Differential Peaks", qsub,
-      c(r_script, sample_sheet, outdir, reference_condition, min_replicates, genome_species(project), if (nzchar(blacklist)) blacklist else "none", spec$comparison, spec$cell_type, spec$mark, runner),
-      "cutrun_diffbind", paste(spec$label, ";", cutrun_seacr_combo_key(seacr_norm, seacr_stringency, track), "; consensus support", min_replicates), sample = run_slug,
-      target = target, reference = paste("SEACR + DiffBind/DESeq2;", genome_species(project))
+      c(r_script, sample_sheet, outdir, reference_condition, min_replicates, genome_species(project), if (nzchar(blacklist)) blacklist else "none", spec$comparison, spec$cell_type, spec$mark, min_peaks_per_sample, peak_source_id, runner),
+      "cutrun_diffbind", paste(spec$label, ";", peak_source_label, "; minimum", min_peaks_per_sample, "peaks/sample; consensus support", min_replicates), sample = run_slug,
+      target = target, reference = paste(peak_source_label, "+ DiffBind/DESeq2;", genome_species(project))
     ))
   }
   paste(messages, collapse = "\n")
@@ -10751,15 +10904,18 @@ server <- function(input, output, session) {
         tool_panel("Differential Peaks", status, "Build mark-specific reproducible consensus peaks and test differential binding with DiffBind/DESeq2.",
           tagList(
             uiOutput("cutrun_diffbind_reference_ui"),
+            uiOutput("cutrun_diffbind_peak_source_ui"),
+            numericInput("cutrun_diffbind_min_peaks", "Minimum called peaks per sample", value = input$cutrun_diffbind_min_peaks %||% 100, min = 1, step = 25),
             uiOutput("cutrun_diffbind_jobs_ui"),
-            tags$p(class = "muted small-note", "Differential Peaks uses only the SEACR normalization/stringency combination selected above and stores that combination separately."),
-            tags$p(class = "muted small-note", "Default behavior matches the ATAC analysis: at least two biological replicates are required per condition, while the consensus includes peaks found in one or more replicates."),
+            tags$p(class = "muted small-note", "Choose a completed MACS2, shared-overlap, or SEACR peak set. Each peak source is stored in a separate differential-results folder, so the same comparison can be run with more than one peak definition."),
+            tags$p(class = "muted small-note", "Only comparisons with at least two biological replicates per condition and at least the selected number of peaks in every sample are selectable. The default minimum is 100 peaks per sample."),
+            tags$p(class = "muted small-note", "DiffBind count normalization still follows the signal configuration selected in the SEACR panel: spike-in uses the E. coli BAMs; CPM/raw configurations use genomic background normalization. Peak-source selection does not rescale MACS2 or overlap BED files."),
             tags$details(
               tags$summary("Advanced consensus setting"),
               numericInput("cutrun_diffbind_min_replicates", "Replicates that must support a peak", value = 1, min = 1, step = 1),
-              tags$p(class = "muted small-note", "Use 2 only when you want every retained condition-consensus peak to occur in at least two replicates. This can be too restrictive for shallow subset tests.")
+              tags$p(class = "muted small-note", "With two biological replicates per condition, use 1 to retain peaks observed in either replicate or 2 to require support from both replicates. Both settings still require two samples in each condition.")
             ),
-            tags$p(class = "muted small-note", "Each selected cell type/mark comparison is submitted as its own SLURM job and writes to its own results folder. Native SEACR widths are preserved; E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
+            tags$p(class = "muted small-note", "Each selected cell type/mark comparison is submitted as its own SLURM job. Native peak widths are preserved, and E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
           ),
           "run_cutrun_diffbind", "Submit selected comparison jobs"),
         tool_panel("MACS2 (optional)", status, "Optional MACS2 peak calling for comparison or broad histone-mark peaks.",
@@ -10860,12 +11016,28 @@ server <- function(input, output, session) {
     )
   })
 
+  output$cutrun_diffbind_peak_source_ui <- renderUI({
+    p <- current_project()
+    if (!is_cutrun_project(p)) return(NULL)
+    sources <- cutrun_diffbind_peak_source_catalog(p)
+    if (!NROW(sources)) return(div(class = "empty-box", "Complete MACS2, a shared peak-overlap run, or SEACR before differential analysis."))
+    choices <- stats::setNames(as.character(sources$source_id), as.character(sources$label))
+    current <- selected_choice(input$cutrun_diffbind_peak_source, choices, unname(choices)[[1]])
+    selectInput(
+      "cutrun_diffbind_peak_source", "Peak source",
+      choices = choices, selected = current, selectize = FALSE
+    )
+  })
+
   output$cutrun_diffbind_jobs_ui <- renderUI({
     p <- current_project()
     if (!is_cutrun_project(p)) return(NULL)
     reference <- input$cutrun_diffbind_reference %||% ""
     support <- input$cutrun_diffbind_min_replicates %||% 1
-    plan <- cutrun_diffbind_comparison_plan(p, reference, support)
+    peak_source <- input$cutrun_diffbind_peak_source %||% ""
+    min_peaks <- input$cutrun_diffbind_min_peaks %||% 100
+    plan <- cutrun_diffbind_comparison_plan(p, reference, support, peak_source, min_peaks)
+    if (!nzchar(peak_source)) return(div(class = "empty-box", "Choose a completed peak source."))
     if (!NROW(plan)) return(div(class = "empty-box", "No non-reference comparisons were found for this reference condition."))
     eligible <- plan[plan$eligible, , drop = FALSE]
     unavailable <- plan[!plan$eligible, , drop = FALSE]
@@ -10876,7 +11048,7 @@ server <- function(input, output, session) {
     tagList(
       selectInput("cutrun_diffbind_jobs", "Comparisons (one SLURM job each)", choices = choices, selected = current, multiple = TRUE),
       if (NROW(unavailable)) tags$details(
-        tags$summary(sprintf("%s under-replicated group%s not selectable", NROW(unavailable), ifelse(NROW(unavailable) == 1L, " is", "s are"))),
+        tags$summary(sprintf("%s comparison%s below replicate/peak requirements", NROW(unavailable), ifelse(NROW(unavailable) == 1L, " is", "s are"))),
         tags$ul(lapply(seq_len(NROW(unavailable)), function(i) tags$li(paste(unavailable$label[[i]], "—", unavailable$reason[[i]]))))
       )
     )
@@ -11324,11 +11496,13 @@ server <- function(input, output, session) {
     reference <- input$cutrun_diffbind_reference %||% ""
     support <- input$cutrun_diffbind_min_replicates %||% 1
     comparisons <- input$cutrun_diffbind_jobs %||% character(0)
+    peak_source <- input$cutrun_diffbind_peak_source %||% ""
+    min_peaks <- input$cutrun_diffbind_min_peaks %||% 100
     config <- cutrun_seacr_config(input$cutrun_seacr_config %||% "spikein_non")
     run_submission(
       "Differential Peaks",
-      submit_cutrun_diffbind_jobs(current_project(), reference, comparisons, support, config$norm, input$cutrun_seacr_stringency %||% "stringent", config$track),
-      paste(length(comparisons), "comparison job(s);", config$key, input$cutrun_seacr_stringency %||% "stringent", "; reference", reference, "; consensus support", support)
+      submit_cutrun_diffbind_jobs(current_project(), reference, comparisons, support, peak_source, min_peaks, config$track),
+      paste(length(comparisons), "comparison job(s); peak source", peak_source, "; minimum", min_peaks, "peaks/sample; reference", reference, "; consensus support", support)
     )
   })
   observeEvent(input$run_cutrun_macs2, {
