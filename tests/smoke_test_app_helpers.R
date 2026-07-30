@@ -61,6 +61,17 @@ assert(
   "comparison views use a separate opt-in for potentially large individual sample peak tracks"
 )
 assert(
+  grepl("new_counts_source_mode", server_source, fixed = TRUE) &&
+    grepl("browse_new_counts_server_file", server_source, fixed = TRUE) &&
+    grepl("open_server_browser(\"new_counts_server_file\", \"file\"", server_source, fixed = TRUE),
+  "counts-only projects support laptop uploads and server-side file browsing"
+)
+assert(
+  grepl("Use selected file", server_source, fixed = TRUE) &&
+    grepl("file.access(value, mode = 4)", server_source, fixed = TRUE),
+  "the server browser selects readable files rather than only folders"
+)
+assert(
   grepl("codespring-igv-locus", server_source, fixed = TRUE),
   "CUT&RUN peak selection navigates the established IGV instance"
 )

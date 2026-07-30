@@ -10267,7 +10267,7 @@ server <- function(input, output, session) {
   progress_refresh_busy <- reactiveVal(FALSE)
   cutrun_normalization_choice <- reactiveVal("spikein")
   genome_browser_mode_state <- reactiveVal("")
-  path_browser <- reactiveValues(target = "", mode = "dir", path = CURRENT_HOME, message = "")
+  path_browser <- reactiveValues(target = "", mode = "dir", path = CURRENT_HOME, selected_file = "", message = "")
   project_selection <- reactiveValues(rna = "", cutrun = "", atac = "", chip = "")
   new_fastq_folders <- reactiveVal(character(0))
 
@@ -10439,13 +10439,22 @@ server <- function(input, output, session) {
     path_browser$target <- target
     path_browser$mode <- mode
     path_browser$path <- normalizePath(browser_start_path(current, mode), winslash = "/", mustWork = FALSE)
+    path_browser$selected_file <- if (identical(mode, "file") && file.exists(path.expand(current)) && !dir.exists(path.expand(current))) {
+      normalizePath(path.expand(current), winslash = "/", mustWork = FALSE)
+    } else {
+      ""
+    }
     path_browser$message <- ""
-    title <- "Choose a server folder"
+    title <- if (identical(mode, "file")) "Choose a server file" else "Choose a server folder"
     showModal(modalDialog(
       title = title,
       div(class = "path-browser-modal",
           div(class = "path-browser-current", textOutput("browser_current_path_text")),
-          textInput("browser_manual_path", "Type or paste a server folder", value = path_browser$path),
+          textInput(
+            "browser_manual_path",
+            if (identical(mode, "file")) "Type or paste a server file or folder" else "Type or paste a server folder",
+            value = if (nzchar(path_browser$selected_file)) path_browser$selected_file else path_browser$path
+          ),
           div(class = "path-browser-actions",
               actionButton("browser_go_path", "Jump to typed path"),
               actionButton("browser_up", "Up one folder"),
@@ -10455,7 +10464,11 @@ server <- function(input, output, session) {
       ),
       footer = tagList(
         modalButton("Cancel"),
-        actionButton("browser_use_current", "Use this folder", class = "btn-primary")
+        actionButton(
+          "browser_use_current",
+          if (identical(mode, "file")) "Use selected file" else "Use this folder",
+          class = "btn-primary"
+        )
       ),
       easyClose = TRUE,
       size = "l"
@@ -10465,6 +10478,9 @@ server <- function(input, output, session) {
   output$browser_current_path_text <- renderText({
     paste(
       "Current folder:", normalizePath(path_browser$path, winslash = "/", mustWork = FALSE),
+      if (identical(path_browser$mode, "file") && nzchar(path_browser$selected_file %||% "")) {
+        paste0("\nSelected file: ", path_browser$selected_file)
+      } else "",
       "\nApp server user:", CURRENT_USER
     )
   })
@@ -10492,7 +10508,18 @@ server <- function(input, output, session) {
       div(class = "empty-box", "This folder has no visible subfolders. You can still use the current folder.")
     }
     visible_files <- listing$files
-    file_list <- if (length(visible_files)) {
+    file_list <- if (identical(path_browser$mode, "file") && length(visible_files)) {
+      selected_file <- path_browser$selected_file %||% ""
+      if (!selected_file %in% visible_files) selected_file <- visible_files[[1]]
+      selectInput(
+        "browser_file_choice",
+        "Files",
+        choices = stats::setNames(visible_files, basename(visible_files)),
+        selected = selected_file,
+        selectize = FALSE,
+        size = min(max(length(visible_files), 6), 18)
+      )
+    } else if (length(visible_files)) {
       tagList(
         tags$h5(paste0("Files in this folder (", length(visible_files), ")")),
         div(class = "path-list compact-path-list", lapply(utils::head(visible_files, 100), function(path) {
@@ -10562,10 +10589,29 @@ server <- function(input, output, session) {
     open_server_browser("new_design_matrix_path", "dir", input$new_design_matrix_path %||% "")
   })
 
+  observeEvent(input$browse_new_counts_server_file, {
+    open_server_browser("new_counts_server_file", "file", input$new_counts_server_file %||% "")
+  })
+
+  observeEvent(input$browse_new_counts_design_server_file, {
+    open_server_browser("new_counts_design_server_file", "file", input$new_counts_design_server_file %||% "")
+  })
+
   observeEvent(input$browser_go_path, {
     candidate <- path.expand(trimws(input$browser_manual_path %||% ""))
+    if (identical(path_browser$mode, "file") && file.exists(candidate) && !dir.exists(candidate)) {
+      if (file.access(candidate, mode = 4) != 0) {
+        path_browser$message <- paste("The app cannot read this file:", candidate)
+        return()
+      }
+      path_browser$message <- ""
+      path_browser$selected_file <- normalizePath(candidate, winslash = "/", mustWork = FALSE)
+      path_browser$path <- normalizePath(dirname(candidate), winslash = "/", mustWork = FALSE)
+      updateTextInput(session, "browser_manual_path", value = path_browser$selected_file)
+      return()
+    }
     if (!nzchar(candidate) || !dir.exists(candidate)) {
-      path_browser$message <- paste("Folder does not exist:", candidate)
+      path_browser$message <- paste(if (identical(path_browser$mode, "file")) "File or folder does not exist:" else "Folder does not exist:", candidate)
       return()
     }
     candidate <- normalizePath(candidate, winslash = "/", mustWork = FALSE)
@@ -10575,11 +10621,13 @@ server <- function(input, output, session) {
     }
     path_browser$message <- ""
     path_browser$path <- candidate
+    path_browser$selected_file <- ""
     updateTextInput(session, "browser_manual_path", value = path_browser$path)
   })
 
   observeEvent(input$browser_up, {
     path_browser$message <- ""
+    path_browser$selected_file <- ""
     path_browser$path <- normalizePath(dirname(path_browser$path), winslash = "/", mustWork = FALSE)
     updateTextInput(session, "browser_manual_path", value = path_browser$path)
   })
@@ -10589,12 +10637,25 @@ server <- function(input, output, session) {
     if (!nzchar(choice)) return()
     if (dir.exists(choice)) {
       path_browser$message <- ""
+      path_browser$selected_file <- ""
       path_browser$path <- normalizePath(choice, winslash = "/", mustWork = FALSE)
       updateTextInput(session, "browser_manual_path", value = path_browser$path)
     }
   })
 
   observeEvent(input$browser_use_current, {
+    if (identical(path_browser$mode, "file")) {
+      value <- input$browser_file_choice %||% path_browser$selected_file %||% ""
+      value <- path.expand(trimws(value))
+      if (!nzchar(value) || !file.exists(value) || dir.exists(value) || file.access(value, mode = 4) != 0) {
+        path_browser$message <- paste("The app cannot use this file:", value)
+        return()
+      }
+      value <- normalizePath(value, winslash = "/", mustWork = FALSE)
+      updateTextInput(session, path_browser$target, value = value)
+      removeModal()
+      return()
+    }
     value <- normalizePath(path_browser$path, winslash = "/", mustWork = FALSE)
     if (!dir.exists(value) || file.access(value, mode = 5) != 0) {
       path_browser$message <- paste("The app cannot use this folder:", value)
@@ -10694,10 +10755,31 @@ server <- function(input, output, session) {
         div(
           class = "read-source-note",
           tags$strong("Counts-only RNA-seq mode"),
-          tags$p("Upload a CSV or tab-delimited matrix with genes in the first column and samples in the remaining numeric columns. Counts are checked, rounded half-up, duplicate gene rows are summed, and the standardized matrix is saved as counts/count_matrix.txt.")
+          tags$p("Choose files from your laptop or browse files already on the app server. The matrix can be CSV or tab-delimited, with genes in the first column and samples in the remaining numeric columns. Counts are checked, rounded half-up, duplicate gene rows are summed, and the standardized matrix is saved as counts/count_matrix.txt.")
         ),
-        fileInput("new_counts_file", "Count matrix", accept = c(".txt", ".tsv", ".csv")),
-        fileInput("new_counts_design_file", "Design matrix (optional)", accept = c(".txt", ".tsv", ".csv")),
+        radioButtons(
+          "new_counts_source_mode", "Where are the input files?",
+          choices = c("Upload from this computer" = "upload", "Browse the app server" = "server"),
+          selected = "upload"
+        ),
+        conditionalPanel(
+          "input.new_counts_source_mode == 'upload'",
+          fileInput("new_counts_file", "Count matrix", accept = c(".txt", ".tsv", ".csv")),
+          fileInput("new_counts_design_file", "Design matrix (optional)", accept = c(".txt", ".tsv", ".csv"))
+        ),
+        conditionalPanel(
+          "input.new_counts_source_mode == 'server'",
+          div(
+            class = "new-project-path-control",
+            textInput("new_counts_server_file", "Count matrix on server", value = "", placeholder = "Choose or paste an absolute server file path"),
+            actionButton("browse_new_counts_server_file", "Browse server", class = "btn-default")
+          ),
+          div(
+            class = "new-project-path-control",
+            textInput("new_counts_design_server_file", "Design matrix on server (optional)", value = "", placeholder = "Choose or paste an absolute server file path"),
+            actionButton("browse_new_counts_design_server_file", "Browse server", class = "btn-default")
+          )
+        ),
         textInput("new_counts_metadata_cols", "Metadata columns if no design is uploaded", value = "treatment", placeholder = "treatment, batch, sex"),
         tags$p(class = "muted", "Without a design file, sample names are taken from the count-matrix column names. Complete the metadata values in the Design Matrix tab before running DESeq2.")
       ),
@@ -10988,16 +11070,34 @@ server <- function(input, output, session) {
       example_design_copied <- ""
       counts_message <- ""
       if (isTRUE(p$counts_only)) {
+        counts_source_mode <- input$new_counts_source_mode %||% "upload"
         upload <- input$new_counts_file
-        if (is.null(upload) || !NROW(upload) || !file.exists(upload$datapath[[1]])) {
-          stop("Choose a count matrix before creating a counts-only project.")
+        count_source <- if (identical(counts_source_mode, "server")) {
+          path.expand(trimws(input$new_counts_server_file %||% ""))
+        } else if (!is.null(upload) && NROW(upload)) {
+          upload$datapath[[1]]
+        } else {
+          ""
+        }
+        if (!nzchar(count_source) || !file.exists(count_source) || dir.exists(count_source) || file.access(count_source, mode = 4) != 0) {
+          stop("Choose a readable count matrix before creating a counts-only project.")
         }
         count_result <- standardize_uploaded_count_matrix(
-          upload$datapath[[1]],
+          count_source,
           file.path(p$data_dir, "counts", "count_matrix.txt")
         )
         design_upload <- input$new_counts_design_file
-        design_path <- if (!is.null(design_upload) && NROW(design_upload)) design_upload$datapath[[1]] else NULL
+        design_source <- if (identical(counts_source_mode, "server")) {
+          path.expand(trimws(input$new_counts_design_server_file %||% ""))
+        } else if (!is.null(design_upload) && NROW(design_upload)) {
+          design_upload$datapath[[1]]
+        } else {
+          ""
+        }
+        if (nzchar(design_source) && (!file.exists(design_source) || dir.exists(design_source) || file.access(design_source, mode = 4) != 0)) {
+          stop("The selected design matrix is not a readable server file.")
+        }
+        design_path <- if (nzchar(design_source)) design_source else NULL
         p$design_matrix_path <- file.path(p$data_dir, "manifest", "design_matrix.txt")
         write_counts_only_design(
           count_result$samples,
