@@ -3664,7 +3664,25 @@ cutrun_diffbind_summary_table <- function(project) {
   paths <- unique(c(if (file.exists(legacy)) legacy else character(0), paths))
   rows <- lapply(paths, safe_read_table, n = 5000)
   rows <- Filter(NROW, rows)
-  if (length(rows)) do.call(rbind, rows) else data.frame()
+  if (!length(rows)) return(data.frame())
+  all_columns <- unique(unlist(lapply(rows, names), use.names = FALSE))
+  rows <- lapply(rows, function(x) {
+    missing <- setdiff(all_columns, names(x))
+    if (length(missing)) for (column in missing) x[[column]] <- NA
+    x[all_columns]
+  })
+  summary <- do.call(rbind, rows)
+  if (!"directory" %in% names(summary)) return(summary)
+  dirs <- as.character(summary$directory)
+  all_paths <- vapply(dirs, cutrun_diffbind_result_table_path, character(1), significant = FALSE)
+  significant_paths <- vapply(dirs, cutrun_diffbind_result_table_path, character(1), significant = TRUE)
+  summary$all_differential_peaks_file <- all_paths
+  summary$significant_differential_peaks_file <- significant_paths
+  sig_counts <- vapply(significant_paths, function(path) NROW(safe_read_table(path, 50000)), integer(1))
+  if (!"significant_peaks" %in% names(summary)) summary$significant_peaks <- sig_counts
+  missing_counts <- is.na(suppressWarnings(as.numeric(summary$significant_peaks)))
+  summary$significant_peaks[missing_counts] <- sig_counts[missing_counts]
+  summary
 }
 
 cutrun_diffbind_result_dirs <- function(project) {
@@ -3672,6 +3690,19 @@ cutrun_diffbind_result_dirs <- function(project) {
   if (!dir.exists(root)) return(character(0))
   dirs <- list.dirs(root, recursive = FALSE, full.names = TRUE)
   dirs[file.exists(file.path(dirs, "all_differential_peaks.tsv"))]
+}
+
+cutrun_diffbind_result_table_path <- function(path, significant = FALSE) {
+  path <- trimws(as.character(path %||% ""))
+  if (length(path) != 1L || is.na(path) || !nzchar(path) || !dir.exists(path)) return("")
+  candidates <- if (isTRUE(significant)) {
+    c("significant_differential_peaks_annotated.tsv", "significant_differential_peaks.tsv")
+  } else {
+    c("differential_peaks_annotated.tsv", "differential_peaks_with_metadata.tsv", "all_differential_peaks.tsv")
+  }
+  files <- file.path(path, candidates)
+  hit <- files[file.exists(files)]
+  if (length(hit)) hit[[1]] else ""
 }
 
 cutrun_peak_source_short_label <- function(project, source_id) {
@@ -5166,12 +5197,13 @@ cutrun_results_explorer_ui <- function() {
                 width = 9,
                 uiOutput("cutrun_diffbind_cards"),
                 div(class = "cutrun-section-heading", tags$h4("Analysis summary"), tags$p("Completed, skipped, and failed comparisons.")),
+                downloadButton("download_cutrun_diffbind_summary", "Download comparison summary"), br(), br(),
                 table_output("cutrun_diffbind_summary"),
                 tags$hr(),
                 tabsetPanel(
                   id = "cutrun_diffbind_tabs",
-                  tabPanel("Results", br(), downloadButton("download_cutrun_diffbind_results", "Download filtered results"), br(), br(), table_output("cutrun_diffbind_results")),
-                  tabPanel("Significant Peaks", br(), downloadButton("download_cutrun_diffbind_significant", "Download significant peaks"), br(), br(), table_output("cutrun_diffbind_significant")),
+                  tabPanel("Annotated Results", br(), downloadButton("download_cutrun_diffbind_results", "Download filtered results"), br(), br(), table_output("cutrun_diffbind_results")),
+                  tabPanel("Significant Peaks", br(), downloadButton("download_cutrun_diffbind_significant", "Download significant annotated peaks"), br(), br(), table_output("cutrun_diffbind_significant")),
                   tabPanel("PCA", br(), uiOutput("cutrun_diffbind_pca_ui")),
                   tabPanel("Volcano", br(), uiOutput("cutrun_diffbind_volcano_ui")),
                   tabPanel("MA Plot", br(), uiOutput("cutrun_diffbind_ma_ui")),
@@ -13106,7 +13138,7 @@ server <- function(input, output, session) {
     }, once = TRUE)
   }, ignoreInit = TRUE)
   cutrun_diffbind_all_results <- reactive({
-    safe_read_table(file.path(selected_cutrun_diffbind_dir(), "all_differential_peaks.tsv"), 20000)
+    safe_read_table(cutrun_diffbind_result_table_path(selected_cutrun_diffbind_dir()), 20000)
   })
   cutrun_diffbind_filtered_results <- reactive({
     df <- cutrun_diffbind_all_results()
@@ -13133,7 +13165,7 @@ server <- function(input, output, session) {
     cutrun_diffbind_filtered_results()
   }, page_length = 50, scroll_y = "620px")
   output$cutrun_diffbind_significant <- render_csl_table({
-    safe_read_table(file.path(selected_cutrun_diffbind_dir(), "significant_differential_peaks.tsv"), 20000)
+    safe_read_table(cutrun_diffbind_result_table_path(selected_cutrun_diffbind_dir(), significant = TRUE), 20000)
   }, page_length = 50, scroll_y = "620px")
   output$cutrun_diffbind_normalization <- render_csl_table({
     safe_read_table(file.path(selected_cutrun_diffbind_dir(), "normalization_factors.tsv"), 5000)
@@ -13145,7 +13177,7 @@ server <- function(input, output, session) {
     progress_refresh()
     path <- selected_cutrun_diffbind_dir()
     all <- cutrun_diffbind_all_results()
-    significant <- safe_read_table(file.path(path, "significant_differential_peaks.tsv"), 20000)
+    significant <- safe_read_table(cutrun_diffbind_result_table_path(path, significant = TRUE), 20000)
     filtered <- cutrun_diffbind_filtered_results()
     normalization <- safe_read_table(file.path(path, "normalization_factors.tsv"), 5000)
     mode <- if (NROW(normalization) && "normalization" %in% names(normalization)) paste(unique(as.character(normalization$normalization)), collapse = ", ") else "—"
@@ -13327,10 +13359,14 @@ server <- function(input, output, session) {
     filename = function() paste0(basename(selected_cutrun_diffbind_dir()), "_filtered.tsv"),
     content = function(file) utils::write.table(cutrun_diffbind_filtered_results(), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
+  output$download_cutrun_diffbind_summary <- downloadHandler(
+    filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_diffbind_comparison_summary.tsv"),
+    content = function(file) utils::write.table(cutrun_diffbind_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  )
   output$download_cutrun_diffbind_significant <- downloadHandler(
     filename = function() paste0(basename(selected_cutrun_diffbind_dir()), "_significant.tsv"),
     content = function(file) {
-      df <- safe_read_table(file.path(selected_cutrun_diffbind_dir(), "significant_differential_peaks.tsv"), 20000)
+      df <- safe_read_table(cutrun_diffbind_result_table_path(selected_cutrun_diffbind_dir(), significant = TRUE), 20000)
       utils::write.table(df, file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
     }
   )
