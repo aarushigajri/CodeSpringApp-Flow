@@ -14,18 +14,20 @@ runtime_files <- c(
 )
 runtime_text <- unlist(lapply(runtime_files[file.exists(runtime_files)], readLines, warn = FALSE), use.names = FALSE)
 server_source <- paste(deparse(body(app_env$MAIN_SERVER)), collapse = "\n")
+cutrun_batch_status_source <- paste(deparse(body(app_env$cutrun_diffbind_batch_status_ui)), collapse = "\n")
 owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamdev)"
 assert(!any(grepl(owner_path_pattern, runtime_text, ignore.case = TRUE)), "runtime code contains no hardcoded rouse home, login, or server path")
 assert(grepl("observeEvent(input$genome_browser_comparison", server_source, fixed = TRUE) && grepl("samples_override = available", server_source, fixed = TRUE), "changing a genome-browser comparison resets its samples and reloads the selected comparison")
 assert(
-  grepl("Automatically select all eligible comparisons", server_source, fixed = TRUE) &&
+  grepl("eligible comparisons selected automatically", cutrun_batch_status_source, fixed = TRUE) &&
+    grepl("Submit all eligible comparisons", server_source, fixed = TRUE) &&
     grepl("as.character(plan$id[plan$eligible])", server_source, fixed = TRUE),
-  "CUT&RUN DiffBind defaults to submitting every eligible comparison"
+  "CUT&RUN DiffBind visibly selects and submits every eligible comparison"
 )
 assert(
-  grepl("cutrun_diffbind_job_status", server_source, fixed = TRUE) &&
-    grepl("cutrun_diffbind_comparison_status", server_source, fixed = TRUE),
-  "CUT&RUN DiffBind exposes a live per-comparison job-status table"
+  grepl("cutrun_diffbind_batch_status_ui(p, plan, jobs)", server_source, fixed = TRUE) &&
+    !grepl("cutrun_diffbind_job_status", server_source, fixed = TRUE),
+  "CUT&RUN DiffBind uses the RNA-style live comparison status summary"
 )
 assert(
   grepl("pca_differential_peaks.png", server_source, fixed = TRUE) &&
@@ -765,6 +767,10 @@ complete_status <- app_env$cutrun_diffbind_comparison_status(seacr_selector_proj
 assert(identical(complete_status$Status[[1]], "Complete"), "CUT&RUN DiffBind status uses each comparison's own completion marker")
 strict_peak_plan <- app_env$cutrun_diffbind_comparison_plan(seacr_selector_project, "A", 1L, shared_diffbind_id, 3L)
 assert(NROW(strict_peak_plan) == 1L && !isTRUE(strict_peak_plan$eligible[[1]]) && grepl("Below 3 peaks", strict_peak_plan$reason[[1]], fixed = TRUE), "CUT&RUN DiffBind excludes comparisons when any selected source has fewer than the requested peaks")
+assert(
+  !NROW(app_env$cutrun_diffbind_comparison_status(seacr_selector_project, strict_peak_plan, jobs = data.frame())),
+  "ineligible CUT&RUN comparisons are not shown as unavailable status rows"
+)
 resolved_shared_sheet <- app_env$cutrun_diffbind_sample_sheet(seacr_selector_project, "A", 1L, "Model", "Creb", "B", shared_diffbind_id, 2L, "cpm")
 resolved_shared <- read.delim(resolved_shared_sheet, check.names = FALSE, stringsAsFactors = FALSE)
 assert(

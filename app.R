@@ -7831,6 +7831,8 @@ cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_re
 
 cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
   if (!NROW(plan)) return(data.frame())
+  plan <- plan[plan$eligible, , drop = FALSE]
+  if (!NROW(plan)) return(data.frame())
   if (is.null(jobs)) jobs <- job_history(project)
   root <- file.path(project$data_dir, "cutrun_diffbind")
   failed_states <- c("FAILED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL")
@@ -7849,8 +7851,6 @@ cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
     elapsed <- if (NROW(latest) && "elapsed" %in% names(latest)) as.character(latest$elapsed[[1]]) else ""
     status <- if (file.exists(target) && file_size_for(target) > 0) {
       "Complete"
-    } else if (!isTRUE(spec$eligible)) {
-      "Unavailable"
     } else if (slurm_state %in% c("RUNNING", "COMPLETING")) {
       "Running"
     } else if (slurm_state %in% c("PENDING", "CONFIGURING", "SUSPENDED", "SUBMITTED")) {
@@ -7875,12 +7875,41 @@ cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
       `SLURM state` = slurm_state,
       Elapsed = elapsed,
       `Minimum peaks/sample` = if (is.finite(spec$minimum_peaks_observed)) as.integer(spec$minimum_peaks_observed) else NA_integer_,
-      Details = if (isTRUE(spec$eligible)) "" else spec$reason,
+      Details = "",
       check.names = FALSE,
       stringsAsFactors = FALSE
     )
   })
   do.call(rbind, rows)
+}
+
+cutrun_diffbind_batch_status_ui <- function(project, plan, jobs = NULL) {
+  eligible <- plan[plan$eligible, , drop = FALSE]
+  if (!NROW(eligible)) return(div(class = "empty-box", "No comparisons meet the replicate and peak requirements for this peak source."))
+  status <- cutrun_diffbind_comparison_status(project, eligible, jobs)
+  if (!NROW(status)) return(NULL)
+  labels <- paste(status$`Cell type`, status$Mark, status$Comparison, sep = " — ")
+  row_ui <- function(label, keep, cls) {
+    values <- labels[keep]
+    if (!length(values)) return(NULL)
+    div(
+      class = "project-step-summary-row",
+      div(class = "project-step-summary-label", label),
+      div(class = "project-step-chip-wrap", lapply(values, function(value) span(class = paste("project-step-chip", cls), value)))
+    )
+  }
+  failed <- grepl("^Failed|^Likely failed", status$Status)
+  div(
+    class = "project-step-summary",
+    div(class = "project-step-summary-title", paste(NROW(status), "eligible comparisons selected automatically")),
+    tags$p(class = "muted small-note", "Submit launches one independent SLURM job for every comparison shown below."),
+    row_ui("Running", status$Status == "Running", "running"),
+    row_ui("Queued", status$Status == "Queued", "running"),
+    row_ui("Ready", status$Status == "Ready", ""),
+    row_ui("Failed", failed, "cancelled"),
+    row_ui("Cancelled", status$Status == "Cancelled", "cancelled"),
+    row_ui("Complete", status$Status == "Complete", "complete")
+  )
 }
 
 cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_replicates = 1L, cell_type = "", mark = "", comparison = "", peak_source_id = "", min_peaks_per_sample = 100L, track = "cpm") {
@@ -11003,10 +11032,7 @@ server <- function(input, output, session) {
             uiOutput("cutrun_diffbind_reference_ui"),
             uiOutput("cutrun_diffbind_peak_source_ui"),
             numericInput("cutrun_diffbind_min_peaks", "Minimum called peaks per sample", value = input$cutrun_diffbind_min_peaks %||% 100, min = 1, step = 25),
-            checkboxInput("cutrun_diffbind_select_all", "Automatically select all eligible comparisons", value = input$cutrun_diffbind_select_all %||% TRUE),
             uiOutput("cutrun_diffbind_jobs_ui"),
-            tags$h4("Comparison job status"),
-            table_output("cutrun_diffbind_job_status"),
             tags$p(class = "muted small-note", "Choose a completed MACS2, shared-overlap, or SEACR peak set. Each peak source is stored in a separate differential-results folder, so the same comparison can be run with more than one peak definition."),
             tags$p(class = "muted small-note", "Only comparisons with at least two biological replicates per condition and at least the selected number of peaks in every sample are selectable. The default minimum is 100 peaks per sample."),
             tags$p(class = "muted small-note", "DiffBind count normalization still follows the signal configuration selected in the SEACR panel: spike-in uses the E. coli BAMs; CPM/raw configurations use genomic background normalization. Peak-source selection does not rescale MACS2 or overlap BED files."),
@@ -11015,9 +11041,9 @@ server <- function(input, output, session) {
               numericInput("cutrun_diffbind_min_replicates", "Replicates that must support a peak", value = 1, min = 1, step = 1),
               tags$p(class = "muted small-note", "With two biological replicates per condition, use 1 to retain peaks observed in either replicate or 2 to require support from both replicates. Both settings still require two samples in each condition.")
             ),
-            tags$p(class = "muted small-note", "Each selected cell type/mark comparison is submitted as its own SLURM job. Native peak widths are preserved, and E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
+            tags$p(class = "muted small-note", "Every eligible cell type/mark comparison is submitted as its own SLURM job. Native peak widths are preserved, and E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
           ),
-          "run_cutrun_diffbind", "Submit selected comparison jobs"),
+          "run_cutrun_diffbind", "Submit all eligible comparisons"),
         tool_panel("MACS2 (optional)", status, "Optional MACS2 peak calling for comparison or broad histone-mark peaks.",
           tagList(
             uiOutput("cutrun_macs2_samples_ui"),
@@ -11130,6 +11156,7 @@ server <- function(input, output, session) {
   })
 
   output$cutrun_diffbind_jobs_ui <- renderUI({
+    progress_refresh()
     p <- current_project()
     if (!is_cutrun_project(p)) return(NULL)
     reference <- input$cutrun_diffbind_reference %||% ""
@@ -11139,36 +11166,10 @@ server <- function(input, output, session) {
     plan <- cutrun_diffbind_comparison_plan(p, reference, support, peak_source, min_peaks)
     if (!nzchar(peak_source)) return(div(class = "empty-box", "Choose a completed peak source."))
     if (!NROW(plan)) return(div(class = "empty-box", "No non-reference comparisons were found for this reference condition."))
-    eligible <- plan[plan$eligible, , drop = FALSE]
-    unavailable <- plan[!plan$eligible, , drop = FALSE]
-    if (!NROW(eligible)) return(div(class = "empty-box", paste(unique(unavailable$reason), collapse = "; ")))
-    choices <- stats::setNames(eligible$id, eligible$label)
-    select_all <- isTRUE(input$cutrun_diffbind_select_all %||% TRUE)
-    current <- if (select_all) eligible$id else intersect(input$cutrun_diffbind_jobs %||% character(0), eligible$id)
-    tagList(
-      selectInput("cutrun_diffbind_jobs", "Comparisons (one SLURM job each)", choices = choices, selected = current, multiple = TRUE),
-      if (NROW(unavailable)) tags$details(
-        tags$summary(sprintf("%s comparison%s below replicate/peak requirements", NROW(unavailable), ifelse(NROW(unavailable) == 1L, " is", "s are"))),
-        tags$ul(lapply(seq_len(NROW(unavailable)), function(i) tags$li(paste(unavailable$label[[i]], "—", unavailable$reason[[i]]))))
-      )
-    )
-  })
-
-  output$cutrun_diffbind_job_status <- render_csl_table({
-    progress_refresh()
-    p <- current_project()
-    if (!is_cutrun_project(p)) return(data.frame())
-    plan <- cutrun_diffbind_comparison_plan(
-      p,
-      input$cutrun_diffbind_reference %||% "",
-      input$cutrun_diffbind_min_replicates %||% 1,
-      input$cutrun_diffbind_peak_source %||% "",
-      input$cutrun_diffbind_min_peaks %||% 100
-    )
     jobs <- job_history_state()
     if (!NROW(jobs)) jobs <- job_history(p)
-    cutrun_diffbind_comparison_status(p, plan, jobs)
-  }, page_length = 25, scroll_y = "420px")
+    cutrun_diffbind_batch_status_ui(p, plan, jobs)
+  })
 
   output$atac_diffbind_controls_ui <- renderUI({
     p <- current_project(); if (!is_atac_project(p) && !is_chip_project(p)) return(NULL)
@@ -11614,11 +11615,7 @@ server <- function(input, output, session) {
     peak_source <- input$cutrun_diffbind_peak_source %||% ""
     min_peaks <- input$cutrun_diffbind_min_peaks %||% 100
     plan <- cutrun_diffbind_comparison_plan(current_project(), reference, support, peak_source, min_peaks)
-    comparisons <- if (isTRUE(input$cutrun_diffbind_select_all %||% TRUE) && NROW(plan)) {
-      as.character(plan$id[plan$eligible])
-    } else {
-      input$cutrun_diffbind_jobs %||% character(0)
-    }
+    comparisons <- if (NROW(plan)) as.character(plan$id[plan$eligible]) else character(0)
     config <- cutrun_seacr_config(input$cutrun_seacr_config %||% "spikein_non")
     run_submission(
       "Differential Peaks",
