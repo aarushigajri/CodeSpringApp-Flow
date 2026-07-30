@@ -8042,6 +8042,17 @@ cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_re
   out[order(!out$eligible, out$cell_type, out$mark, out$comparison), , drop = FALSE]
 }
 
+cutrun_diffbind_all_comparison_plans <- function(project, reference_condition, min_replicates = 1L, min_peaks_per_sample = 100L) {
+  sources <- cutrun_diffbind_peak_source_catalog(project)
+  if (!NROW(sources)) return(data.frame())
+  plans <- lapply(as.character(sources$source_id), function(source_id) {
+    cutrun_diffbind_comparison_plan(project, reference_condition, min_replicates, source_id, min_peaks_per_sample)
+  })
+  plans <- Filter(NROW, plans)
+  if (!length(plans)) return(data.frame())
+  do.call(rbind, plans)
+}
+
 cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
   if (!NROW(plan)) return(data.frame())
   plan <- plan[plan$eligible, , drop = FALSE]
@@ -8080,6 +8091,7 @@ cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
       "Ready"
     }
     data.frame(
+      `Peak source` = cutrun_peak_source_short_label(project, spec$peak_source),
       Comparison = paste(spec$comparison, "vs", spec$reference),
       `Cell type` = spec$cell_type,
       Mark = spec$mark,
@@ -8101,7 +8113,7 @@ cutrun_diffbind_batch_status_ui <- function(project, plan, jobs = NULL) {
   if (!NROW(eligible)) return(div(class = "empty-box", "No comparisons meet the replicate and peak requirements for this peak source."))
   status <- cutrun_diffbind_comparison_status(project, eligible, jobs)
   if (!NROW(status)) return(NULL)
-  labels <- paste(status$`Cell type`, status$Mark, status$Comparison, sep = " — ")
+  labels <- paste(status$`Peak source`, status$`Cell type`, status$Mark, status$Comparison, sep = " — ")
   row_ui <- function(label, keep, cls) {
     values <- labels[keep]
     if (!length(values)) return(NULL)
@@ -8114,8 +8126,8 @@ cutrun_diffbind_batch_status_ui <- function(project, plan, jobs = NULL) {
   failed <- grepl("^Failed|^Likely failed", status$Status)
   div(
     class = "project-step-summary",
-    div(class = "project-step-summary-title", paste(NROW(status), "eligible comparisons selected automatically")),
-    tags$p(class = "muted small-note", "Submit launches one independent SLURM job for every comparison shown below."),
+    div(class = "project-step-summary-title", paste(NROW(status), "eligible source × comparison jobs")),
+    tags$p(class = "muted small-note", "This status list includes every completed peak source, not only the source currently selected for a new submission."),
     row_ui("Running", status$Status == "Running", "running"),
     row_ui("Queued", status$Status == "Queued", "running"),
     row_ui("Ready", status$Status == "Ready", ""),
@@ -11614,9 +11626,11 @@ server <- function(input, output, session) {
     support <- input$cutrun_diffbind_min_replicates %||% 1
     peak_source <- input$cutrun_diffbind_peak_source %||% ""
     min_peaks <- input$cutrun_diffbind_min_peaks %||% 100
-    plan <- cutrun_diffbind_comparison_plan(p, reference, support, peak_source, min_peaks)
+    selected_plan <- cutrun_diffbind_comparison_plan(p, reference, support, peak_source, min_peaks)
     if (!nzchar(peak_source)) return(div(class = "empty-box", "Choose a completed peak source."))
-    if (!NROW(plan)) return(div(class = "empty-box", "No non-reference comparisons were found for this reference condition."))
+    if (!NROW(selected_plan)) return(div(class = "empty-box", "No non-reference comparisons were found for this reference condition."))
+    plan <- cutrun_diffbind_all_comparison_plans(p, reference, support, min_peaks)
+    if (!NROW(plan)) plan <- selected_plan
     jobs <- job_history_state()
     if (!NROW(jobs)) jobs <- job_history(p)
     cutrun_diffbind_batch_status_ui(p, plan, jobs)
