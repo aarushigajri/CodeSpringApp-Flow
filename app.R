@@ -1815,9 +1815,9 @@ job_history <- function(project, force_refresh = FALSE) {
   if (length(ids) && nzchar(Sys.which("squeue"))) {
     queue_user <- CURRENT_USER
     queue_args <- if (nzchar(queue_user)) {
-      c("-h", "-u", queue_user, "-o", "%A|%T|%M|%j")
+      c("-h", "-u", queue_user, "-o", shQuote("%A|%T|%M|%j"))
     } else {
-      c("-h", "-j", paste(ids, collapse = ","), "-o", "%A|%T|%M|%j")
+      c("-h", "-j", paste(ids, collapse = ","), "-o", shQuote("%A|%T|%M|%j"))
     }
     sq <- tryCatch(suppressWarnings(system2("squeue", queue_args, stdout = TRUE, stderr = FALSE, timeout = 10)), error = function(e) character(0))
     sq <- sq[nzchar(sq)]
@@ -2044,7 +2044,7 @@ active_squeue_project_jobs <- function(project) {
   prefix <- project_job_name_prefix(project)
   if (!nzchar(prefix)) return(data.frame())
   user <- CURRENT_USER
-  args <- c("-h", "-o", "%A|%T|%.200j")
+  args <- c("-h", "-o", shQuote("%A|%T|%.200j"))
   if (nzchar(user)) args <- c(args, "-u", user)
   out <- tryCatch(system2("squeue", args, stdout = TRUE, stderr = FALSE), error = function(e) character(0))
   out <- out[nzchar(out)]
