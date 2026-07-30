@@ -20,7 +20,10 @@ owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamd
 assert(!any(grepl(owner_path_pattern, runtime_text, ignore.case = TRUE)), "runtime code contains no hardcoded rouse home, login, or server path")
 assert(grepl("observeEvent(input$genome_browser_comparison", server_source, fixed = TRUE) && grepl("samples_override = available", server_source, fixed = TRUE), "changing a genome-browser comparison resets its samples and reloads the selected comparison")
 assert(
-  grepl("eligible comparisons selected automatically", cutrun_batch_status_source, fixed = TRUE) &&
+  (
+    grepl("eligible comparisons selected automatically", cutrun_batch_status_source, fixed = TRUE) ||
+      grepl("eligible source × comparison jobs", cutrun_batch_status_source, fixed = TRUE)
+  ) &&
     grepl("Submit all eligible comparisons", server_source, fixed = TRUE) &&
     grepl("as.character(plan$id[plan$eligible])", server_source, fixed = TRUE),
   "CUT&RUN DiffBind visibly selects and submits every eligible comparison"
@@ -65,6 +68,11 @@ assert(
     grepl("browse_new_counts_server_file", server_source, fixed = TRUE) &&
     grepl("open_server_browser(\"new_counts_server_file\", \"file\"", server_source, fixed = TRUE),
   "counts-only projects support laptop uploads and server-side file browsing"
+)
+assert(
+  grepl("CODE_SPRING_UPLOAD_LIMIT_BYTES <- 500 * 1024^2", app_text, fixed = TRUE) &&
+    grepl("shiny.maxRequestSize", app_text, fixed = TRUE),
+  "local count-matrix uploads support files larger than Shiny's 5 MB default"
 )
 assert(
   grepl("Use selected file", server_source, fixed = TRUE) &&

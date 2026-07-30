@@ -1,5 +1,11 @@
 library(shiny)
 
+CODE_SPRING_UPLOAD_LIMIT_BYTES <- 500 * 1024^2
+options(shiny.maxRequestSize = max(
+  as.numeric(getOption("shiny.maxRequestSize", 0)),
+  CODE_SPRING_UPLOAD_LIMIT_BYTES
+))
+
 DT_AVAILABLE <- requireNamespace("DT", quietly = TRUE)
 BASE64_AVAILABLE <- requireNamespace("base64enc", quietly = TRUE)
 PDF_PREVIEW_CACHE <- new.env(parent = emptyenv())
@@ -10787,7 +10793,8 @@ server <- function(input, output, session) {
         conditionalPanel(
           "input.new_counts_source_mode == 'upload'",
           fileInput("new_counts_file", "Count matrix", accept = c(".txt", ".tsv", ".csv")),
-          fileInput("new_counts_design_file", "Design matrix (optional)", accept = c(".txt", ".tsv", ".csv"))
+          fileInput("new_counts_design_file", "Design matrix (optional)", accept = c(".txt", ".tsv", ".csv")),
+          tags$p(class = "muted", "Maximum upload size: 500 MB per request.")
         ),
         conditionalPanel(
           "input.new_counts_source_mode == 'server'",
