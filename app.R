@@ -3678,11 +3678,21 @@ cutrun_diffbind_summary_table <- function(project) {
   significant_paths <- vapply(dirs, cutrun_diffbind_result_table_path, character(1), significant = TRUE)
   summary$all_differential_peaks_file <- all_paths
   summary$significant_differential_peaks_file <- significant_paths
-  sig_counts <- vapply(significant_paths, function(path) NROW(safe_read_table(path, 50000)), integer(1))
+  sig_counts <- vapply(significant_paths, cutrun_tabular_data_rows, integer(1))
   if (!"significant_peaks" %in% names(summary)) summary$significant_peaks <- sig_counts
   missing_counts <- is.na(suppressWarnings(as.numeric(summary$significant_peaks)))
   summary$significant_peaks[missing_counts] <- sig_counts[missing_counts]
   summary
+}
+
+cutrun_tabular_data_rows <- function(path) {
+  path <- trimws(as.character(path %||% ""))
+  if (length(path) != 1L || is.na(path) || !nzchar(path) || !file.exists(path)) return(NA_integer_)
+  output <- tryCatch(system2("wc", c("-l", "--", path), stdout = TRUE, stderr = FALSE), error = function(e) character(0))
+  if (!length(output)) return(NA_integer_)
+  lines <- suppressWarnings(as.numeric(sub("^\\s*([0-9]+).*$", "\\1", output[[1]])))
+  if (!is.finite(lines)) return(NA_integer_)
+  as.integer(max(lines - 1, 0))
 }
 
 cutrun_diffbind_result_dirs <- function(project) {
@@ -5181,7 +5191,7 @@ cutrun_results_explorer_ui <- function() {
             )
           ),
           tabPanel("Genome Browser", genome_browser_ui()),
-          tabPanel("Differential Binding",
+          tabPanel("Differential Peak Results & Summary",
             br(),
             sidebarLayout(
               sidebarPanel(
@@ -5196,7 +5206,7 @@ cutrun_results_explorer_ui <- function() {
               mainPanel(
                 width = 9,
                 uiOutput("cutrun_diffbind_cards"),
-                div(class = "cutrun-section-heading", tags$h4("Analysis summary"), tags$p("Completed, skipped, and failed comparisons.")),
+                div(class = "cutrun-section-heading", tags$h4("Project-wide differential-peak summary"), tags$p("Every completed, skipped, and failed comparison, including peak source, counts, and result-file paths.")),
                 downloadButton("download_cutrun_diffbind_summary", "Download comparison summary"), br(), br(),
                 table_output("cutrun_diffbind_summary"),
                 tags$hr(),
@@ -11494,6 +11504,17 @@ server <- function(input, output, session) {
             tags$p(class = "muted small-note", "Every eligible cell type/mark comparison is submitted as its own SLURM job. Native peak widths are preserved, and E. coli BAMs are reused automatically when spike-in normalization was selected for Bowtie2.")
           ),
           "run_cutrun_diffbind", "Submit all eligible comparisons"),
+        tags$details(
+          class = "tool-panel",
+          tags$summary(div(class = "tool-summary",
+            div(tags$strong("Differential Peak Summary"), tags$span("All completed DiffBind comparisons, sources, significant peaks, and result-file paths."))
+          )),
+          div(class = "tool-body",
+            tags$p(class = "muted small-note", "This is a project-wide summary; it remains available while other MACS2, SEACR, or shared-overlap DiffBind jobs are running."),
+            downloadButton("download_cutrun_diffbind_run_summary", "Download comparison summary"), br(), br(),
+            table_output("cutrun_diffbind_run_summary")
+          )
+        ),
         tool_panel("MACS2 (optional)", status, "Optional MACS2 peak calling for comparison or broad histone-mark peaks.",
           tagList(
             uiOutput("cutrun_macs2_samples_ui"),
@@ -11509,6 +11530,17 @@ server <- function(input, output, session) {
             tags$p(class = "muted small-note", "Shared peaks are ranked by combined caller evidence rank for the Genome Browser. SEACR signal and MACS2 q-values remain caller-specific evidence rather than being combined as incompatible p-values.")
           ),
           "run_cutrun_peak_overlap", "Submit selected peak overlaps", show_sample_progress = FALSE, show_job_actions = FALSE),
+        tags$details(
+          class = "tool-panel",
+          tags$summary(div(class = "tool-summary",
+            div(tags$strong("Peak-Calling Summary"), tags$span("Ravinder-style per-sample peak counts across every SEACR configuration, MACS2, and shared-overlap output."))
+          )),
+          div(class = "tool-body",
+            tags$p(class = "muted small-note", "Columns are added automatically as new peak callers/settings are completed and are removed if their output folders are deleted."),
+            downloadButton("download_cutrun_peak_calling_run_summary", "Download peak-calling summary"), br(), br(),
+            table_output("cutrun_peak_calling_run_summary")
+          )
+        ),
         tool_panel("Peak Annotation", status, "Annotate every completed CUT&RUN MACS2 and differential peak file with nearby genes.", tagList(
           tags$p(class = "muted small-note", "This project-level final step scans all completed samples and differential comparisons. Both all-peak and significant differential result files are annotated."),
           tags$p(class = "muted small-note", "Peak statistics are shown as explicit columns—including differential p.value and FDR when available—and a project summary records every source and annotated file.")
@@ -13108,6 +13140,10 @@ server <- function(input, output, session) {
     progress_refresh()
     cutrun_seacr_peak_summary_table(current_project())
   }, page_length = 50, scroll_y = "520px")
+  output$cutrun_peak_calling_run_summary <- render_csl_table({
+    progress_refresh()
+    cutrun_seacr_peak_summary_table(current_project())
+  }, page_length = 25, scroll_y = "420px")
   output$cutrun_frip_plot <- renderPlot({
     progress_refresh()
     df <- cutrun_seacr_frip_table(current_project())
@@ -13273,8 +13309,13 @@ server <- function(input, output, session) {
     df[keep, , drop = FALSE]
   })
   output$cutrun_diffbind_summary <- render_csl_table({
+    progress_refresh()
     cutrun_diffbind_summary_table(current_project())
   }, page_length = 25)
+  output$cutrun_diffbind_run_summary <- render_csl_table({
+    progress_refresh()
+    cutrun_diffbind_summary_table(current_project())
+  }, page_length = 25, scroll_y = "420px")
   output$cutrun_diffbind_results <- render_csl_table({
     cutrun_diffbind_filtered_results()
   }, page_length = 50, scroll_y = "620px")
@@ -13439,6 +13480,10 @@ server <- function(input, output, session) {
     filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_seacr_peak_summary.tsv"),
     content = function(file) utils::write.table(cutrun_seacr_peak_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
+  output$download_cutrun_peak_calling_run_summary <- downloadHandler(
+    filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_peak_calling_summary.tsv"),
+    content = function(file) utils::write.table(cutrun_seacr_peak_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  )
   output$download_cutrun_seacr_peak_summary_xlsx <- downloadHandler(
     filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_peak_summary.xlsx"),
     content = function(file) write_cutrun_peak_summary_xlsx(current_project(), file)
@@ -13474,6 +13519,10 @@ server <- function(input, output, session) {
     content = function(file) utils::write.table(cutrun_diffbind_filtered_results(), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
   output$download_cutrun_diffbind_summary <- downloadHandler(
+    filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_diffbind_comparison_summary.tsv"),
+    content = function(file) utils::write.table(cutrun_diffbind_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  )
+  output$download_cutrun_diffbind_run_summary <- downloadHandler(
     filename = function() paste0(clean_name(current_project()$name, "cutrun"), "_diffbind_comparison_summary.tsv"),
     content = function(file) utils::write.table(cutrun_diffbind_summary_table(current_project()), file, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
   )
