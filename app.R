@@ -8363,6 +8363,30 @@ submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison
   paste(messages, collapse = "\n")
 }
 
+submit_cutrun_project_summary_job <- function(project, kind = c("peak_calling", "differential")) {
+  kind <- match.arg(kind)
+  step <- if (identical(kind, "peak_calling")) "Peak-Calling Summary" else "Differential Peak Summary"
+  out_dir <- file.path(project$data_dir, "cutrun_summaries")
+  target <- file.path(out_dir, paste0(kind, "_summary_COMPLETE"))
+  qsub <- file.path(SCRIPTS_DIR, "CUTRUN", "qsub_cutrun_project_summary.sh")
+  runner <- file.path(SCRIPTS_DIR, "CUTRUN", "cutrun_project_summary.sh")
+  r_script <- file.path(SCRIPTS_DIR, "CUTRUN", "cutrun_project_summary.R")
+  required <- c(qsub, runner, r_script)
+  missing <- required[!file.exists(required)]
+  if (length(missing)) return(record_preflight_failure(project, step, paste("Required CUT&RUN summary scripts are missing:", paste(missing, collapse = ", ")), "cutrun_summaries"))
+  jobs <- job_history(project)
+  active <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) {
+    jobs[canonical_job_step(jobs$step) == canonical_job_step(step) & jobs$slurm_state %in% active_slurm_states(), , drop = FALSE]
+  } else data.frame()
+  if (NROW(active)) return(paste(step, "is already active; use the existing job rather than submitting a duplicate."))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  submit_sbatch(
+    project, step, qsub, c(r_script, project$data_dir, out_dir, kind, runner),
+    log_name = paste0("cutrun_", kind, "_summary"), input_mode = "all completed CUT&RUN outputs",
+    sample = kind, target = target, reference = "Project-wide CUT&RUN summary"
+  )
+}
+
 submit_cutrun_macs2_jobs <- function(project, qvalue = "0.01", peak_type = "auto", samples = NULL) {
   res <- cutrun_reference_resources(project)
   outdir <- file.path(project$data_dir, "macs2")
@@ -12237,24 +12261,18 @@ server <- function(input, output, session) {
     )
   })
   observeEvent(input$run_cutrun_peak_calling_summary, {
-    result <- tryCatch(write_cutrun_project_summary(current_project(), "peak_calling"), error = function(e) e)
-    if (inherits(result, "error")) {
-      showNotification(paste("Could not create peak-calling summary:", conditionMessage(result)), type = "error", duration = NULL)
-    } else {
-      files <- c(result$tsv, result$xlsx)
-      files <- files[nzchar(files)]
-      showNotification(paste("Peak-calling summary updated:", paste(files, collapse = " | ")), type = "message", duration = 10)
-      safe_refresh_progress_now("CUT&RUN peak-calling summary")
-    }
+    run_submission(
+      "Peak-Calling Summary",
+      submit_cutrun_project_summary_job(current_project(), "peak_calling"),
+      "all completed CUT&RUN peak callers and settings"
+    )
   }, ignoreInit = TRUE)
   observeEvent(input$run_cutrun_diffbind_summary, {
-    result <- tryCatch(write_cutrun_project_summary(current_project(), "differential"), error = function(e) e)
-    if (inherits(result, "error")) {
-      showNotification(paste("Could not create differential-peak summary:", conditionMessage(result)), type = "error", duration = NULL)
-    } else {
-      showNotification(paste("Differential-peak summary updated:", result$tsv), type = "message", duration = 10)
-      safe_refresh_progress_now("CUT&RUN differential-peak summary")
-    }
+    run_submission(
+      "Differential Peak Summary",
+      submit_cutrun_project_summary_job(current_project(), "differential"),
+      "all completed CUT&RUN DiffBind comparisons"
+    )
   }, ignoreInit = TRUE)
   observeEvent(input$run_peak_annotation, {
     inputs <- peak_annotation_input_files(current_project())
