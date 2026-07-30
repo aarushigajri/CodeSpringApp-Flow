@@ -13,6 +13,7 @@ runtime_files <- c(
   list.files(file.path(lab_root, "scripts_DoNotTouch"), pattern = "\\.(R|r|py|sh)$", recursive = TRUE, full.names = TRUE)
 )
 runtime_text <- unlist(lapply(runtime_files[file.exists(runtime_files)], readLines, warn = FALSE), use.names = FALSE)
+app_text <- paste(readLines(file.path(repo_root, "app.R"), warn = FALSE), collapse = "\n")
 server_source <- paste(deparse(body(app_env$MAIN_SERVER)), collapse = "\n")
 cutrun_batch_status_source <- paste(deparse(body(app_env$cutrun_diffbind_batch_status_ui)), collapse = "\n")
 owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamdev)"
@@ -43,6 +44,21 @@ assert(
   any(grepl("window.codespringIgvSignature === signature", runtime_text, fixed = TRUE)) &&
     any(grepl("signature = browser_signature", runtime_text, fixed = TRUE)),
   "genome browser reuses an unchanged IGV instance instead of repeatedly reloading the same large peak tracks"
+)
+browser_controls_source <- sub(
+  "^[\\s\\S]*output\\$genome_browser_controls_ui <- renderUI\\(\\{",
+  "",
+  sub("\\n  observeEvent\\(input\\$genome_browser_mode,[\\s\\S]*$", "", app_text, perl = TRUE),
+  perl = TRUE
+)
+assert(
+  !grepl("progress_refresh()", browser_controls_source, fixed = TRUE) &&
+    grepl("if (nzchar(remembered_mode)) remembered_mode else isolate(input$genome_browser_mode)", browser_controls_source, fixed = TRUE),
+  "the genome-browser controls are not rebuilt by the one-second job timer and preserve the canonical browser mode"
+)
+assert(
+  grepl("genome_browser_comparison_show_peaks", server_source, fixed = TRUE),
+  "comparison views use a separate opt-in for potentially large individual sample peak tracks"
 )
 assert(
   grepl("codespring-igv-locus", server_source, fixed = TRUE),

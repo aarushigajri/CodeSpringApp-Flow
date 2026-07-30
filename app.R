@@ -12053,7 +12053,6 @@ server <- function(input, output, session) {
   }, page_length = 50, scroll_y = "600px")
   output$genome_browser_controls_ui <- renderUI({
     req(identical(input$web_main_tabs %||% "", "Results Explorer"))
-    progress_refresh()
     p <- current_project()
     catalog <- genome_browser_track_catalog(p)
     if (!NROW(catalog)) return(div(class = "empty-box", "No bigWig signal or peak files are available yet."))
@@ -12072,7 +12071,7 @@ server <- function(input, output, session) {
     }
     default_mode <- if (has_cutrun_peaks) "cutrun_peak" else if (NROW(comparisons)) "comparison" else "manual"
     remembered_mode <- genome_browser_mode_state()
-    requested_mode <- input$genome_browser_mode %||% remembered_mode
+    requested_mode <- if (nzchar(remembered_mode)) remembered_mode else isolate(input$genome_browser_mode)
     mode <- selected_choice(requested_mode, mode_choices, default_mode)
     if (!identical(remembered_mode, mode)) genome_browser_mode_state(mode)
     samples <- unique(as.character(catalog$sample))
@@ -12171,8 +12170,8 @@ server <- function(input, output, session) {
           value = if (is.null(input$genome_browser_shared_scale)) TRUE else isTRUE(input$genome_browser_shared_scale)
         ),
         checkboxInput(
-          "genome_browser_show_peaks", "Include individual sample peak calls",
-          value = if (is.null(input$genome_browser_show_peaks)) FALSE else isTRUE(input$genome_browser_show_peaks)
+          "genome_browser_comparison_show_peaks", "Include individual sample peak calls",
+          value = isTRUE(input$genome_browser_comparison_show_peaks)
         ),
         checkboxInput(
           "genome_browser_show_differential_peaks", "Show differential peaks as bottom track",
@@ -12200,7 +12199,7 @@ server <- function(input, output, session) {
   observeEvent(input$genome_browser_mode, {
     mode <- trimws(as.character(input$genome_browser_mode %||% ""))
     if (nzchar(mode)) genome_browser_mode_state(mode)
-  }, ignoreInit = FALSE)
+  }, ignoreInit = FALSE, priority = 1000)
   observeEvent(input$genome_browser_gene, {
     gene <- trimws(as.character(input$genome_browser_gene %||% ""))
     if (!nzchar(gene)) return(invisible(NULL))
@@ -12308,7 +12307,7 @@ server <- function(input, output, session) {
           paste(tracks$sample, "signal", sep = " — ")
         )
       }
-      if (isTRUE(input$genome_browser_show_peaks)) {
+      if (isTRUE(input$genome_browser_comparison_show_peaks)) {
         sample_peaks <- catalog[catalog$kind == "peaks" & catalog$sample %in% selected_samples, , drop = FALSE]
         sample_peaks <- sample_peaks[order(match(sample_peaks$sample, selected_samples), sample_peaks$label), , drop = FALSE]
         tracks <- rbind(tracks, sample_peaks)
@@ -12411,7 +12410,7 @@ server <- function(input, output, session) {
   # not alter either caller's input files; it only resets the browser display.
   observeEvent(list(input$genome_browser_cutrun_tool, input$genome_browser_cutrun_parameters), {
     p <- current_project()
-    if (!is_cutrun_project(p) || !identical(input$genome_browser_mode %||% "", "cutrun_peak")) return(invisible(NULL))
+    if (!is_cutrun_project(p) || !identical(genome_browser_mode_state(), "cutrun_peak")) return(invisible(NULL))
     catalog <- genome_browser_track_catalog(p)
     target_sample <- trimws(as.character(input$genome_browser_cutrun_sample %||% ""))
     matched_igg <- cutrun_control_sample_for(p, target_sample)
@@ -12426,15 +12425,16 @@ server <- function(input, output, session) {
   # immediately.  Other controls can still be adjusted before using Load.
   observeEvent(input$genome_browser_cutrun_sample, {
     p <- current_project()
-    if (!is_cutrun_project(p) || !identical(input$genome_browser_mode %||% "", "cutrun_peak")) return(invisible(NULL))
+    if (!is_cutrun_project(p) || !identical(genome_browser_mode_state(), "cutrun_peak")) return(invisible(NULL))
     send_genome_browser()
   }, ignoreInit = TRUE)
   observeEvent(input$genome_browser_cutrun_signal_normalization, {
     p <- current_project()
-    if (!is_cutrun_project(p) || !identical(input$genome_browser_mode %||% "", "cutrun_peak")) return(invisible(NULL))
+    if (!is_cutrun_project(p) || !identical(genome_browser_mode_state(), "cutrun_peak")) return(invisible(NULL))
     send_genome_browser()
   }, ignoreInit = TRUE)
   observeEvent(input$genome_browser_comparison, {
+    if (!identical(genome_browser_mode_state(), "comparison")) return(invisible(NULL))
     comparison_id <- as.character(input$genome_browser_comparison %||% "")
     if (!nzchar(comparison_id)) return(invisible(NULL))
     p <- current_project()
