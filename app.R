@@ -7717,6 +7717,16 @@ cutrun_diffbind_conditions <- function(project) {
   c(preferred, setdiff(sort(values), preferred))
 }
 
+cutrun_diffbind_run_slug <- function(peak_source_id, cell_type, mark, comparison, reference_condition) {
+  paste(
+    clean_name(peak_source_id, "peak_source"),
+    clean_name(cell_type),
+    clean_name(mark),
+    paste0(clean_name(comparison), "_vs_", clean_name(reference_condition)),
+    sep = "__"
+  )
+}
+
 cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_replicates = 1L, peak_source_id = "", min_peaks_per_sample = 100L) {
   design <- cutrun_target_design(project, include_controls = FALSE)
   reference_condition <- trimws(as.character(reference_condition %||% ""))
@@ -7784,6 +7794,60 @@ cutrun_diffbind_comparison_plan <- function(project, reference_condition, min_re
   if (!length(rows)) return(data.frame())
   out <- do.call(rbind, rows)
   out[order(!out$eligible, out$cell_type, out$mark, out$comparison), , drop = FALSE]
+}
+
+cutrun_diffbind_comparison_status <- function(project, plan, jobs = NULL) {
+  if (!NROW(plan)) return(data.frame())
+  if (is.null(jobs)) jobs <- job_history(project)
+  root <- file.path(project$data_dir, "cutrun_diffbind")
+  failed_states <- c("FAILED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL")
+  rows <- lapply(seq_len(NROW(plan)), function(i) {
+    spec <- plan[i, , drop = FALSE]
+    slug <- cutrun_diffbind_run_slug(spec$peak_source, spec$cell_type, spec$mark, spec$comparison, spec$reference)
+    outdir <- file.path(root, slug)
+    target <- file.path(outdir, "_COMPLETE")
+    started <- file.path(outdir, "_RUN_STARTED")
+    hit <- if (NROW(jobs) && all(c("step", "sample") %in% names(jobs))) {
+      jobs[canonical_job_step(jobs$step) == "Differential Peaks" & as.character(jobs$sample) == slug, , drop = FALSE]
+    } else data.frame()
+    latest <- if (NROW(hit)) hit[NROW(hit), , drop = FALSE] else data.frame()
+    slurm_state <- if (NROW(latest) && "slurm_state" %in% names(latest)) toupper(trimws(as.character(latest$slurm_state[[1]]))) else ""
+    job_id <- if (NROW(latest) && "job_id" %in% names(latest)) as.character(latest$job_id[[1]]) else ""
+    elapsed <- if (NROW(latest) && "elapsed" %in% names(latest)) as.character(latest$elapsed[[1]]) else ""
+    status <- if (file.exists(target) && file_size_for(target) > 0) {
+      "Complete"
+    } else if (!isTRUE(spec$eligible)) {
+      "Unavailable"
+    } else if (slurm_state %in% c("RUNNING", "COMPLETING")) {
+      "Running"
+    } else if (slurm_state %in% c("PENDING", "CONFIGURING", "SUSPENDED", "SUBMITTED")) {
+      "Queued"
+    } else if (grepl("^CANCELLED", slurm_state)) {
+      "Cancelled"
+    } else if (slurm_state %in% failed_states) {
+      paste("Failed:", slurm_state)
+    } else if (identical(slurm_state, "COMPLETED")) {
+      "Likely failed: SLURM completed without result marker"
+    } else if (file.exists(started)) {
+      "Likely failed"
+    } else {
+      "Ready"
+    }
+    data.frame(
+      Comparison = paste(spec$comparison, "vs", spec$reference),
+      `Cell type` = spec$cell_type,
+      Mark = spec$mark,
+      Status = status,
+      `Job ID` = job_id,
+      `SLURM state` = slurm_state,
+      Elapsed = elapsed,
+      `Minimum peaks/sample` = if (is.finite(spec$minimum_peaks_observed)) as.integer(spec$minimum_peaks_observed) else NA_integer_,
+      Details = if (isTRUE(spec$eligible)) "" else spec$reason,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+  })
+  do.call(rbind, rows)
 }
 
 cutrun_diffbind_sample_sheet <- function(project, reference_condition, min_replicates = 1L, cell_type = "", mark = "", comparison = "", peak_source_id = "", min_peaks_per_sample = 100L, track = "cpm") {
@@ -7901,7 +7965,7 @@ submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison
   messages <- character(0)
   for (i in seq_len(NROW(selected))) {
     spec <- selected[i, , drop = FALSE]
-    run_slug <- paste(clean_name(peak_source_id, "peak_source"), clean_name(spec$cell_type), clean_name(spec$mark), paste0(clean_name(spec$comparison), "_vs_", clean_name(reference_condition)), sep = "__")
+    run_slug <- cutrun_diffbind_run_slug(peak_source_id, spec$cell_type, spec$mark, spec$comparison, reference_condition)
     outdir <- file.path(root, run_slug); dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
     target <- file.path(outdir, "_COMPLETE")
     if (file.exists(target)) {
@@ -10906,7 +10970,10 @@ server <- function(input, output, session) {
             uiOutput("cutrun_diffbind_reference_ui"),
             uiOutput("cutrun_diffbind_peak_source_ui"),
             numericInput("cutrun_diffbind_min_peaks", "Minimum called peaks per sample", value = input$cutrun_diffbind_min_peaks %||% 100, min = 1, step = 25),
+            checkboxInput("cutrun_diffbind_select_all", "Automatically select all eligible comparisons", value = input$cutrun_diffbind_select_all %||% TRUE),
             uiOutput("cutrun_diffbind_jobs_ui"),
+            tags$h4("Comparison job status"),
+            table_output("cutrun_diffbind_job_status"),
             tags$p(class = "muted small-note", "Choose a completed MACS2, shared-overlap, or SEACR peak set. Each peak source is stored in a separate differential-results folder, so the same comparison can be run with more than one peak definition."),
             tags$p(class = "muted small-note", "Only comparisons with at least two biological replicates per condition and at least the selected number of peaks in every sample are selectable. The default minimum is 100 peaks per sample."),
             tags$p(class = "muted small-note", "DiffBind count normalization still follows the signal configuration selected in the SEACR panel: spike-in uses the E. coli BAMs; CPM/raw configurations use genomic background normalization. Peak-source selection does not rescale MACS2 or overlap BED files."),
@@ -11043,8 +11110,8 @@ server <- function(input, output, session) {
     unavailable <- plan[!plan$eligible, , drop = FALSE]
     if (!NROW(eligible)) return(div(class = "empty-box", paste(unique(unavailable$reason), collapse = "; ")))
     choices <- stats::setNames(eligible$id, eligible$label)
-    current <- intersect(input$cutrun_diffbind_jobs %||% character(0), eligible$id)
-    if (!length(current)) current <- eligible$id
+    select_all <- isTRUE(input$cutrun_diffbind_select_all %||% TRUE)
+    current <- if (select_all) eligible$id else intersect(input$cutrun_diffbind_jobs %||% character(0), eligible$id)
     tagList(
       selectInput("cutrun_diffbind_jobs", "Comparisons (one SLURM job each)", choices = choices, selected = current, multiple = TRUE),
       if (NROW(unavailable)) tags$details(
@@ -11053,6 +11120,22 @@ server <- function(input, output, session) {
       )
     )
   })
+
+  output$cutrun_diffbind_job_status <- render_csl_table({
+    progress_refresh()
+    p <- current_project()
+    if (!is_cutrun_project(p)) return(data.frame())
+    plan <- cutrun_diffbind_comparison_plan(
+      p,
+      input$cutrun_diffbind_reference %||% "",
+      input$cutrun_diffbind_min_replicates %||% 1,
+      input$cutrun_diffbind_peak_source %||% "",
+      input$cutrun_diffbind_min_peaks %||% 100
+    )
+    jobs <- job_history_state()
+    if (!NROW(jobs)) jobs <- job_history(p)
+    cutrun_diffbind_comparison_status(p, plan, jobs)
+  }, page_length = 25, scroll_y = "420px")
 
   output$atac_diffbind_controls_ui <- renderUI({
     p <- current_project(); if (!is_atac_project(p) && !is_chip_project(p)) return(NULL)
@@ -11495,9 +11578,14 @@ server <- function(input, output, session) {
   observeEvent(input$run_cutrun_diffbind, {
     reference <- input$cutrun_diffbind_reference %||% ""
     support <- input$cutrun_diffbind_min_replicates %||% 1
-    comparisons <- input$cutrun_diffbind_jobs %||% character(0)
     peak_source <- input$cutrun_diffbind_peak_source %||% ""
     min_peaks <- input$cutrun_diffbind_min_peaks %||% 100
+    plan <- cutrun_diffbind_comparison_plan(current_project(), reference, support, peak_source, min_peaks)
+    comparisons <- if (isTRUE(input$cutrun_diffbind_select_all %||% TRUE) && NROW(plan)) {
+      as.character(plan$id[plan$eligible])
+    } else {
+      input$cutrun_diffbind_jobs %||% character(0)
+    }
     config <- cutrun_seacr_config(input$cutrun_seacr_config %||% "spikein_non")
     run_submission(
       "Differential Peaks",
