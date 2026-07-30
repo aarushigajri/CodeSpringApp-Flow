@@ -36,8 +36,13 @@ assert(
 )
 assert(
   grepl("observeEvent(input$genome_browser_ready, send_genome_browser()", server_source, fixed = TRUE) &&
-    !grepl("genome_browser_loaded <- reactiveVal(FALSE)", server_source, fixed = TRUE),
-  "genome browser uses the established immediate-load behavior"
+    grepl("genome_browser_mode_state", server_source, fixed = TRUE),
+  "genome browser uses immediate loading while preserving the selected browser mode"
+)
+assert(
+  any(grepl("window.codespringIgvSignature === signature", runtime_text, fixed = TRUE)) &&
+    any(grepl("signature = browser_signature", runtime_text, fixed = TRUE)),
+  "genome browser reuses an unchanged IGV instance instead of repeatedly reloading the same large peak tracks"
 )
 assert(
   grepl("codespring-igv-locus", server_source, fixed = TRUE),

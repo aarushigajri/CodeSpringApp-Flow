@@ -9859,6 +9859,18 @@ ui <- fluidPage(
           }
           return;
         }
+        var signature = message && message.signature ? String(message.signature) : '';
+        var requestedLocus = message && message.config && message.config.locus ? String(message.config.locus) : '';
+        if (window.codespringIgvBrowser && signature && window.codespringIgvSignature === signature) {
+          if (status) status.textContent = message.summary || 'Genome browser loaded.';
+          if (requestedLocus) {
+            Promise.resolve(window.codespringIgvBrowser.search(requestedLocus)).catch(function(error) {
+              if (status) status.textContent = 'Could not navigate to ' + requestedLocus + ': ' + (error && error.message ? error.message : String(error));
+            });
+          }
+          window.setTimeout(function() { $(window).trigger('resize'); }, 50);
+          return;
+        }
         if (status) status.textContent = 'Loading genome tracks…';
         var requestId = (window.codespringIgvLoadRequestId || 0) + 1;
         window.codespringIgvLoadRequestId = requestId;
@@ -9870,12 +9882,14 @@ ui <- fluidPage(
           return removal.then(function() {
             if (requestId !== window.codespringIgvLoadRequestId) return null;
             window.codespringIgvBrowser = null;
+            window.codespringIgvSignature = '';
             container.innerHTML = '';
             return window.igv.createBrowser(container, message.config).then(function(browser) {
               if (requestId !== window.codespringIgvLoadRequestId) {
                 return Promise.resolve(window.igv.removeBrowser(browser));
               }
               window.codespringIgvBrowser = browser;
+              window.codespringIgvSignature = signature;
               if (status) status.textContent = message.summary || 'Genome browser loaded.';
               window.setTimeout(function() { $(window).trigger('resize'); }, 100);
               return browser;
@@ -9884,6 +9898,7 @@ ui <- fluidPage(
         }).catch(function(error) {
           if (requestId !== window.codespringIgvLoadRequestId) return;
           window.codespringIgvBrowser = null;
+          window.codespringIgvSignature = '';
           container.innerHTML = '';
           if (status) status.textContent = 'Genome browser error: ' + (error && error.message ? error.message : String(error));
         });
@@ -10024,6 +10039,7 @@ server <- function(input, output, session) {
   sample_progress_state <- reactiveVal(data.frame())
   progress_refresh_busy <- reactiveVal(FALSE)
   cutrun_normalization_choice <- reactiveVal("spikein")
+  genome_browser_mode_state <- reactiveVal("")
   path_browser <- reactiveValues(target = "", mode = "dir", path = CURRENT_HOME, message = "")
   project_selection <- reactiveValues(rna = "", cutrun = "", atac = "", chip = "")
   new_fastq_folders <- reactiveVal(character(0))
@@ -12055,7 +12071,10 @@ server <- function(input, output, session) {
       c("Manual samples" = "manual")
     }
     default_mode <- if (has_cutrun_peaks) "cutrun_peak" else if (NROW(comparisons)) "comparison" else "manual"
-    mode <- selected_choice(input$genome_browser_mode, mode_choices, default_mode)
+    remembered_mode <- genome_browser_mode_state()
+    requested_mode <- input$genome_browser_mode %||% remembered_mode
+    mode <- selected_choice(requested_mode, mode_choices, default_mode)
+    if (!identical(remembered_mode, mode)) genome_browser_mode_state(mode)
     samples <- unique(as.character(catalog$sample))
     design_order <- project_samples(p)
     samples <- unique(c(design_order[design_order %in% samples], sort(setdiff(samples, design_order))))
@@ -12178,6 +12197,10 @@ server <- function(input, output, session) {
     }
     do.call(tagList, controls)
   })
+  observeEvent(input$genome_browser_mode, {
+    mode <- trimws(as.character(input$genome_browser_mode %||% ""))
+    if (nzchar(mode)) genome_browser_mode_state(mode)
+  }, ignoreInit = FALSE)
   observeEvent(input$genome_browser_gene, {
     gene <- trimws(as.character(input$genome_browser_gene %||% ""))
     if (!nzchar(gene)) return(invisible(NULL))
@@ -12215,7 +12238,13 @@ server <- function(input, output, session) {
       if (NROW(comparisons)) "comparison",
       "manual"
     )
-    requested_mode <- if (nzchar(as.character(mode_override %||% ""))) mode_override else input$genome_browser_mode
+    requested_mode <- if (nzchar(as.character(mode_override %||% ""))) {
+      mode_override
+    } else if (nzchar(genome_browser_mode_state())) {
+      genome_browser_mode_state()
+    } else {
+      input$genome_browser_mode
+    }
     browser_mode <- selected_choice(
       requested_mode,
       allowed_modes,
@@ -12327,6 +12356,17 @@ server <- function(input, output, session) {
     if (!nzchar(trimws(input$genome_browser_locus %||% "")) || nzchar(as.character(locus_override %||% ""))) {
       updateTextInput(session, "genome_browser_locus", value = locus)
     }
+    track_signature <- if (NROW(tracks)) {
+      info <- file.info(tracks$path)
+      paste(tracks$path, info$size, as.numeric(info$mtime), collapse = "|")
+    } else {
+      "no-tracks"
+    }
+    browser_signature <- paste(
+      p$id %||% p$name %||% p$data_dir, browser_mode, comparison_label,
+      paste(selected_samples, collapse = ","), shared_signal_scale, track_signature,
+      sep = "\r"
+    )
     summary <- paste0(
       "Loaded ", length(configs), " track", if (length(configs) == 1L) "" else "s",
       " for ", length(selected_samples), " sample", if (length(selected_samples) == 1L) "" else "s",
@@ -12344,6 +12384,7 @@ server <- function(input, output, session) {
     )
     session$sendCustomMessage("codespring-igv-load", list(
       elementId = "codespring_igv_browser",
+      signature = browser_signature,
       config = list(
         genome = genome_browser_reference(p),
         locus = locus,
@@ -12688,6 +12729,7 @@ server <- function(input, output, session) {
     path <- selected_cutrun_diffbind_dir()
     comparisons <- genome_browser_comparison_catalog(current_project())
     validate(need(NROW(comparisons) && path %in% comparisons$id, "This comparison does not have a browser-ready differential BED yet."))
+    genome_browser_mode_state("comparison")
     updateTabsetPanel(session, "cutrun_results_tabs", selected = "Genome Browser")
     updateSelectInput(session, "genome_browser_mode", selected = "comparison")
     updateSelectInput(session, "genome_browser_comparison", selected = path)
