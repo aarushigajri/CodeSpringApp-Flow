@@ -884,6 +884,22 @@ assert(identical(unname(navigation$genes), c("GeneA", "GeneB")), "genome-browser
 assert(length(navigation$peaks) == 2L && grepl("1. chr1:101-220", names(navigation$peaks)[[1]], fixed = TRUE), "genome browser offers ranked searchable differential-peak intervals")
 assert(grepl("GeneA", names(navigation$peaks)[[1]], fixed = TRUE), "top differential-peak selector includes HOMER gene-name context")
 assert(identical(unname(navigation$peaks)[[1]], "chr1:101-220"), "selected differential peak inserts its exact genomic interval into the locus search")
+comparison_direction_navigation <- app_env$genome_browser_comparison_navigation(comparison_dir, direction = "comparison")
+reference_direction_navigation <- app_env$genome_browser_comparison_navigation(comparison_dir, direction = "reference")
+assert(
+  identical(unname(comparison_direction_navigation$peaks), "chr1:101-220") &&
+    identical(unname(comparison_direction_navigation$genes), "GeneA"),
+  "positive DiffBind Fold filtering retains only peaks higher in the comparison condition"
+)
+assert(
+  identical(unname(reference_direction_navigation$peaks), "chr1:501-650") &&
+    identical(unname(reference_direction_navigation$genes), "GeneB"),
+  "negative DiffBind Fold filtering retains only peaks higher in the reference condition"
+)
+comparison_direction_bed <- app_env$genome_browser_filtered_differential_bed(differential_bed, "comparison")
+reference_direction_bed <- app_env$genome_browser_filtered_differential_bed(differential_bed, "reference")
+assert(NROW(read.table(comparison_direction_bed, sep = "\t")) == 1L && read.table(comparison_direction_bed, sep = "\t")[[5]][[1]] > 0, "comparison-direction browser BED contains only positive-Fold peaks")
+assert(NROW(read.table(reference_direction_bed, sep = "\t")) == 1L && read.table(reference_direction_bed, sep = "\t")[[5]][[1]] < 0, "reference-direction browser BED contains only negative-Fold peaks")
 ranking_dir <- file.path(root, "diffbind", "ranking_test")
 dir.create(ranking_dir, recursive = TRUE)
 ranking_rows <- vapply(seq_len(205L), function(i) {
@@ -923,6 +939,10 @@ comparison_catalog <- app_env$genome_browser_comparison_catalog(chip_project)
 assert(NROW(comparison_catalog) == 1L, "genome browser discovers a completed differential comparison")
 assert(identical(comparison_catalog$samples[[1]], c("B1", "B2", "A1", "A2")), "comparison browser places the experimental condition above the reference condition")
 assert(identical(comparison_catalog$reference_condition[[1]], "A"), "comparison browser records the DiffBind reference condition")
+assert(
+  identical(unname(app_env$genome_browser_comparison_condition_labels(comparison_catalog)), c("B", "A")),
+  "differential direction controls use the actual comparison and reference condition labels"
+)
 assert(identical(comparison_catalog$differential_bed[[1]], normalizePath(differential_bed)), "comparison browser selects the differential BED annotation")
 comparison_tracks <- app_env$genome_browser_preferred_signal_rows(
   chip_project, app_env$genome_browser_track_catalog(chip_project),

@@ -356,6 +356,7 @@ JOB_HISTORY_CACHE_SECONDS <- 10
 JOB_HISTORY_CACHE <- new.env(parent = emptyenv())
 METRIC_LINES_CACHE <- new.env(parent = emptyenv())
 GENOME_BROWSER_NAV_CACHE <- new.env(parent = emptyenv())
+GENOME_BROWSER_FILTERED_BED_CACHE <- new.env(parent = emptyenv())
 CUTRUN_PEAK_SOURCE_CACHE <- new.env(parent = emptyenv())
 CUTRUN_DEFAULT_SPIKEIN_INDEX <- "/grid/bsr/data/data/utama/genome/ecoli_k12/bowtie2_index/ecoli_k12_mg1655"
 CUTRUN_DEFAULT_SPIKEIN_NAME <- "ecoli"
@@ -3869,6 +3870,20 @@ genome_browser_comparison_catalog <- function(project) {
   if (length(rows)) do.call(rbind, rows) else data.frame()
 }
 
+genome_browser_comparison_condition_labels <- function(comparison) {
+  comparison_label <- trimws(as.character(comparison$comparison_condition[[1]] %||% ""))
+  reference_label <- trimws(as.character(comparison$reference_condition[[1]] %||% ""))
+  metadata <- comparison$sample_metadata[[1]]
+  conditions <- if (NROW(metadata) && "condition" %in% names(metadata)) unique(trimws(as.character(metadata$condition))) else character(0)
+  conditions <- conditions[nzchar(conditions)]
+  if (!nzchar(comparison_label) && length(conditions)) comparison_label <- conditions[[1]]
+  if (!nzchar(reference_label) && length(conditions)) reference_label <- conditions[[length(conditions)]]
+  c(
+    comparison = if (nzchar(comparison_label)) comparison_label else "comparison condition",
+    reference = if (nzchar(reference_label)) reference_label else "reference condition"
+  )
+}
+
 differential_accessibility_result_table <- function(result_dir, n = 20000) {
   if (!dir.exists(result_dir)) return(data.frame())
   annotated_files <- sort(list.files(
@@ -3938,9 +3953,42 @@ rank_differential_peak_rows <- function(peaks, limit = 200L) {
   peaks[utils::head(ranked, max(1L, as.integer(limit))), , drop = FALSE]
 }
 
-genome_browser_comparison_navigation <- function(result_dir, project = NULL, max_rows = 10000L, max_peaks = 200L) {
+filter_differential_peak_rows <- function(peaks, direction = "all") {
+  direction <- selected_choice(direction, c("all", "comparison", "reference"), "all")
+  if (!NROW(peaks) || identical(direction, "all")) return(peaks)
+  fold_columns <- c("Fold", "fold", "log2FoldChange", "log2FC")
+  fold_column <- fold_columns[fold_columns %in% names(peaks)]
+  if (!length(fold_column) && NCOL(peaks) >= 5L) fold_column <- names(peaks)[[5]]
+  if (!length(fold_column)) return(peaks[FALSE, , drop = FALSE])
+  fold <- suppressWarnings(as.numeric(peaks[[fold_column[[1]]]]))
+  keep <- is.finite(fold) & if (identical(direction, "comparison")) fold > 0 else fold < 0
+  peaks[keep, , drop = FALSE]
+}
+
+genome_browser_filtered_differential_bed <- function(path, direction = "all") {
+  direction <- selected_choice(direction, c("all", "comparison", "reference"), "all")
+  if (identical(direction, "all")) return(normalizePath(path, winslash = "/", mustWork = TRUE))
+  info <- file.info(path)
+  cache_key <- paste(normalizePath(path, winslash = "/", mustWork = TRUE), info$size, as.numeric(info$mtime), direction, sep = "\r")
+  if (exists(cache_key, envir = GENOME_BROWSER_FILTERED_BED_CACHE, inherits = FALSE)) {
+    cached <- get(cache_key, envir = GENOME_BROWSER_FILTERED_BED_CACHE, inherits = FALSE)
+    if (file.exists(cached)) return(cached)
+  }
+  peaks <- tryCatch(
+    utils::read.table(path, sep = "\t", header = FALSE, quote = "", comment.char = "", check.names = FALSE),
+    error = function(e) data.frame()
+  )
+  peaks <- filter_differential_peak_rows(peaks, direction)
+  output <- tempfile(paste0("codespring_", direction, "_"), fileext = ".bed")
+  utils::write.table(peaks, output, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE, na = "")
+  assign(cache_key, output, envir = GENOME_BROWSER_FILTERED_BED_CACHE)
+  output
+}
+
+genome_browser_comparison_navigation <- function(result_dir, project = NULL, max_rows = 10000L, max_peaks = 200L, direction = "all") {
   empty <- list(genes = setNames(character(0), character(0)), peaks = setNames(character(0), character(0)))
   if (!dir.exists(result_dir)) return(empty)
+  direction <- selected_choice(direction, c("all", "comparison", "reference"), "all")
   cutrun_mode <- !is.null(project) && is_cutrun_project(project)
   bed_files <- if (cutrun_mode) {
     c(file.path(result_dir, "significant_differential_peaks.bed"), file.path(result_dir, "all_differential_peaks.bed"))
@@ -3956,7 +4004,7 @@ genome_browser_comparison_navigation <- function(result_dir, project = NULL, max
   table_files <- if (cutrun_mode) file.path(result_dir, "all_differential_peaks.tsv") else character(0)
   table_files <- table_files[file.exists(table_files) & vapply(table_files, file_size_for, numeric(1)) > 0]
   source_files <- c(bed_files, annotation_files, table_files)
-  cache_key <- paste(normalizePath(result_dir, winslash = "/", mustWork = TRUE), max_rows, max_peaks, sep = "\r")
+  cache_key <- paste(normalizePath(result_dir, winslash = "/", mustWork = TRUE), max_rows, max_peaks, direction, sep = "\r")
   signature <- if (length(source_files)) {
     info <- file.info(source_files)
     paste(source_files, info$size, as.numeric(info$mtime), collapse = "|")
@@ -3970,6 +4018,7 @@ genome_browser_comparison_navigation <- function(result_dir, project = NULL, max
   peak_gene_context <- setNames(character(0), character(0))
   if (length(annotation_files)) {
     annotation <- safe_read_result_table(annotation_files[[1]], max_rows)
+    annotation <- filter_differential_peak_rows(annotation, direction)
     annotation <- rank_differential_peak_rows(annotation, max_peaks)
     gene_columns <- names(annotation)[gsub("[^a-z0-9]+", "", tolower(names(annotation))) %in% c("genename", "genesymbol", "symbol")]
     if (length(gene_columns) && NROW(annotation)) {
@@ -4001,6 +4050,7 @@ genome_browser_comparison_navigation <- function(result_dir, project = NULL, max
   peak_file <- if (length(table_files)) table_files[[1]] else if (length(bed_files)) bed_files[[1]] else ""
   if (nzchar(peak_file)) {
     peaks <- safe_read_result_table(peak_file, max_rows)
+    peaks <- filter_differential_peak_rows(peaks, direction)
     chrom_col <- intersect(c("chrom", "seqnames", "Chr", "chr"), names(peaks))
     start_col <- intersect(c("start", "Start"), names(peaks))
     end_col <- intersect(c("end", "End"), names(peaks))
@@ -4342,9 +4392,15 @@ genome_browser_range_response <- function(data, req) {
   shiny:::httpResponse(206, data$content_type, content, headers)
 }
 
-register_genome_browser_track <- function(session, project, path, index = 1L) {
-  path <- validated_project_result_path(project, path)
-  if (!nzchar(path)) stop("Genome-browser track is outside the selected project.")
+register_genome_browser_track <- function(session, project, path, index = 1L, generated = FALSE) {
+  if (isTRUE(generated)) {
+    path <- normalizePath(path, winslash = "/", mustWork = TRUE)
+    temp_root <- normalizePath(tempdir(), winslash = "/", mustWork = TRUE)
+    if (!path_is_within(path, temp_root)) stop("Generated genome-browser tracks must remain inside the application temporary directory.")
+  } else {
+    path <- validated_project_result_path(project, path)
+    if (!nzchar(path)) stop("Genome-browser track is outside the selected project.")
+  }
   ext <- tolower(tools::file_ext(path))
   content_type <- if (ext %in% c("bw", "bigwig")) "application/octet-stream" else "text/plain; charset=utf-8"
   key <- paste0("igv_", clean_name(basename(path), "track"), "_", index)
@@ -12143,7 +12199,16 @@ server <- function(input, output, session) {
       available <- comparison_samples[comparison_samples %in% samples]
       selected <- intersect(as.character(input$genome_browser_samples %||% character(0)), available)
       if (!length(selected)) selected <- available
-      navigation <- genome_browser_comparison_navigation(comparison$id[[1]], project = p, max_peaks = 200L)
+      condition_labels <- genome_browser_comparison_condition_labels(comparison)
+      direction_choices <- c(
+        "Both directions" = "all",
+        stats::setNames("comparison", paste0("Higher in ", condition_labels[["comparison"]], " (positive Fold)")),
+        stats::setNames("reference", paste0("Higher in ", condition_labels[["reference"]], " (negative Fold)"))
+      )
+      selected_direction <- selected_choice(isolate(input$genome_browser_peak_direction), direction_choices, "all")
+      navigation <- genome_browser_comparison_navigation(
+        comparison$id[[1]], project = p, max_peaks = 200L, direction = selected_direction
+      )
       gene_choices <- c("Choose a gene..." = "", navigation$genes)
       peak_choices <- c("Choose a differential peak..." = "", navigation$peaks)
       selected_gene <- as.character(input$genome_browser_gene %||% "")
@@ -12152,6 +12217,10 @@ server <- function(input, output, session) {
       if (!selected_peak %in% unname(peak_choices)) selected_peak <- ""
       controls <- c(controls, list(
         selectInput("genome_browser_comparison", "Differential comparison", choices = comparison_choices, selected = comparison_id, selectize = FALSE),
+        selectInput(
+          "genome_browser_peak_direction", "Differential peak direction",
+          choices = direction_choices, selected = selected_direction, selectize = FALSE
+        ),
         tags$h5("Navigate to"),
         if (length(navigation$genes)) selectizeInput(
           "genome_browser_gene", "Gene", choices = gene_choices, selected = selected_gene,
@@ -12255,6 +12324,8 @@ server <- function(input, output, session) {
     comparison_label <- ""
     comparison_default_locus <- ""
     differential_loaded <- FALSE
+    differential_direction <- "all"
+    differential_direction_label <- "both directions"
     matched_igg <- ""
     if (cutrun_peak_mode) {
       target_samples <- unique(as.character(catalog$sample[catalog$kind == "peaks"]))
@@ -12307,22 +12378,42 @@ server <- function(input, output, session) {
           paste(tracks$sample, "signal", sep = " — ")
         )
       }
+      condition_labels <- genome_browser_comparison_condition_labels(comparison)
+      differential_direction <- selected_choice(
+        input$genome_browser_peak_direction,
+        c("all", "comparison", "reference"),
+        "all"
+      )
+      differential_direction_label <- switch(
+        differential_direction,
+        comparison = paste("higher in", condition_labels[["comparison"]]),
+        reference = paste("higher in", condition_labels[["reference"]]),
+        "both directions"
+      )
       if (isTRUE(input$genome_browser_comparison_show_peaks)) {
         sample_peaks <- catalog[catalog$kind == "peaks" & catalog$sample %in% selected_samples, , drop = FALSE]
         sample_peaks <- sample_peaks[order(match(sample_peaks$sample, selected_samples), sample_peaks$label), , drop = FALSE]
         tracks <- rbind(tracks, sample_peaks)
       }
       if (isTRUE(input$genome_browser_show_differential_peaks)) {
+        differential_path <- genome_browser_filtered_differential_bed(
+          comparison$differential_bed[[1]], differential_direction
+        )
         differential <- data.frame(
           sample = "__differential__", kind = "differential", format = "bed",
-          label = paste(comparison$label[[1]], "differential peaks", sep = " — "),
-          path = comparison$differential_bed[[1]], stringsAsFactors = FALSE, check.names = FALSE
+          label = paste(comparison$label[[1]], differential_direction_label, "differential peaks", sep = " — "),
+          path = differential_path,
+          generated = !identical(differential_direction, "all"),
+          stringsAsFactors = FALSE, check.names = FALSE
         )
+        if (!"generated" %in% names(tracks)) tracks$generated <- FALSE
         tracks <- rbind(tracks, differential)
         differential_loaded <- TRUE
       }
       comparison_label <- comparison$label[[1]]
-      navigation <- genome_browser_comparison_navigation(comparison$id[[1]], project = p, max_peaks = 200L)
+      navigation <- genome_browser_comparison_navigation(
+        comparison$id[[1]], project = p, max_peaks = 200L, direction = differential_direction
+      )
       if (length(navigation$peaks)) comparison_default_locus <- unname(navigation$peaks)[[1]]
     } else {
       selected_samples <- intersect(as.character(input$genome_browser_samples %||% character(0)), unique(catalog$sample))
@@ -12335,9 +12426,10 @@ server <- function(input, output, session) {
     if (truncated) tracks <- utils::head(tracks, 32L)
     palette <- c("#2563eb", "#dc2626", "#059669", "#7c3aed", "#d97706", "#0891b2", "#be185d", "#4d7c0f")
     sample_colors <- stats::setNames(rep(palette, length.out = length(selected_samples)), selected_samples)
+    if (!"generated" %in% names(tracks)) tracks$generated <- FALSE
     configs <- lapply(seq_len(NROW(tracks)), function(i) {
       row <- tracks[i, , drop = FALSE]
-      url <- register_genome_browser_track(session, p, row$path[[1]], i)
+      url <- register_genome_browser_track(session, p, row$path[[1]], i, generated = isTRUE(row$generated[[1]]))
       color <- if (identical(row$kind[[1]], "differential")) "#6d28d9" else unname(sample_colors[[row$sample[[1]]]])
       base <- list(name = row$label[[1]], url = url, format = row$format[[1]], color = color)
       if (identical(row$kind[[1]], "signal")) {
@@ -12363,7 +12455,7 @@ server <- function(input, output, session) {
     }
     browser_signature <- paste(
       p$id %||% p$name %||% p$data_dir, browser_mode, comparison_label,
-      paste(selected_samples, collapse = ","), shared_signal_scale, track_signature,
+      paste(selected_samples, collapse = ","), shared_signal_scale, differential_direction, track_signature,
       sep = "\r"
     )
     summary <- paste0(
@@ -12376,6 +12468,7 @@ server <- function(input, output, session) {
         " Target and IgG share one y-axis scale."
       ) else if (comparison_mode) paste0(
         " Comparison: ", comparison_label, ".",
+        " Differential peaks: ", differential_direction_label, ".",
         if (shared_signal_scale) " Signal tracks share one y-axis scale." else "",
         if (differential_loaded) " Differential peaks are the bottom track." else ""
       ) else "",
@@ -12445,7 +12538,10 @@ server <- function(input, output, session) {
     catalog <- genome_browser_track_catalog(p)
     available <- comparison$samples[[1]]
     available <- available[available %in% unique(as.character(catalog$sample))]
-    navigation <- genome_browser_comparison_navigation(comparison$id[[1]], project = p, max_peaks = 200L)
+    direction <- selected_choice(input$genome_browser_peak_direction, c("all", "comparison", "reference"), "all")
+    navigation <- genome_browser_comparison_navigation(
+      comparison$id[[1]], project = p, max_peaks = 200L, direction = direction
+    )
     top_peak <- if (length(navigation$peaks)) unname(navigation$peaks)[[1]] else ""
     updateSelectizeInput(session, "genome_browser_samples", choices = available, selected = available, server = FALSE)
     updateSelectizeInput(session, "genome_browser_gene", selected = "")
@@ -12457,6 +12553,27 @@ server <- function(input, output, session) {
       updateSelectizeInput(session, "genome_browser_peak", selected = top_peak)
     }, once = TRUE)
     send_genome_browser(comparison_override = comparison_id, samples_override = available, locus_override = top_peak)
+  }, ignoreInit = TRUE)
+  observeEvent(input$genome_browser_peak_direction, {
+    if (!identical(genome_browser_mode_state(), "comparison")) return(invisible(NULL))
+    direction <- selected_choice(input$genome_browser_peak_direction, c("all", "comparison", "reference"), "all")
+    comparison_id <- as.character(input$genome_browser_comparison %||% "")
+    p <- current_project()
+    comparisons <- genome_browser_comparison_catalog(p)
+    hit <- match(comparison_id, comparisons$id)
+    if (is.na(hit)) return(invisible(NULL))
+    comparison <- comparisons[hit, , drop = FALSE]
+    available <- comparison$samples[[1]]
+    catalog <- genome_browser_track_catalog(p)
+    available <- available[available %in% unique(as.character(catalog$sample))]
+    navigation <- genome_browser_comparison_navigation(
+      comparison$id[[1]], project = p, max_peaks = 200L, direction = direction
+    )
+    top_peak <- if (length(navigation$peaks)) unname(navigation$peaks)[[1]] else ""
+    updateSelectizeInput(session, "genome_browser_gene", choices = c("Choose a gene..." = "", navigation$genes), selected = "")
+    updateSelectizeInput(session, "genome_browser_peak", choices = c("Choose a differential peak..." = "", navigation$peaks), selected = top_peak)
+    if (nzchar(top_peak)) updateTextInput(session, "genome_browser_locus", value = top_peak)
+    send_genome_browser(comparison_override = comparison$id[[1]], samples_override = available, locus_override = top_peak)
   }, ignoreInit = TRUE)
   observeEvent(input$load_genome_browser, send_genome_browser(), ignoreInit = TRUE)
   observeEvent(input$genome_browser_ready, send_genome_browser(), ignoreInit = TRUE)
