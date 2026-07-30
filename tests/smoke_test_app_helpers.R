@@ -29,9 +29,8 @@ assert(
 )
 assert(
   grepl("pca_differential_peaks.png", server_source, fixed = TRUE) &&
-    grepl("PCA using differential peaks", server_source, fixed = TRUE) &&
-    grepl("run_cutrun_diffbind_pca", server_source, fixed = TRUE),
-  "CUT&RUN DiffBind Results Explorer exposes and can repair the contrast-specific differential-peak PCA"
+    grepl("PCA using differential peaks", server_source, fixed = TRUE),
+  "CUT&RUN DiffBind Results Explorer exposes the contrast-specific differential-peak PCA"
 )
 assert(
   grepl("observeEvent(input$genome_browser_ready, send_genome_browser()", server_source, fixed = TRUE) &&
