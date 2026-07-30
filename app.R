@@ -3703,6 +3703,7 @@ genome_browser_differential_bed <- function(project, result_dir) {
   candidates <- if (is_cutrun_project(project)) {
     c(
       file.path(result_dir, "significant_differential_peaks.bed"),
+      file.path(result_dir, "all_differential_peaks.bed"),
       list.files(result_dir, pattern = "differential.*\\.bed$", full.names = TRUE, ignore.case = TRUE)
     )
   } else {
@@ -3851,7 +3852,7 @@ genome_browser_comparison_catalog <- function(project) {
     if (!NROW(sheet)) return(NULL)
     condition_labels <- genome_browser_diffbind_labels(result_dir)
     sheet <- order_genome_browser_comparison_sheet(sheet, condition_labels)
-    label <- trimws(gsub("_+", " ", basename(result_dir)))
+    label <- if (is_cutrun_project(project)) cutrun_diffbind_result_label(project, result_dir) else trimws(gsub("_+", " ", basename(result_dir)))
     data.frame(
       id = normalizePath(result_dir, winslash = "/", mustWork = TRUE),
       label = label,
@@ -3940,9 +3941,21 @@ rank_differential_peak_rows <- function(peaks, limit = 200L) {
 genome_browser_comparison_navigation <- function(result_dir, project = NULL, max_rows = 10000L, max_peaks = 200L) {
   empty <- list(genes = setNames(character(0), character(0)), peaks = setNames(character(0), character(0)))
   if (!dir.exists(result_dir)) return(empty)
-  bed_files <- list.files(result_dir, pattern = "^DifferentialPeaks_.*\\.with_stats\\.bed$", full.names = TRUE)
-  annotation_files <- list.files(result_dir, pattern = "^DifferentialPeaks_.*_annotated.*\\.txt$", full.names = TRUE)
-  source_files <- c(bed_files, annotation_files)
+  cutrun_mode <- !is.null(project) && is_cutrun_project(project)
+  bed_files <- if (cutrun_mode) {
+    c(file.path(result_dir, "significant_differential_peaks.bed"), file.path(result_dir, "all_differential_peaks.bed"))
+  } else {
+    list.files(result_dir, pattern = "^DifferentialPeaks_.*\\.with_stats\\.bed$", full.names = TRUE)
+  }
+  bed_files <- bed_files[file.exists(bed_files) & vapply(bed_files, file_size_for, numeric(1)) > 0]
+  annotation_files <- list.files(
+    result_dir,
+    pattern = if (cutrun_mode) "^(all|significant)_differential_peaks_annotated.*\\.txt$" else "^DifferentialPeaks_.*_annotated.*\\.txt$",
+    full.names = TRUE
+  )
+  table_files <- if (cutrun_mode) file.path(result_dir, "all_differential_peaks.tsv") else character(0)
+  table_files <- table_files[file.exists(table_files) & vapply(table_files, file_size_for, numeric(1)) > 0]
+  source_files <- c(bed_files, annotation_files, table_files)
   cache_key <- paste(normalizePath(result_dir, winslash = "/", mustWork = TRUE), max_rows, max_peaks, sep = "\r")
   signature <- if (length(source_files)) {
     info <- file.info(source_files)
@@ -3985,22 +3998,29 @@ genome_browser_comparison_navigation <- function(result_dir, project = NULL, max
     }
   }
   peak_choices <- setNames(character(0), character(0))
-  if (length(bed_files)) {
-    peaks <- safe_read_result_table(bed_files[[1]], max_rows)
-    if (NROW(peaks) && all(c("chrom", "start", "end") %in% names(peaks))) {
-      start <- suppressWarnings(as.numeric(peaks$start)) + 1
-      end <- suppressWarnings(as.numeric(peaks$end))
-      keep <- nzchar(as.character(peaks$chrom)) & is.finite(start) & is.finite(end) & end >= start
+  peak_file <- if (length(table_files)) table_files[[1]] else if (length(bed_files)) bed_files[[1]] else ""
+  if (nzchar(peak_file)) {
+    peaks <- safe_read_result_table(peak_file, max_rows)
+    chrom_col <- intersect(c("chrom", "seqnames", "Chr", "chr"), names(peaks))
+    start_col <- intersect(c("start", "Start"), names(peaks))
+    end_col <- intersect(c("end", "End"), names(peaks))
+    if (NROW(peaks) && length(chrom_col) && length(start_col) && length(end_col)) {
+      start <- suppressWarnings(as.numeric(peaks[[start_col[[1]]]])) + if (tolower(tools::file_ext(peak_file)) == "bed") 1 else 0
+      end <- suppressWarnings(as.numeric(peaks[[end_col[[1]]]]))
+      chrom <- as.character(peaks[[chrom_col[[1]]]])
+      keep <- nzchar(chrom) & is.finite(start) & is.finite(end) & end >= start
       peaks <- peaks[keep, , drop = FALSE]
+      chrom <- chrom[keep]
       start <- start[keep]
       end <- end[keep]
       if (NROW(peaks)) {
         original_rows <- as.integer(rownames(peaks))
         peaks <- rank_differential_peak_rows(peaks, max_peaks)
         selected_rows <- match(as.integer(rownames(peaks)), original_rows)
+        chrom <- chrom[selected_rows]
         start <- start[selected_rows]
         end <- end[selected_rows]
-        interval <- paste0(peaks$chrom, ":", format(start, scientific = FALSE, trim = TRUE), "-", format(end, scientific = FALSE, trim = TRUE))
+        interval <- paste0(chrom, ":", format(start, scientific = FALSE, trim = TRUE), "-", format(end, scientific = FALSE, trim = TRUE))
         locus <- interval
         label <- paste0(seq_len(NROW(peaks)), ". ", interval)
         gene_context <- unname(peak_gene_context[interval])
@@ -4949,7 +4969,6 @@ cutrun_results_explorer_ui <- function() {
                 div(class = "cutrun-section-heading", tags$h4("Genome-browser tracks"), tags$p("BigWig and bedGraph signals, including spike-in, CPM, or raw normalization.")),
                 table_output("cutrun_signal_tracks")
               ),
-              tabPanel("Genome Browser", genome_browser_ui()),
               tabPanel("Peak Counts",
                 br(),
                 tags$p(class = "muted small-note", "Project-wide union counts are intended for QC. Use Differential Binding for mark-specific statistical comparisons."),
@@ -4970,6 +4989,7 @@ cutrun_results_explorer_ui <- function() {
               tabPanel("Gene Annotation", peak_annotation_results_ui())
             )
           ),
+          tabPanel("Genome Browser", genome_browser_ui()),
           tabPanel("Differential Binding",
             br(),
             sidebarLayout(
@@ -4978,6 +4998,7 @@ cutrun_results_explorer_ui <- function() {
                 uiOutput("cutrun_diffbind_comparison_ui"),
                 numericInput("cutrun_diffbind_fdr", "FDR cutoff", value = 0.05, min = 0, max = 1, step = 0.001),
                 numericInput("cutrun_diffbind_fold", "Absolute log2 fold cutoff", value = 0, min = 0, step = 0.1),
+                actionButton("open_cutrun_diffbind_browser", "Open comparison in Genome Browser", class = "btn-primary"),
                 tags$hr(),
                 helpText("Each cell type and mark is analyzed independently from raw BAM fragment counts with spike-in or genomic-background normalization.")
               ),
@@ -12175,7 +12196,7 @@ server <- function(input, output, session) {
       updateSelectizeInput(session, "genome_browser_gene", selected = "")
     }
   }, ignoreInit = TRUE)
-  send_genome_browser <- function(comparison_override = "", samples_override = NULL, locus_override = "") {
+  send_genome_browser <- function(comparison_override = "", samples_override = NULL, locus_override = "", mode_override = "") {
     p <- current_project()
     if (!is_atac_project(p) && !is_chip_project(p) && !is_cutrun_project(p)) return(invisible(NULL))
     catalog <- genome_browser_track_catalog(p)
@@ -12194,8 +12215,9 @@ server <- function(input, output, session) {
       if (NROW(comparisons)) "comparison",
       "manual"
     )
+    requested_mode <- if (nzchar(as.character(mode_override %||% ""))) mode_override else input$genome_browser_mode
     browser_mode <- selected_choice(
-      input$genome_browser_mode,
+      requested_mode,
       allowed_modes,
       if (has_cutrun_peaks) "cutrun_peak" else if (NROW(comparisons)) "comparison" else "manual"
     )
@@ -12662,6 +12684,17 @@ server <- function(input, output, session) {
     req(nzchar(path), path_is_within(path, root), file.exists(file.path(path, "all_differential_peaks.tsv")))
     path
   })
+  observeEvent(input$open_cutrun_diffbind_browser, {
+    path <- selected_cutrun_diffbind_dir()
+    comparisons <- genome_browser_comparison_catalog(current_project())
+    validate(need(NROW(comparisons) && path %in% comparisons$id, "This comparison does not have a browser-ready differential BED yet."))
+    updateTabsetPanel(session, "cutrun_results_tabs", selected = "Genome Browser")
+    updateSelectInput(session, "genome_browser_mode", selected = "comparison")
+    updateSelectInput(session, "genome_browser_comparison", selected = path)
+    session$onFlushed(function() {
+      send_genome_browser(comparison_override = path, mode_override = "comparison")
+    }, once = TRUE)
+  }, ignoreInit = TRUE)
   cutrun_diffbind_all_results <- reactive({
     safe_read_table(file.path(selected_cutrun_diffbind_dir(), "all_differential_peaks.tsv"), 20000)
   })

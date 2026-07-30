@@ -414,6 +414,11 @@ atac_signal_position <- regexpr("Signal &amp; Peaks", atac_ui_text, fixed = TRUE
 atac_browser_position <- regexpr("Genome Browser", atac_ui_text, fixed = TRUE)[[1]]
 atac_diff_position <- regexpr("Differential Accessibility", atac_ui_text, fixed = TRUE)[[1]]
 assert(atac_signal_position > 0L && atac_browser_position > atac_signal_position && atac_diff_position > atac_browser_position, "ATAC Genome Browser is a main tab between Signal & Peaks and Differential Accessibility")
+cutrun_signal_position <- regexpr("Signal &amp; Peaks", cutrun_ui_text, fixed = TRUE)[[1]]
+cutrun_browser_position <- regexpr("Genome Browser", cutrun_ui_text, fixed = TRUE)[[1]]
+cutrun_diff_position <- regexpr("Differential Binding", cutrun_ui_text, fixed = TRUE)[[1]]
+assert(cutrun_signal_position > 0L && cutrun_browser_position > cutrun_signal_position && cutrun_diff_position > cutrun_browser_position, "CUT&RUN Genome Browser is a main tab between Signal & Peaks and Differential Binding")
+assert(grepl("Open comparison in Genome Browser", cutrun_ui_text, fixed = TRUE), "CUT&RUN Differential Binding links directly to its comparison browser")
 assert(grepl("codespring-genome-browser-controls", atac_ui_text, fixed = TRUE), "genome-browser controls use an overflow-safe dropdown container")
 assert(all(vapply(list(atac_ui_text, chip_ui_text, cutrun_ui_text), grepl, logical(1), pattern = "Gene Annotation", fixed = TRUE)), "all peak Results Explorers expose gene annotations")
 assert(grepl("cutrun_file_sample_ui", cutrun_ui_text, fixed = TRUE), "CUT&RUN file explorer exposes a sample selector")
@@ -907,6 +912,20 @@ assert(NROW(comparison_tracks) == 4L && identical(comparison_tracks$sample, c("B
 cutrun_comparison_dir <- file.path(root, "cutrun_diffbind", "Creb", "B_vs_A")
 dir.create(cutrun_comparison_dir, recursive = TRUE, showWarnings = FALSE)
 writeLines("chr1\t100\t220\tpeak_1\t2.5", file.path(cutrun_comparison_dir, "significant_differential_peaks.bed"))
+write.table(
+  data.frame(
+    seqnames = c("chr1", "chr2"), start = c(101, 501), end = c(220, 650),
+    Fold = c(2.5, -1.8), p.value = c(0.0002, 0.003), FDR = c(0.004, 0.02),
+    stringsAsFactors = FALSE
+  ),
+  file.path(cutrun_comparison_dir, "all_differential_peaks.tsv"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+writeLines(c(
+  "PeakID\tGene Name\tFold\tp.value\tFDR",
+  "chr1:101-220|Fold=2.5|p.value=0.0002|FDR=0.004\tCutGeneA\t2.5\t0.0002\t0.004",
+  "chr2:501-650|Fold=-1.8|p.value=0.003|FDR=0.02\tCutGeneB\t-1.8\t0.003\t0.02"
+), file.path(cutrun_comparison_dir, "all_differential_peaks_annotated_with_stats.txt"))
 comparison_samples$normalization_mode <- "spikein"
 write.table(comparison_samples, file.path(cutrun_comparison_dir, "diffbind_sample_sheet.tsv"), sep = "\t", row.names = FALSE, quote = FALSE)
 cutrun_browser_project <- chip_project
@@ -915,6 +934,13 @@ cutrun_browser_project$analysis <- "CUT&RUN"
 cutrun_comparisons <- app_env$genome_browser_comparison_catalog(cutrun_browser_project)
 assert(NROW(cutrun_comparisons) == 1L && basename(cutrun_comparisons$id[[1]]) == "B_vs_A", "genome browser discovers nested CUT&RUN differential comparisons")
 assert(identical(cutrun_comparisons$samples[[1]], c("B1", "B2", "A1", "A2")), "CUT&RUN genome browser places the reference condition below the comparison")
+cutrun_navigation <- app_env$genome_browser_comparison_navigation(cutrun_comparison_dir, project = cutrun_browser_project)
+assert(
+  length(cutrun_navigation$peaks) == 2L &&
+    identical(unname(cutrun_navigation$peaks)[[1]], "chr1:101-220") &&
+    "CutGeneA" %in% unname(cutrun_navigation$genes),
+  "CUT&RUN comparison browser ranks all differential regions and exposes annotated gene navigation"
+)
 
 atac_browser_root <- file.path(root, "atac_browser_case")
 atac_browser_samples <- paste0(rep(c("Control", "Treated"), each = 3), rep(1:3, 2))
