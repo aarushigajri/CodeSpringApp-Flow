@@ -28,6 +28,12 @@ assert(
   "CUT&RUN DiffBind exposes a live per-comparison job-status table"
 )
 assert(
+  grepl("pca_differential_peaks.png", server_source, fixed = TRUE) &&
+    grepl("PCA using differential peaks", server_source, fixed = TRUE) &&
+    grepl("run_cutrun_diffbind_pca", server_source, fixed = TRUE),
+  "CUT&RUN DiffBind Results Explorer exposes and can repair the contrast-specific differential-peak PCA"
+)
+assert(
   grepl("observeEvent(input$genome_browser_ready, send_genome_browser()", server_source, fixed = TRUE) &&
     !grepl("genome_browser_loaded <- reactiveVal(FALSE)", server_source, fixed = TRUE),
   "genome browser uses the established immediate-load behavior"
@@ -743,6 +749,19 @@ assert(
 diffbind_complete_marker <- file.path(seacr_selector_project$data_dir, "cutrun_diffbind", diffbind_run_slug, "_COMPLETE")
 dir.create(dirname(diffbind_complete_marker), recursive = TRUE, showWarnings = FALSE)
 writeLines(as.character(Sys.time()), diffbind_complete_marker)
+write.table(
+  data.frame(
+    cell_type = "Model", mark = "Creb", comparison = "B", reference = "A",
+    peak_source = shared_diffbind_id, stringsAsFactors = FALSE
+  ),
+  file.path(dirname(diffbind_complete_marker), "cutrun_diffbind_summary.tsv"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+diffbind_result_label <- app_env$cutrun_diffbind_result_label(seacr_selector_project, dirname(diffbind_complete_marker))
+assert(
+  grepl("^Model — Creb — B vs A — peaks: Shared overlap", diffbind_result_label),
+  "CUT&RUN DiffBind result labels lead with the biological comparison and show the peak source last"
+)
 complete_status <- app_env$cutrun_diffbind_comparison_status(seacr_selector_project, two_rep_plan, jobs = data.frame())
 assert(identical(complete_status$Status[[1]], "Complete"), "CUT&RUN DiffBind status uses each comparison's own completion marker")
 strict_peak_plan <- app_env$cutrun_diffbind_comparison_plan(seacr_selector_project, "A", 1L, shared_diffbind_id, 3L)

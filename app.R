@@ -3569,6 +3569,39 @@ cutrun_diffbind_result_dirs <- function(project) {
   dirs[file.exists(file.path(dirs, "all_differential_peaks.tsv"))]
 }
 
+cutrun_peak_source_short_label <- function(project, source_id) {
+  source_id <- trimws(as.character(source_id %||% ""))
+  sources <- cutrun_diffbind_peak_source_catalog(project)
+  hit <- if (NROW(sources)) sources[sources$source_id == source_id, , drop = FALSE] else data.frame()
+  if (NROW(hit)) return(paste(hit$tool[[1]], hit$setting[[1]]))
+  label <- gsub("_", " ", source_id, fixed = TRUE)
+  label <- sub("^macs2 ", "MACS2 ", label, ignore.case = TRUE)
+  label <- sub("^seacr ", "SEACR ", label, ignore.case = TRUE)
+  label <- sub("^shared ", "Shared overlap: ", label, ignore.case = TRUE)
+  trimws(label)
+}
+
+cutrun_diffbind_result_label <- function(project, path) {
+  summary <- safe_read_table(file.path(path, "cutrun_diffbind_summary.tsv"), 10)
+  if (NROW(summary) && all(c("cell_type", "mark", "comparison", "reference") %in% names(summary))) {
+    row <- summary[1, , drop = FALSE]
+    source_id <- if ("peak_source" %in% names(row)) as.character(row$peak_source[[1]]) else strsplit(basename(path), "__", fixed = TRUE)[[1]][[1]]
+    return(paste(
+      as.character(row$cell_type[[1]]),
+      as.character(row$mark[[1]]),
+      paste(as.character(row$comparison[[1]]), "vs", as.character(row$reference[[1]])),
+      paste("peaks:", cutrun_peak_source_short_label(project, source_id)),
+      sep = " — "
+    ))
+  }
+  parts <- strsplit(basename(path), "__", fixed = TRUE)[[1]]
+  if (length(parts) >= 4L) {
+    comparison <- gsub("_", " ", parts[[4]], fixed = TRUE)
+    return(paste(parts[[2]], parts[[3]], comparison, paste("peaks:", cutrun_peak_source_short_label(project, parts[[1]])), sep = " — "))
+  }
+  gsub("__", " — ", basename(path), fixed = TRUE)
+}
+
 cutrun_fragment_plot_files <- function(project) {
   root <- file.path(project$data_dir, "bowtie2")
   if (!dir.exists(root)) return(character(0))
@@ -7991,6 +8024,47 @@ submit_cutrun_diffbind_jobs <- function(project, reference_condition, comparison
   paste(messages, collapse = "\n")
 }
 
+submit_cutrun_diffbind_pca_job <- function(project, result_dir) {
+  root <- file.path(project$data_dir, "cutrun_diffbind")
+  result_dir <- normalizePath(result_dir, winslash = "/", mustWork = FALSE)
+  if (!dir.exists(result_dir) || !path_is_within(result_dir, root)) {
+    return(record_preflight_failure(project, "Differential Peaks", "Choose a completed CUT&RUN differential comparison first.", "cutrun_diffbind_pca"))
+  }
+  object_path <- file.path(result_dir, "diffbind_object.rds")
+  target <- file.path(result_dir, "pca_differential_peaks.png")
+  if (file.exists(target) && file_size_for(target) > 0) return("The differential-peak PCA is already complete.")
+  if (!file.exists(object_path) || file_size_for(object_path) <= 0) {
+    return(record_preflight_failure(project, "Differential Peaks", "The saved DiffBind object is missing, so this PCA cannot be repaired without rerunning the comparison.", "cutrun_diffbind_pca"))
+  }
+  qsub <- file.path(SCRIPTS_DIR, "DiffBind", "qsub_cutrun_diffbind_replot.sh")
+  r_script <- file.path(SCRIPTS_DIR, "DiffBind", "cutrun_diffbind_replot.R")
+  missing_scripts <- c(qsub, r_script)[!file.exists(c(qsub, r_script))]
+  if (length(missing_scripts)) {
+    return(record_preflight_failure(project, "Differential Peaks", paste("CodeSpringLab PCA repair scripts are missing:", paste(missing_scripts, collapse = ", ")), "cutrun_diffbind_pca"))
+  }
+  sample <- paste0(basename(result_dir), "__pca")
+  jobs <- job_history(project)
+  active <- if (NROW(jobs) && all(c("step", "sample", "slurm_state") %in% names(jobs))) {
+    jobs[canonical_job_step(jobs$step) == "Differential Peaks" & jobs$sample == sample & jobs$slurm_state %in% active_slurm_states(), , drop = FALSE]
+  } else data.frame()
+  if (NROW(active)) return("The differential-peak PCA job for this comparison is already active.")
+  submit_sbatch(
+    project, "Differential Peaks", qsub, c(r_script, object_path, result_dir),
+    "cutrun_diffbind_pca", paste("repair differential-peak PCA;", basename(result_dir)),
+    sample = sample, target = target, reference = "saved DiffBind object"
+  )
+}
+
+submit_cutrun_diffbind_pca_jobs <- function(project) {
+  dirs <- cutrun_diffbind_result_dirs(project)
+  missing <- dirs[!vapply(file.path(dirs, "pca_differential_peaks.png"), function(path) {
+    file.exists(path) && file_size_for(path) > 0
+  }, logical(1))]
+  if (!length(missing)) return("Every completed CUT&RUN comparison already has a differential-peak PCA.")
+  messages <- vapply(missing, function(path) submit_cutrun_diffbind_pca_job(project, path), character(1))
+  paste(messages, collapse = "\n")
+}
+
 submit_cutrun_macs2_jobs <- function(project, qvalue = "0.01", peak_type = "auto", samples = NULL) {
   res <- cutrun_reference_resources(project)
   outdir <- file.path(project$data_dir, "macs2")
@@ -11593,6 +11667,13 @@ server <- function(input, output, session) {
       paste(length(comparisons), "comparison job(s); peak source", peak_source, "; minimum", min_peaks, "peaks/sample; reference", reference, "; consensus support", support)
     )
   })
+  observeEvent(input$run_cutrun_diffbind_pca, {
+    run_submission(
+      "Differential Peaks",
+      submit_cutrun_diffbind_pca_jobs(current_project()),
+      "repair missing differential-peak PCAs"
+    )
+  })
   observeEvent(input$run_cutrun_macs2, {
     samples <- input$cutrun_macs2_samples %||% character(0)
     run_submission(
@@ -12617,7 +12698,7 @@ server <- function(input, output, session) {
     progress_refresh()
     dirs <- cutrun_diffbind_result_dirs(current_project())
     if (!length(dirs)) return(div(class = "empty-box", "No completed CUT&RUN differential comparisons were found yet."))
-    labels <- gsub("__", " — ", basename(dirs), fixed = TRUE)
+    labels <- vapply(dirs, function(path) cutrun_diffbind_result_label(current_project(), path), character(1))
     choices <- stats::setNames(dirs, labels)
     selectInput(
       "cutrun_diffbind_result_dir", "Comparison",
@@ -12687,7 +12768,26 @@ server <- function(input, output, session) {
     )
   })
   output$cutrun_diffbind_pca_ui <- renderUI({
-    image_or_file_ui(file.path(selected_cutrun_diffbind_dir(), "pca_normalized_counts.png"), "760px")
+    path <- selected_cutrun_diffbind_dir()
+    normalized <- file.path(path, "pca_normalized_counts.png")
+    differential <- file.path(path, "pca_differential_peaks.png")
+    tagList(
+      tags$h4("PCA using normalized counts across the consensus peak set"),
+      tags$p(class = "muted small-note", "This PCA uses normalized counts across all tested consensus regions."),
+      image_or_file_ui(normalized, "760px"),
+      tags$hr(),
+      tags$h4("PCA using differential peaks"),
+      tags$p(class = "muted small-note", "This contrast-specific PCA uses the regions identified by the differential analysis."),
+      if (file.exists(differential)) {
+        image_or_file_ui(differential, "760px")
+      } else {
+        div(
+          class = "empty-box",
+          tags$p("This result was created before differential-peak PCA output was added."),
+          actionButton("run_cutrun_diffbind_pca", "Generate missing differential-peak PCAs for all comparisons", class = "btn-primary")
+        )
+      }
+    )
   })
   output$cutrun_diffbind_volcano_ui <- renderUI({
     image_or_file_ui(file.path(selected_cutrun_diffbind_dir(), "volcano_differential_peaks.png"), "760px")
