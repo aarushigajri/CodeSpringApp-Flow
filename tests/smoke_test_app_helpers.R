@@ -1132,6 +1132,10 @@ writeLines(
   "DESCRIPTION\tS1\tS2\tS3",
   file.path(counts_only_root, "deseq2", "normalized_counts_Treated_vs_Control(ref).txt")
 )
+writeLines(
+  "gene\tbaseMean\tlog2FoldChange\tpvalue\tpadj",
+  file.path(counts_only_root, "deseq2", "DEG_Treated_vs_Control(ref).txt")
+)
 completed_deseq <- app_env$completed_deseq_comparison_catalog(counts_project)
 assert(
   NROW(completed_deseq) == 1L &&
@@ -1149,6 +1153,22 @@ assert(
   grepl("Completed DESeq2 comparison", app_text, fixed = TRUE) &&
     grepl("completed_deseq_comparison_catalog(current_project())", app_text, fixed = TRUE),
   "GSEA has an independent dropdown populated from completed DESeq2 runs"
+)
+assert(
+  app_env$PROGRESS_REFRESH_MS >= 20000 &&
+    app_env$SLURM_QUERY_TIMEOUT_SECONDS <= 2 &&
+    app_env$MAX_SLURM_JOB_IDS_PER_REFRESH <= 100,
+  "progress polling is bounded so scheduler latency cannot repeatedly freeze the Shiny event loop"
+)
+assert(
+  grepl("previous_cache$value", app_text, fixed = TRUE) &&
+    grepl("sacct_ids <- setdiff(ids, ids_seen)", app_text, fixed = TRUE),
+  "terminal SLURM states are cached and active queue jobs are not redundantly queried through sacct"
+)
+assert(
+  grepl("completed_deseq_result_files(current_project())", app_text, fixed = TRUE) &&
+    grepl("completed_gsea_result_files(current_project())", app_text, fixed = TRUE),
+  "Results Explorer selectors only list files from completed DESeq2 and GSEA runs"
 )
 
 cat("CodeSpringApp fake-data helper smoke tests passed.\n")

@@ -357,8 +357,10 @@ ATAC_EXAMPLE_FASTQ_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "fastq_at
 ATAC_EXAMPLE_DESIGN_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "manifest_atac"), winslash = "/", mustWork = FALSE)
 CHIP_EXAMPLE_FASTQ_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "fastq_chip"), winslash = "/", mustWork = FALSE)
 CHIP_EXAMPLE_DESIGN_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "manifest_chip"), winslash = "/", mustWork = FALSE)
-PROGRESS_REFRESH_MS <- 5000
-JOB_HISTORY_CACHE_SECONDS <- 10
+PROGRESS_REFRESH_MS <- 20000
+JOB_HISTORY_CACHE_SECONDS <- 12
+MAX_SLURM_JOB_IDS_PER_REFRESH <- 100L
+SLURM_QUERY_TIMEOUT_SECONDS <- 2
 JOB_HISTORY_CACHE <- new.env(parent = emptyenv())
 METRIC_LINES_CACHE <- new.env(parent = emptyenv())
 GENOME_BROWSER_NAV_CACHE <- new.env(parent = emptyenv())
@@ -1780,8 +1782,13 @@ job_history_file_signature <- function() {
 job_history <- function(project, force_refresh = FALSE) {
   cache_key <- job_history_cache_key(project)
   file_signature <- job_history_file_signature()
+  previous_cache <- if (exists(cache_key, envir = JOB_HISTORY_CACHE, inherits = FALSE)) {
+    get(cache_key, envir = JOB_HISTORY_CACHE, inherits = FALSE)
+  } else {
+    NULL
+  }
   if (!isTRUE(force_refresh) && exists(cache_key, envir = JOB_HISTORY_CACHE, inherits = FALSE)) {
-    cached <- get(cache_key, envir = JOB_HISTORY_CACHE, inherits = FALSE)
+    cached <- previous_cache
     cache_age <- as.numeric(difftime(Sys.time(), cached$checked, units = "secs"))
     if (identical(cached$file_signature, file_signature) && is.finite(cache_age) && cache_age < JOB_HISTORY_CACHE_SECONDS) {
       return(cached$value)
@@ -1811,7 +1818,25 @@ job_history <- function(project, force_refresh = FALSE) {
   jobs$start_time <- ""
   jobs$end_time <- ""
   jobs$slurm_job_name <- ""
-  ids <- unique(jobs$job_id[nzchar(jobs$job_id)])
+  if (!is.null(previous_cache) && NROW(previous_cache$value) && all(c("job_id", "slurm_state") %in% names(previous_cache$value))) {
+    previous <- previous_cache$value
+    previous <- previous[nzchar(previous$job_id), , drop = FALSE]
+    previous <- previous[!duplicated(previous$job_id, fromLast = TRUE), , drop = FALSE]
+    previous_hit <- match(jobs$job_id, previous$job_id)
+    restore <- !is.na(previous_hit) & nzchar(jobs$job_id)
+    jobs$slurm_state[restore] <- as.character(previous$slurm_state[previous_hit[restore]])
+    for (column in intersect(c("elapsed", "start_time", "end_time"), names(previous))) {
+      jobs[[column]][restore] <- as.character(previous[[column]][previous_hit[restore]])
+    }
+  }
+  refreshable_states <- c("Submitted", "Finished or not in queue", active_slurm_states())
+  ids <- unique(jobs$job_id[nzchar(jobs$job_id) & jobs$slurm_state %in% refreshable_states])
+  if (length(ids) > MAX_SLURM_JOB_IDS_PER_REFRESH) {
+    skipped_ids <- head(ids, length(ids) - MAX_SLURM_JOB_IDS_PER_REFRESH)
+    jobs$slurm_state[jobs$job_id %in% skipped_ids & jobs$slurm_state == "Submitted"] <- "Finished or not in queue"
+    ids <- tail(ids, MAX_SLURM_JOB_IDS_PER_REFRESH)
+  }
+  sacct_ids <- ids
   if (length(ids) && nzchar(Sys.which("squeue"))) {
     queue_user <- CURRENT_USER
     queue_args <- if (nzchar(queue_user)) {
@@ -1819,11 +1844,12 @@ job_history <- function(project, force_refresh = FALSE) {
     } else {
       c("-h", "-j", paste(ids, collapse = ","), "-o", shQuote("%A|%T|%M|%j"))
     }
-    sq <- tryCatch(suppressWarnings(system2("squeue", queue_args, stdout = TRUE, stderr = FALSE, timeout = 10)), error = function(e) character(0))
+    sq <- tryCatch(suppressWarnings(system2("squeue", queue_args, stdout = TRUE, stderr = FALSE, timeout = SLURM_QUERY_TIMEOUT_SECONDS)), error = function(e) character(0))
     sq <- sq[nzchar(sq)]
     if (length(sq)) {
       parts <- strsplit(sq, "|", fixed = TRUE)
       ids_seen <- vapply(parts, function(x) x[1], character(1))
+      sacct_ids <- setdiff(ids, ids_seen)
       state_map <- setNames(vapply(parts, function(x) if (length(x) >= 2) x[2] else "Active", character(1)), ids_seen)
       elapsed_map <- setNames(vapply(parts, function(x) if (length(x) >= 3) x[3] else "", character(1)), ids_seen)
       name_map <- setNames(vapply(parts, function(x) if (length(x) >= 4) x[4] else "", character(1)), ids_seen)
@@ -1836,8 +1862,8 @@ job_history <- function(project, force_refresh = FALSE) {
       jobs$slurm_state[nzchar(jobs$job_id)] <- "Finished or not in queue"
     }
   }
-  if (length(ids) && nzchar(Sys.which("sacct"))) {
-    sac <- tryCatch(suppressWarnings(system2("sacct", c("-n", "-P", "-j", paste(ids, collapse = ","), "--format=JobIDRaw,State,Elapsed,Start,End,JobName"), stdout = TRUE, stderr = FALSE, timeout = 10)), error = function(e) character(0))
+  if (length(sacct_ids) && nzchar(Sys.which("sacct"))) {
+    sac <- tryCatch(suppressWarnings(system2("sacct", c("-n", "-P", "-j", paste(sacct_ids, collapse = ","), "--format=JobIDRaw,State,Elapsed,Start,End,JobName"), stdout = TRUE, stderr = FALSE, timeout = SLURM_QUERY_TIMEOUT_SECONDS)), error = function(e) character(0))
     sac <- sac[nzchar(sac)]
     if (length(sac)) {
       parts <- strsplit(sac, "|", fixed = TRUE)
@@ -5786,6 +5812,8 @@ completed_deseq_comparison_catalog <- function(project) {
     if (length(hit) != 3L) return(NULL)
     comparison <- hit[[2]]
     reference <- hit[[3]]
+    deg_path <- file.path(deseq_dir, paste0("DEG_", comparison, "_vs_", reference, "(ref).txt"))
+    if (!file.exists(deg_path) || file_size_for(path) <= 0 || file_size_for(deg_path) <= 0) return(NULL)
     candidates <- compare_cols[vapply(compare_cols, function(column) {
       all(c(reference, comparison) %in% as.character(design[[column]]))
     }, logical(1))]
@@ -5811,6 +5839,31 @@ completed_deseq_comparison_catalog <- function(project) {
   out <- do.call(rbind, rows)
   out <- out[!duplicated(out$key), , drop = FALSE]
   out[order(out$label), , drop = FALSE]
+}
+
+completed_deseq_result_files <- function(project) {
+  catalog <- completed_deseq_comparison_catalog(project)
+  if (!NROW(catalog)) return(character(0))
+  root <- file.path(project$data_dir, "deseq2")
+  files <- list.files(root, pattern = "\\.(txt|csv|png|pdf)$", full.names = TRUE)
+  tokens <- paste0(catalog$comparison, "_vs_", catalog$reference)
+  keep <- vapply(basename(files), function(file) {
+    startsWith(file, "pca_all_samples_") || any(vapply(tokens, grepl, logical(1), x = file, fixed = TRUE))
+  }, logical(1))
+  sort(files[keep & file.exists(files) & vapply(files, file_size_for, numeric(1)) > 0])
+}
+
+completed_gsea_result_files <- function(project) {
+  root <- file.path(project$data_dir, "gseapy")
+  if (!dir.exists(root)) return(character(0))
+  reports <- list.files(root, pattern = "^report\\.gseapy\\..*\\.csv$", recursive = TRUE, full.names = TRUE)
+  reports <- reports[file.exists(reports) & vapply(reports, file_size_for, numeric(1)) > 0]
+  if (!length(reports)) return(character(0))
+  completed_dirs <- unique(dirname(reports))
+  files <- unique(unlist(lapply(completed_dirs, function(path) {
+    list.files(path, pattern = "\\.(txt|csv|png|pdf)$", recursive = TRUE, full.names = TRUE)
+  }), use.names = FALSE))
+  sort(files[file.exists(files) & vapply(files, file_size_for, numeric(1)) > 0])
 }
 
 sample_progress_step_table <- function(progress_df, step) {
@@ -13704,15 +13757,31 @@ server <- function(input, output, session) {
 
   file_select <- function(id, label, dir, pattern) {
     files <- if (dir.exists(dir)) list.files(dir, pattern = pattern, recursive = TRUE, full.names = TRUE) else character(0)
-    selectInput(id, label, choices = files, selected = files[1] %||% character(0), selectize = FALSE)
+    if (!length(files)) return(div(class = "empty-box", paste("No completed", label, "outputs are available yet.")))
+    selectInput(id, label, choices = files, selected = selected_choice(input[[id]], files, files[[1]]), selectize = FALSE)
+  }
+  file_select_paths <- function(id, label, files) {
+    files <- unique(as.character(files %||% character(0)))
+    files <- files[nzchar(files) & file.exists(files)]
+    if (!length(files)) return(div(class = "empty-box", paste("No completed", label, "outputs are available yet.")))
+    selectInput(id, label, choices = files, selected = selected_choice(input[[id]], files, files[[1]]), selectize = FALSE)
   }
   output$rsem_file_ui <- renderUI({ req(identical(input$web_main_tabs %||% "", "Results Explorer")); progress_refresh(); file_select("rsem_file", "RSEM table", file.path(current_project()$data_dir, "rsem"), "\\.(txt|csv|results)$") })
   output$rsem_table <- render_csl_table({ req(input$rsem_file); safe_read_table(input$rsem_file, 5000) }, page_length = 50)
   output$kallisto_file_ui <- renderUI({ req(identical(input$web_main_tabs %||% "", "Results Explorer")); progress_refresh(); file_select("kallisto_file", "Kallisto table", file.path(current_project()$data_dir, "kallisto"), "\\.(tsv|txt|csv)$") })
   output$kallisto_table <- render_csl_table({ req(input$kallisto_file); safe_read_table(input$kallisto_file, 5000) }, page_length = 50)
-  output$norm_file_ui <- renderUI({ req(identical(input$web_main_tabs %||% "", "Results Explorer")); progress_refresh(); file_select("norm_file", "DESeq2 normalized counts", file.path(current_project()$data_dir, "deseq2"), "normalized.*\\.(txt|csv)$") })
+  output$norm_file_ui <- renderUI({
+    req(identical(input$web_main_tabs %||% "", "Results Explorer"))
+    progress_refresh()
+    catalog <- completed_deseq_comparison_catalog(current_project())
+    file_select_paths("norm_file", "DESeq2 normalized counts", if (NROW(catalog)) catalog$path else character(0))
+  })
   output$norm_table <- render_csl_table({ req(input$norm_file); safe_read_table(input$norm_file, 5000) }, page_length = 50)
-  output$deseq_file_ui <- renderUI({ req(identical(input$web_main_tabs %||% "", "Results Explorer")); progress_refresh(); file_select("deseq_file", "DESeq2 file", file.path(current_project()$data_dir, "deseq2"), "\\.(txt|csv|png|pdf)$") })
+  output$deseq_file_ui <- renderUI({
+    req(identical(input$web_main_tabs %||% "", "Results Explorer"))
+    progress_refresh()
+    file_select_paths("deseq_file", "DESeq2 file", completed_deseq_result_files(current_project()))
+  })
   output$deseq_file_view <- renderUI({
     req(input$deseq_file)
     if (tolower(tools::file_ext(input$deseq_file)) %in% c("txt", "csv", "tsv")) {
@@ -13720,7 +13789,11 @@ server <- function(input, output, session) {
     } else image_or_file_ui(input$deseq_file)
   })
   output$deseq_selected_table <- render_csl_table({ req(input$deseq_file); safe_read_table(input$deseq_file, 5000) }, page_length = 50)
-  output$gsea_file_ui <- renderUI({ req(identical(input$web_main_tabs %||% "", "Results Explorer")); progress_refresh(); file_select("gsea_file", "GSEA file", file.path(current_project()$data_dir, "gseapy"), "\\.(txt|csv|png|pdf)$") })
+  output$gsea_file_ui <- renderUI({
+    req(identical(input$web_main_tabs %||% "", "Results Explorer"))
+    progress_refresh()
+    file_select_paths("gsea_file", "GSEA file", completed_gsea_result_files(current_project()))
+  })
   output$gsea_file_view <- renderUI({
     req(input$gsea_file)
     if (tolower(tools::file_ext(input$gsea_file)) %in% c("txt", "csv", "tsv")) {
