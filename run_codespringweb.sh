@@ -165,10 +165,25 @@ install_r_package_if_missing() {
   R_MAKEVARS_USER="$R_MAKEVARS_FILE" Rscript -e 'pkg <- commandArgs(TRUE)[1]; lib <- Sys.getenv("R_LIBS_USER"); if (!nzchar(lib)) lib <- file.path(path.expand("~"), "R", paste0(R.version$platform, "-library"), paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")); lib <- path.expand(lib); dir.create(lib, recursive = TRUE, showWarnings = FALSE); .libPaths(c(lib, .libPaths())); install.packages(pkg, lib = lib, repos = "https://cloud.r-project.org"); if (!requireNamespace(pkg, quietly = TRUE)) stop("Could not install required R package: ", pkg)' "$pkg"
 }
 
+# Plotly is an enhancement for the interactive single-cell explorer.  Never
+# block a working app just because a compute node cannot reach CRAN or lacks a
+# compiler for this optional package; the Results Explorer transparently keeps
+# its publication-ready static UMAPs available in that case.
+install_optional_r_package_if_missing() {
+  local pkg="$1"
+  if R_MAKEVARS_USER="$R_MAKEVARS_FILE" Rscript -e "quit(status = if (requireNamespace('$pkg', quietly = TRUE)) 0 else 1)" >/dev/null 2>&1; then
+    return 0
+  fi
+  printf '\033[33mOptional R package %s is not installed; attempting a user-library install...\033[0m\n' "$pkg"
+  if ! R_MAKEVARS_USER="$R_MAKEVARS_FILE" Rscript -e 'pkg <- commandArgs(TRUE)[1]; lib <- Sys.getenv("R_LIBS_USER"); if (!nzchar(lib)) lib <- file.path(path.expand("~"), "R", paste0(R.version$platform, "-library"), paste(R.version$major, sub("\\..*", "", R.version$minor), sep = ".")); lib <- path.expand(lib); dir.create(lib, recursive = TRUE, showWarnings = FALSE); .libPaths(c(lib, .libPaths())); install.packages(pkg, lib = lib, repos = "https://cloud.r-project.org"); if (!requireNamespace(pkg, quietly = TRUE)) stop("Could not install optional R package: ", pkg)' "$pkg"; then
+    printf '\033[33mContinuing without optional package %s. The app will use its static scRNA UMAP view.\033[0m\n' "$pkg"
+  fi
+}
+
 install_r_package_if_missing "DT"
 install_r_package_if_missing "base64enc"
 install_r_package_if_missing "ggplot2"
-install_r_package_if_missing "plotly"
+install_optional_r_package_if_missing "plotly"
 
 current_user() {
   id -un 2>/dev/null || true
