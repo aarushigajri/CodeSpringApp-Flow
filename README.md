@@ -59,7 +59,7 @@ The optional first command prints the verified Unix user and all identity-sensit
 From your laptop, copy the SSH command printed by the launcher. It will use the port that was actually started:
 
 ```bash
-ssh -N -L <PORT>:localhost:<PORT> $USER@bamdev1
+ssh -N -L <PORT>:localhost:<PORT> $USER@<DEV_NODE>
 ```
 
 Then open the complete private URL printed by the launcher:
@@ -67,6 +67,11 @@ Then open the complete private URL printed by the launcher:
 ```text
 http://localhost:<PORT>/?token=<PRIVATE_TOKEN>
 ```
+
+`<DEV_NODE>` is the node where you ran `./run_codespringweb.sh` (for example,
+`bamdev2`). The launcher detects and prints it automatically. If your cluster
+uses a different SSH alias or gateway, set `CSL_WEB_SSH_HOST` before launching
+to print that address instead.
 
 Example launcher output. The port in your terminal may differ if the default port is already busy:
 

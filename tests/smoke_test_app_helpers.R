@@ -14,10 +14,17 @@ runtime_files <- c(
 )
 runtime_text <- unlist(lapply(runtime_files[file.exists(runtime_files)], readLines, warn = FALSE), use.names = FALSE)
 app_text <- paste(readLines(file.path(repo_root, "app.R"), warn = FALSE), collapse = "\n")
+launcher_text <- paste(readLines(file.path(repo_root, "run_codespringweb.sh"), warn = FALSE), collapse = "\n")
 server_source <- paste(deparse(body(app_env$MAIN_SERVER)), collapse = "\n")
 cutrun_batch_status_source <- paste(deparse(body(app_env$cutrun_diffbind_batch_status_ui)), collapse = "\n")
 owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamdev)"
 assert(!any(grepl(owner_path_pattern, runtime_text, ignore.case = TRUE)), "runtime code contains no hardcoded rouse home, login, or server path")
+assert(
+  grepl('NODE_HOST="$(hostname -s', launcher_text, fixed = TRUE) &&
+    grepl("CSL_WEB_SSH_HOST", launcher_text, fixed = TRUE) &&
+    !grepl("@bamdev1", launcher_text, fixed = TRUE),
+  "launcher generates its tunnel command for the node that started the app rather than bamdev1"
+)
 assert(grepl("observeEvent(input$genome_browser_comparison", server_source, fixed = TRUE) && grepl("samples_override = available", server_source, fixed = TRUE), "changing a genome-browser comparison resets its samples and reloads the selected comparison")
 assert(
   (

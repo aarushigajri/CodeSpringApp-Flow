@@ -11,6 +11,18 @@ elif [[ -n "${1:-}" ]]; then
 fi
 # Only SSH tunnels and other processes on the server itself may reach Shiny.
 HOST="127.0.0.1"
+# The app can run on any development/login node. Use the node that actually
+# launched this process in the printed SSH command; sites with an SSH alias or
+# gateway can override it explicitly with CSL_WEB_SSH_HOST.
+NODE_HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+if [[ -z "$NODE_HOST" ]]; then
+  NODE_HOST="$(hostname 2>/dev/null || true)"
+fi
+if [[ -z "$NODE_HOST" ]]; then
+  printf '\033[31mCould not determine the current server hostname. CodeSpringApp was not started.\033[0m\n'
+  exit 1
+fi
+SSH_HOST="${CSL_WEB_SSH_HOST:-$NODE_HOST}"
 
 USER_NAME="$(id -un 2>/dev/null || true)"
 if [[ -z "$USER_NAME" ]]; then
@@ -335,9 +347,9 @@ URL_FILE="$LOG_DIR/codespringweb_${PORT}.url"
 printf '%s\n' "$APP_URL" > "$URL_FILE"
 chmod 600 "$URL_FILE"
 
-printf '\n\033[32mCodeSpringApp is running on bamdev1 port %s.\033[0m\n' "$PORT"
+printf '\n\033[32mCodeSpringApp is running on %s port %s.\033[0m\n' "$NODE_HOST" "$PORT"
 printf '\033[1;36mCopy/paste this command into your laptop terminal:\033[0m\n'
-printf '\033[1mssh -N -L %s:localhost:%s %s@bamdev1\033[0m\n' "$PORT" "$PORT" "$USER_NAME"
+printf '\033[1mssh -N -L %s:localhost:%s %s@%s\033[0m\n' "$PORT" "$PORT" "$USER_NAME" "$SSH_HOST"
 printf '\033[1;36mThen open this private URL:\033[0m \033[1m%s\033[0m\n' "$APP_URL"
 if [[ "$IDLE_SHUTDOWN_SECONDS" == "0" ]]; then
   printf '\033[90mAutomatic idle shutdown: disabled\033[0m\n'
