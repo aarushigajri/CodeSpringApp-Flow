@@ -12600,9 +12600,14 @@ server <- function(input, output, session) {
 
   output$scrna_inspect_settings_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    detected_engine <- tryCatch(scrna_engine_for_manifest(p, "auto"), error = function(e) "seurat")
+    selected_engine <- tolower(input$scrna_run_engine %||% p$scrna_engine %||% "auto")
+    # The choice presented to the user is the concrete engine, not a vague
+    # automatic placeholder: H5AD -> Scanpy; RDS and raw 10x -> Seurat.
+    if (!selected_engine %in% c("seurat", "scanpy")) selected_engine <- detected_engine
     tagList(
-      selectInput("scrna_run_engine", "Analysis engine", choices = c("Automatic (recommended)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
-      tags$p(class = "muted small-note", "Automatic uses Seurat for RDS or 10x inputs and Scanpy for H5AD. On first use, Scanpy creates one managed per-user runtime and later H5AD jobs reuse it. The inspection report tells you exactly what was detected.")
+      selectInput("scrna_run_engine", "Analysis engine", choices = c("Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_engine, selectize = FALSE),
+      tags$p(class = "muted small-note", "Default: Scanpy for H5AD; Seurat for RDS and filtered 10x/raw matrices. On first use, Scanpy creates one managed per-user runtime and later H5AD jobs reuse it. The inspection report tells you exactly what was detected.")
     )
   })
 
