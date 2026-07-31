@@ -12097,11 +12097,10 @@ server <- function(input, output, session) {
           tagList(
             selectInput("scrna_run_engine", "Processing engine", choices = c("Automatic (Seurat for .rds/10x; Scanpy for .h5ad)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
             uiOutput("scrna_engine_settings_ui"),
-            textInput("scrna_batch_column", "Batch metadata column", value = input$scrna_batch_column %||% "batch"),
+            uiOutput("scrna_batch_column_ui"),
             numericInput("scrna_min_features", "Minimum detected genes per cell", value = input$scrna_min_features %||% 200, min = 0, step = 25),
             numericInput("scrna_min_counts", "Minimum UMIs/counts per cell", value = input$scrna_min_counts %||% 0, min = 0, step = 100),
             numericInput("scrna_max_percent_mt", "Maximum mitochondrial percent", value = input$scrna_max_percent_mt %||% 20, min = 0, max = 100, step = 1),
-            selectInput("scrna_doublet_method", "Doublet detection", choices = c("Automatic (scDblFinder for Seurat; Scrublet for Scanpy)" = "auto", "No doublet detection/removal" = "none", "scDblFinder (Seurat)" = "scdblfinder", "Scrublet (Scanpy)" = "scrublet"), selected = selected_choice(input$scrna_doublet_method, c("auto", "none", "scdblfinder", "scrublet"), "auto"), selectize = FALSE),
             numericInput("scrna_doublet_rate", "Expected doublet rate", value = input$scrna_doublet_rate %||% 0.05, min = 0.001, max = 0.5, step = 0.01),
             checkboxInput("scrna_remove_doublets", "Remove predicted doublets before normalization and clustering", value = if (is.null(input$scrna_remove_doublets)) TRUE else isTRUE(input$scrna_remove_doublets)),
             numericInput("scrna_cluster_resolution", "Clustering resolution", value = input$scrna_cluster_resolution %||% 0.6, min = 0.05, max = 5, step = 0.05),
@@ -12377,6 +12376,21 @@ server <- function(input, output, session) {
         placeholder = if (identical(engine, "scanpy")) "/path/to/conda-env/bin/python" else "/path/to/Rscript"
       ),
       tags$p(class = "muted small-note", "Leave blank to use the cluster's configured module runtime. A custom executable is checked before job submission and is recorded with the run parameters.")
+    )
+  })
+
+  output$scrna_batch_column_ui <- renderUI({
+    p <- current_project()
+    if (!is_scrna_project(p)) return(NULL)
+    manifest <- scrna_manifest(p)
+    metadata <- if (NROW(manifest)) setdiff(names(manifest), c("sample_id", "input_path")) else character(0)
+    choices <- c("No technical batch column (automatic integration will be skipped)" = "")
+    if (length(metadata)) choices <- c(choices, stats::setNames(metadata, metadata))
+    previous <- if (is.null(input$scrna_batch_column)) if ("batch" %in% metadata) "batch" else "" else as.character(input$scrna_batch_column)
+    if (!previous %in% unname(choices)) previous <- ""
+    tagList(
+      selectInput("scrna_batch_column", "Technical batch metadata column", choices = choices, selected = previous, selectize = FALSE),
+      tags$p(class = "muted small-note", "Use a technical batch field such as library, lane, or sequencing run—not a biological condition. Automatic integration stays off when no technical batch column is selected.")
     )
   })
 
@@ -12759,7 +12773,7 @@ server <- function(input, output, session) {
         engine = input$scrna_run_engine %||% "auto",
         normalization = input$scrna_normalization %||% "auto",
         integration = input$scrna_integration %||% "auto",
-        batch_column = input$scrna_batch_column %||% "batch",
+        batch_column = if (is.null(input$scrna_batch_column)) "batch" else input$scrna_batch_column,
         cluster_resolution = input$scrna_cluster_resolution %||% 0.6,
         min_features = input$scrna_min_features %||% 200,
         min_counts = input$scrna_min_counts %||% 0,
