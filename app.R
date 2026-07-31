@@ -627,6 +627,7 @@ legacy_project_from_config <- function(path) {
     design_matrix_path = design_path_from_dir(inpath_design),
     scrna_input_manifest = resolve_legacy_path(vals$scrna_input_manifest %||% "", key),
     scrna_engine = tolower(vals$scrna_engine %||% "auto"),
+    scrna_input_mode = tolower(vals$scrna_input_mode %||% "auto"),
     external_results = tolower(vals$external_results %||% "false") %in% c("true", "t", "yes", "y", "1"),
     counts_only = tolower(vals$counts_only %||% "false") %in% c("true", "t", "yes", "y", "1"),
     source_config = normalizePath(path, winslash = "/", mustWork = FALSE),
@@ -758,6 +759,7 @@ new_project_from_inputs <- function(input) {
     design_matrix_path = design_path,
     scrna_input_manifest = trimws(input$new_scrna_manifest_path %||% ""),
     scrna_engine = tolower(trimws(input$new_scrna_engine %||% "auto")),
+    scrna_input_mode = tolower(trimws(input$new_scrna_setup_mode %||% "single")),
     external_results = existing_results,
     counts_only = counts_only,
     source_config = "",
@@ -919,7 +921,8 @@ write_project_config <- function(project) {
     sprintf("external_results = %s", deparse(isTRUE(project$external_results))),
     sprintf("counts_only = %s", deparse(isTRUE(project$counts_only))),
     sprintf("scrna_input_manifest = %s", deparse(project$scrna_input_manifest %||% "")),
-    sprintf("scrna_engine = %s", deparse(project$scrna_engine %||% "auto"))
+    sprintf("scrna_engine = %s", deparse(project$scrna_engine %||% "auto")),
+    sprintf("scrna_input_mode = %s", deparse(project$scrna_input_mode %||% "auto"))
   )
   if (is_atac_project(project)) {
     ref <- atac_reference_resources(project)
@@ -8602,6 +8605,16 @@ scrna_manifest <- function(project) {
   tryCatch(utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) data.frame())
 }
 
+scrna_uses_input_manifest <- function(project) {
+  mode <- tolower(trimws(as.character(project$scrna_input_mode %||% "auto")))
+  if (identical(mode, "multiple")) return(TRUE)
+  if (identical(mode, "single")) return(FALSE)
+  # Existing projects created before this setting retain their manifest view
+  # when they contain multiple inputs or input-level metadata.
+  manifest <- scrna_manifest(project)
+  NROW(manifest) > 1L || length(setdiff(names(manifest), c("sample_id", "input_path"))) > 0L
+}
+
 validate_scrna_manifest <- function(manifest, check_paths = TRUE) {
   manifest <- as.data.frame(manifest, stringsAsFactors = FALSE, check.names = FALSE)
   if (!all(c("sample_id", "input_path") %in% names(manifest))) {
@@ -11423,30 +11436,35 @@ server <- function(input, output, session) {
         "input.new_project_mode == 'new' && input.new_project_analysis == 'scRNA-seq'",
         div(class = "read-source-note",
             tags$strong("Data and output locations"),
-            tags$p("Start from a Seurat .rds object, Scanpy .h5ad object, or filtered 10x matrix folder. For multiple samples, provide a manifest now or add/edit rows in the in-app manifest after creating the project."),
+            tags$p("For one object, choose its data location and run directly. Choose a manifest only when combining multiple inputs or integrating samples."),
             tags$p("All heavy processing is submitted to SLURM. The app remains responsive and shows the workflow as In progress while the HPC job runs.")),
-        radioButtons("new_scrna_input_source", "Data location", choices = c("Browse or paste a server path" = "server", "Upload one Seurat/Scanpy object from laptop" = "upload"), selected = "server", inline = TRUE),
-        conditionalPanel("input.new_scrna_input_source == 'server'",
-          div(class = "new-project-path-control",
-              textInput("new_scrna_input_path", "Server data path", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x matrix folder"),
-              actionButton("browse_new_scrna_input_path", "Browse server", class = "btn-default"))
+        radioButtons("new_scrna_setup_mode", "Input setup", choices = c("One input — no manifest" = "single", "Multiple inputs or integration — use a manifest" = "multiple"), selected = "single", inline = TRUE),
+        conditionalPanel("input.new_scrna_setup_mode == 'single'",
+          radioButtons("new_scrna_input_source", "Data location", choices = c("Browse or paste a server path" = "server", "Upload one Seurat/Scanpy object from laptop" = "upload"), selected = "server", inline = TRUE),
+          conditionalPanel("input.new_scrna_input_source == 'server'",
+            div(class = "new-project-path-control",
+                textInput("new_scrna_input_path", "Server data path", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x matrix folder"),
+                actionButton("browse_new_scrna_input_path", "Browse server", class = "btn-default"))
+          ),
+          conditionalPanel("input.new_scrna_input_source == 'upload'",
+            fileInput("new_scrna_input_upload", "Single-cell object from laptop", accept = c(".rds", ".h5ad")),
+            tags$p(class = "muted small-note", "The uploaded object is copied to data/uploads/inputs inside this project. For a filtered 10x matrix folder, use a server path.")
+          ),
+          radioButtons("new_scrna_input_location_type", "Data type", choices = c("Seurat RDS or Scanpy H5AD file" = "file", "Filtered 10x matrix folder" = "dir"), selected = "file", inline = TRUE)
         ),
-        conditionalPanel("input.new_scrna_input_source == 'upload'",
-          fileInput("new_scrna_input_upload", "Single-cell object from laptop", accept = c(".rds", ".h5ad")),
-          tags$p(class = "muted small-note", "The uploaded object is copied to data/uploads/inputs inside this project. For a filtered 10x matrix folder, use a server path or add its folder paths in the manifest." )
+        conditionalPanel("input.new_scrna_setup_mode == 'multiple'",
+          radioButtons("new_scrna_manifest_source", "Input manifest location", choices = c("Browse or paste a server path" = "server", "Upload a manifest from laptop" = "upload"), selected = "server", inline = TRUE),
+          conditionalPanel("input.new_scrna_manifest_source == 'server'",
+            div(class = "new-project-path-control",
+                textInput("new_scrna_manifest_path", "Server manifest path", value = "", placeholder = "Absolute server path to samples.tsv"),
+                actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default"))
+          ),
+          conditionalPanel("input.new_scrna_manifest_source == 'upload'",
+            fileInput("new_scrna_manifest_upload", "Manifest from laptop", accept = c(".tsv", ".txt"))
+          ),
+          tags$p(class = "muted small-note", "The manifest must contain sample_id and input_path columns. Add condition, donor, or technical_batch columns only when they are available.")
         ),
-        radioButtons("new_scrna_manifest_source", "Multiple-sample manifest (optional)", choices = c("Browse or paste a server path" = "server", "Upload a manifest from laptop" = "upload"), selected = "server", inline = TRUE),
-        conditionalPanel("input.new_scrna_manifest_source == 'server'",
-          div(class = "new-project-path-control",
-              textInput("new_scrna_manifest_path", "Server manifest path", value = "", placeholder = "Absolute server path to samples.tsv"),
-              actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default"))
-        ),
-        conditionalPanel("input.new_scrna_manifest_source == 'upload'",
-          fileInput("new_scrna_manifest_upload", "Manifest from laptop", accept = c(".tsv", ".txt"))
-        ),
-        tags$p(class = "muted small-note", "When supplied, the manifest takes precedence over the single input. It must contain sample_id and input_path columns."),
         scrna_results_location_control,
-        radioButtons("new_scrna_input_location_type", "Data type", choices = c("Seurat RDS or Scanpy H5AD file" = "file", "Filtered 10x matrix folder" = "dir"), selected = "file", inline = TRUE),
         selectInput("new_scrna_engine", "Processing engine", choices = c("Automatic from input type" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = "auto", selectize = FALSE),
         tags$p(class = "muted small-note", "The cluster runtime is configured by CodeSpringLab. Cell-type annotation files are selected at the annotation step in Run Pipeline.")
       ),
@@ -11687,6 +11705,12 @@ server <- function(input, output, session) {
   output$design_matrix_help_ui <- renderUI({
     if (is_scrna_project(current_project())) {
       manifest <- scrna_manifest(current_project())
+      if (!scrna_uses_input_manifest(current_project())) {
+        return(div(class = "read-source-note",
+          tags$strong("One input project"),
+          tags$p("No input manifest is needed. The app has stored the selected object internally and will run QC, normalization, UMAP, clustering, markers, and optional annotation directly. Enable a manifest only when adding inputs or preparing an integration analysis.")
+        ))
+      }
       single_input_note <- if (NROW(manifest) == 1L) {
         div(class = "read-source-note",
           tags$strong("One input detected — no comparison design is required."),
@@ -11712,11 +11736,14 @@ server <- function(input, output, session) {
   })
 
   output$design_editor_heading <- renderUI({
-    if (is_scrna_project(current_project())) h3("Single-cell Input Manifest") else h3("Design Matrix Builder")
+    if (is_scrna_project(current_project())) {
+      h3(if (scrna_uses_input_manifest(current_project())) "Single-cell Input Manifest" else "Single-cell Input")
+    } else h3("Design Matrix Builder")
   })
 
   output$metadata_columns_control_ui <- renderUI({
     p <- current_project()
+    if (is_scrna_project(p) && !scrna_uses_input_manifest(p)) return(NULL)
     is_single_scrna_input <- is_scrna_project(p) && NROW(scrna_manifest(p)) <= 1L
     label <- if (is_single_scrna_input) "Optional sample metadata columns" else "Metadata columns"
     placeholder <- if (is_single_scrna_input) "Only if known: donor, technical_batch" else "condition, donor, technical_batch"
@@ -11726,6 +11753,9 @@ server <- function(input, output, session) {
 
   output$design_matrix_actions_ui <- renderUI({
     if (is_scrna_project(current_project())) {
+      if (!scrna_uses_input_manifest(current_project())) {
+        return(div(class = "button-row", actionButton("enable_scrna_manifest", "Add multiple inputs / integration", class = "btn-default")))
+      }
       return(div(
         class = "button-row",
         actionButton("add_metadata_col", "Update metadata columns", class = "btn-primary"),
@@ -11745,6 +11775,18 @@ server <- function(input, output, session) {
       actionButton("add_design_rows", "Add 5 blank rows", class = "btn-default")
     )
   })
+
+  observeEvent(input$enable_scrna_manifest, {
+    if (!isTRUE(existing_project_selected())) return()
+    p <- current_project()
+    if (!is_scrna_project(p) || isTRUE(p$external_results)) return()
+    p$scrna_input_mode <- "multiple"
+    write_project_config(p)
+    refreshed <- discover_projects()
+    projects(refreshed)
+    scrna_manifest_state(scrna_manifest(p))
+    output$design_save_status <- renderText("Multiple-input manifest enabled. Add sample rows and optional metadata, then save the manifest before integration.")
+  }, ignoreInit = TRUE)
 
   output$create_project_status <- renderText("")
   output$delete_project_status <- renderText("")
@@ -11831,9 +11873,12 @@ server <- function(input, output, session) {
       example_design_copied <- ""
       counts_message <- ""
       if (is_scrna_project(p)) {
+        setup_mode <- tolower(input$new_scrna_setup_mode %||% "single")
         input_source <- input$new_scrna_input_source %||% "server"
         manifest_source_mode <- input$new_scrna_manifest_source %||% "server"
-        input_path <- if (identical(input_source, "upload")) {
+        input_path <- if (identical(setup_mode, "multiple")) {
+          ""
+        } else if (identical(input_source, "upload")) {
           copy_uploaded_project_file(
             input$new_scrna_input_upload,
             file.path(p$data_dir, "uploads", "inputs"),
@@ -11843,7 +11888,9 @@ server <- function(input, output, session) {
         } else {
           input$new_scrna_input_path %||% ""
         }
-        manifest_source <- if (identical(manifest_source_mode, "upload")) {
+        manifest_source <- if (!identical(setup_mode, "multiple")) {
+          ""
+        } else if (identical(manifest_source_mode, "upload")) {
           copy_uploaded_project_file(
             input$new_scrna_manifest_upload,
             file.path(p$data_dir, "uploads", "manifests"),
@@ -11852,6 +11899,9 @@ server <- function(input, output, session) {
           )
         } else {
           p$scrna_input_manifest %||% ""
+        }
+        if (identical(setup_mode, "multiple") && !nzchar(manifest_source)) {
+          stop("Choose an input manifest for multiple inputs or integration.")
         }
         manifest <- scrna_manifest_from_setup(
           manifest_source,
@@ -12003,6 +12053,9 @@ server <- function(input, output, session) {
 
   output$design_editor_ui <- renderUI({
     if (is_scrna_project(current_project())) {
+      if (!scrna_uses_input_manifest(current_project())) {
+        return(div(class = "empty-box", "This project has one input. No manifest editing is needed."))
+      }
       return(tagList(
         div(class = "read-source-note", tags$strong("Single-cell sample manifest"), tags$p("This project-local copy preserves input paths plus optional condition, donor, and batch columns. Edit cells directly, then save before running.")),
         table_output("scrna_manifest_table"),

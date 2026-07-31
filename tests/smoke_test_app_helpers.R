@@ -31,6 +31,12 @@ assert(
   "single-cell setup uses cluster-managed runtimes and exposes annotation and upload controls in the appropriate workflow steps"
 )
 assert(
+  !app_env$scrna_uses_input_manifest(list(analysis_key = "scrna", scrna_input_mode = "single")) &&
+    app_env$scrna_uses_input_manifest(list(analysis_key = "scrna", scrna_input_mode = "multiple")) &&
+    grepl("One input — no manifest", app_text, fixed = TRUE),
+  "single-input scRNA projects keep their internal manifest hidden and reveal it only for multi-input or integration workflows"
+)
+assert(
   grepl('NODE_HOST="$(hostname -s', launcher_text, fixed = TRUE) &&
     grepl("CSL_WEB_SSH_HOST", launcher_text, fixed = TRUE) &&
     !grepl("@bamdev1", launcher_text, fixed = TRUE),

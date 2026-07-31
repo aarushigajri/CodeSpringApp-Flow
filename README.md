@@ -83,10 +83,12 @@ Example launcher output. The port in your terminal may differ if the default por
 
 The scRNA-seq project type accepts a Seurat RDS, Scanpy H5AD, or filtered 10x
 matrix directory from a server path, or a Seurat/Scanpy object uploaded from a
-laptop. A manifest is optional: choose one input during setup and CodeSpring
-derives an editable sample ID from its file/folder name, then add/edit further
-samples in the project-local manifest in the app. Existing manifests remain
-supported for multi-sample projects.
+laptop. For a single input, setup stays manifest-free: CodeSpring derives the
+sample ID from the selected file/folder name and keeps the required one-row
+record internally. Choose **Multiple inputs or integration** only when samples
+come from more than one location or an integration workflow is intended; that
+selection reveals the editable project-local manifest. Existing multi-sample
+manifests remain supported.
 
 Choose the **Results root** in project setup; the app writes the processed
 object, figures, tables, logs, and job temporary storage under
