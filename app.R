@@ -496,7 +496,7 @@ results_explorer_tabs <- function(x) {
   switch(
     analysis_key(x),
     rna = c("Overview", "QC", "Counts", "Differential Expression", "Plots", "GSEA", "Files"),
-    scrna = c("Overview", "QC", "Preprocessing", "Explore Cells", "Composition", "Markers", "Downloads"),
+    scrna = c("Overview", "Source input", "QC", "Preprocessing", "Explore Cells", "Composition", "Markers", "Downloads"),
     atac = c("Overview", "QC", "Signal & Peaks", "Genome Browser", "Differential Accessibility", "Files"),
     cutrun = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files"),
     chip = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files")
@@ -8785,7 +8785,8 @@ submit_scrna_pipeline_job <- function(project, stage = "inspect", engine = "auto
   qsub <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "qsub_scrna_pipeline.sh")
   runner <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "scrna_pipeline.sh")
   if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, step_label, "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna"))
-  prior <- c(qc = "inspect", preprocess = "qc", cluster = "preprocess", annotate = "cluster")[[stage]] %||% ""
+  prior_map <- c(qc = "inspect", preprocess = "qc", cluster = "preprocess", annotate = "cluster")
+  prior <- unname(prior_map[stage]) %||% ""
   prior_marker <- if (nzchar(prior)) file.path(out_dir, paste0("_STAGE_", toupper(prior), "_COMPLETE")) else ""
   if (nzchar(prior_marker) && !file.exists(prior_marker)) return(record_preflight_failure(project, step_label, paste0("Complete ", scrna_stage_step(prior), " before submitting this stage."), "scrna"))
   submit_sbatch(project, step_label, qsub, c(runner, resolved_engine, manifest_path, out_dir, params_path, stage), "scrna_pipeline", paste(stage, resolved_engine, normalization, integration), target = file.path(out_dir, paste0("_STAGE_", toupper(stage), "_COMPLETE")), reference = resolved_engine)
@@ -9954,11 +9955,12 @@ scrna_results_explorer_ui <- function() {
     results_explorer_hero("Single-cell RNA-seq Results Explorer"),
     div(class = "main-tabs", tabsetPanel(
       id = "scrna_results_tabs",
-    tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Detected input processing"), table_output("scrna_input_processing"), br(), uiOutput("scrna_input_plot_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
+    tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui")),
+    tabPanel("Source input", br(), h3("Source Object Inspection"), tags$p(class = "muted", "This records what was present in the supplied object before CodeSpring starts its reproducible workflow. The source object itself is never changed."), table_output("scrna_input_processing"), br(), uiOutput("scrna_input_plot_ui")),
     tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary"), br(), h4("Individual doublet calls"), table_output("scrna_doublet_calls")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("Feature filtering by sample"), tags$p(class = "muted small-note", "Genes are retained when they are detected in at least the selected number of cells within an input library; the analysis retains their union across libraries."), table_output("scrna_feature_filtering"), br(), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), uiOutput("scrna_selected_cells_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
-    tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Exact composition table"), tags$p(class = "muted small-note", "This complete table is never grouped or rounded; use it for reporting and download it from Downloads."), table_output("scrna_composition_table")),
+    tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes"), br(), h4("Exact composition table"), tags$p(class = "muted small-note", "This complete table is never grouped or rounded; use it for reporting and download it from Downloads."), table_output("scrna_composition_table")),
     tabPanel("Markers", br(), h3("Cluster Markers"), tags$p(class = "muted", "Start with the ten strongest markers for one cluster; the complete ranked marker table remains available below and in Downloads."), uiOutput("scrna_top_markers_ui"), table_output("scrna_top_markers"), br(), uiOutput("scrna_marker_score_ui"), tags$details(tags$summary("Full ranked marker table"), br(), table_output("scrna_marker_table"))),
       tabPanel("Downloads", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
     ))
@@ -11095,7 +11097,8 @@ server <- function(input, output, session) {
     msg <- tool_messages()[[canonical_job_step(step)]] %||% ""
     msg <- trimws(msg)
     if (!nzchar(msg)) return(NULL)
-    div(class = "run-message-alert tool-message-alert error", tags$strong("Previous step required"), msg)
+    failed <- startsWith(msg, "ERROR") || upstream_blocking_message(msg)
+    div(class = paste("run-message-alert tool-message-alert", if (failed) "error" else "success"), tags$strong(if (failed) "Action needed" else "Submitted"), msg)
   }
 
   mark_submission_active <- function(label, input_mode = "", samples = NULL) {
@@ -11129,7 +11132,7 @@ server <- function(input, output, session) {
     progress_refresh(Sys.time())
     msg <- tryCatch(force(expr), error = function(e) paste("ERROR submitting", label, ":", conditionMessage(e)))
     run_message(msg)
-    set_tool_message(step, if (upstream_blocking_message(msg)) msg else "")
+    set_tool_message(step, if (startsWith(msg, "ERROR") || upstream_blocking_message(msg)) msg else msg)
     if (!startsWith(msg, "ERROR")) {
       tryCatch(
         {
@@ -12305,31 +12308,13 @@ server <- function(input, output, session) {
     r2_choices <- adapter_choices_r2()
     adapter_defaults <- default_adapter_pair(p)
     if (is_scrna_project(p)) {
-      settings <- div(class = "tool-panel",
-        tags$h4("Single-cell settings"),
-        tags$p(class = "muted", "Choose settings once, then run one stage at a time. Each completed stage saves a checkpoint for the next."),
-        tagList(
-            selectInput("scrna_run_engine", "Processing engine", choices = c("Automatic (Seurat for .rds/10x; Scanpy for .h5ad)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
-            uiOutput("scrna_engine_settings_ui"),
-            uiOutput("scrna_batch_column_ui"),
-            uiOutput("scrna_recommendations_ui"),
-            numericInput("scrna_min_features", "Minimum detected genes per cell", value = input$scrna_min_features %||% 200, min = 0, step = 25),
-            numericInput("scrna_min_counts", "Minimum UMIs/counts per cell", value = input$scrna_min_counts %||% 0, min = 0, step = 100),
-            numericInput("scrna_max_percent_mt", "Maximum mitochondrial percent", value = input$scrna_max_percent_mt %||% 20, min = 0, max = 100, step = 1),
-            numericInput("scrna_doublet_rate", "Expected doublet rate", value = input$scrna_doublet_rate %||% 0.05, min = 0.001, max = 0.5, step = 0.01),
-            checkboxInput("scrna_remove_doublets", "Remove predicted doublets before normalization and clustering", value = if (is.null(input$scrna_remove_doublets)) TRUE else isTRUE(input$scrna_remove_doublets)),
-            numericInput("scrna_cluster_resolution", "Clustering resolution", value = input$scrna_cluster_resolution %||% 0.6, min = 0.05, max = 5, step = 0.05),
-            uiOutput("scrna_advanced_settings_ui"),
-            tags$p(class = "muted small-note", "Doublet calls are recorded before removal. Seurat doublet removal uses scDblFinder; Scanpy uses Scrublet. Automatic integration runs only when the selected batch metadata column has multiple values, so condition-only sample sets are not automatically batch-corrected. Seurat objects use Seurat; AnnData .h5ad objects use Scanpy.")
-          )
-      )
-      return(tagList(settings, div(class = "run-grid",
-        tool_panel("Input inspection", status, "Read the source object on the compute node and detect raw counts, prior normalization, PCA/UMAP, clusters, and existing annotations.", tags$p(class = "muted small-note", "This does not change your input object."), "run_scrna_inspect", "Inspect input", show_sample_progress = FALSE),
-        tool_panel("QC & doublets", status, "Apply the selected QC thresholds and doublet handling to the raw-count checkpoint.", tags$p(class = "muted small-note", "Requires Input inspection."), "run_scrna_qc", "Run QC & doublets", show_sample_progress = FALSE),
-        tool_panel("Normalize & PCA", status, "Normalize retained cells, identify variable genes, scale, and calculate PCA.", tags$p(class = "muted small-note", "Requires QC & doublets."), "run_scrna_preprocess", "Run normalization & PCA", show_sample_progress = FALSE),
-        tool_panel("Integrate & cluster", status, "Use the selected technical-batch method when applicable, then calculate neighbours, UMAP, and clusters.", tags$p(class = "muted small-note", "Requires Normalize & PCA."), "run_scrna_cluster", "Run integration & clustering", show_sample_progress = FALSE),
-        tool_panel("Annotate & markers", status, "Apply a supplied/existing annotation and write marker tables, final UMAPs, and the portable processed object.", tags$p(class = "muted small-note", "Requires Integrate & cluster."), "run_scrna_annotate", "Run annotation & markers", show_sample_progress = FALSE)
-      )))
+      return(div(class = "run-grid",
+        tool_panel("Input inspection", status, "Submit a short job that inspects your supplied object and records which data and analysis components it already contains.", tagList(uiOutput("scrna_inspect_settings_ui"), uiOutput("scrna_input_state_ui"), tags$p(class = "muted small-note", "The input is read only. This first job creates a project checkpoint and a clear yes/no source report.")), "run_scrna_inspect", "Inspect source input", show_sample_progress = FALSE),
+        tool_panel("QC & doublets", status, "Filter low-quality cells and record predicted doublets from the raw-count checkpoint.", tagList(uiOutput("scrna_qc_settings_ui"), tags$p(class = "muted small-note", "Review the QC figures before continuing. Doublet calls are saved whether or not predicted doublets are removed.")), "run_scrna_qc", "Run QC & doublets", show_sample_progress = FALSE),
+        tool_panel("Normalize & PCA", status, "Normalize retained cells, identify variable genes, scale, and calculate PCA.", uiOutput("scrna_preprocess_settings_ui"), "run_scrna_preprocess", "Run normalization & PCA", show_sample_progress = FALSE),
+        tool_panel("Integrate & cluster", status, "Correct a technical batch only when needed, then calculate neighbours, UMAP, and clusters.", uiOutput("scrna_cluster_settings_ui"), "run_scrna_cluster", "Run integration & clustering", show_sample_progress = FALSE),
+        tool_panel("Annotate & markers", status, "Apply an optional cell mapping or marker list, then write markers, final UMAPs, and a portable processed object.", uiOutput("scrna_annotation_settings_ui"), "run_scrna_annotate", "Run annotation & markers", show_sample_progress = FALSE)
+      ))
     }
     if (is_chip_project(p)) {
       return(div(class = "run-grid",
@@ -12568,46 +12553,102 @@ server <- function(input, output, session) {
     })
   })
 
-  output$scrna_engine_settings_ui <- renderUI({
+  scrna_ui_engine <- function() {
     p <- current_project()
-    if (!is_scrna_project(p)) return(NULL)
     requested <- tolower(input$scrna_run_engine %||% p$scrna_engine %||% "auto")
     resolved <- tryCatch(scrna_engine_for_manifest(p, requested), error = function(e) "")
-    # Before a valid manifest is available, retain neutral choices. Once it is
-    # readable, expose only settings that the chosen engine can actually run.
     engine <- if (resolved %in% c("seurat", "scanpy")) resolved else requested
     if (!engine %in% c("seurat", "scanpy")) engine <- "seurat"
-    if (identical(engine, "seurat")) {
-      normalization_choices <- c("Automatic best-practice default" = "auto", "SCTransform v2" = "sct", "LogNormalize" = "lognormalize")
-      integration_choices <- c("Automatic (RPCA for multi-sample data)" = "auto", "None" = "none", "RPCA" = "rpca", "CCA" = "cca")
-      doublet_choices <- c("Automatic (scDblFinder)" = "auto", "No doublet detection/removal" = "none", "scDblFinder" = "scdblfinder")
+    engine
+  }
+
+  scrna_ui_choices <- function() {
+    if (identical(scrna_ui_engine(), "seurat")) {
+      list(
+        normalization = c("Automatic (SCTransform v2)" = "auto", "SCTransform v2" = "sct", "LogNormalize" = "lognormalize"),
+        integration = c("Automatic (RPCA when a technical batch is selected)" = "auto", "No integration" = "none", "RPCA" = "rpca", "CCA" = "cca"),
+        doublets = c("Automatic (scDblFinder)" = "auto", "No doublet detection" = "none", "scDblFinder" = "scdblfinder")
+      )
     } else {
-      normalization_choices <- c("Automatic best-practice default" = "auto", "LogNormalize/log1p" = "lognormalize")
-      integration_choices <- c("Automatic (Harmony for technical batches)" = "auto", "None" = "none", "Harmony" = "harmony", "scVI (dedicated runtime required)" = "scvi")
-      doublet_choices <- c("Automatic (Scrublet)" = "auto", "No doublet detection/removal" = "none", "Scrublet" = "scrublet")
+      list(
+        normalization = c("Automatic (log1p)" = "auto", "LogNormalize/log1p" = "lognormalize"),
+        integration = c("Automatic (Harmony when a technical batch is selected)" = "auto", "No integration" = "none", "Harmony" = "harmony", "scVI (dedicated runtime required)" = "scvi"),
+        doublets = c("Automatic (Scrublet)" = "auto", "No doublet detection" = "none", "Scrublet" = "scrublet")
+      )
     }
+  }
+
+  output$scrna_inspect_settings_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
     tagList(
-      selectInput("scrna_normalization", "Normalization", choices = normalization_choices, selected = selected_choice(input$scrna_normalization, unname(normalization_choices), "auto"), selectize = FALSE),
-      selectInput("scrna_integration", "Integration", choices = integration_choices, selected = selected_choice(input$scrna_integration, unname(integration_choices), "auto"), selectize = FALSE),
-      selectInput("scrna_doublet_method", "Doublet detection", choices = doublet_choices, selected = selected_choice(input$scrna_doublet_method, unname(doublet_choices), "auto"), selectize = FALSE),
-      tags$hr(),
-      tags$h4("Cell-type annotation (optional)"),
-      tags$p(class = "muted small-note", "Supply a marker list or a cell-to-cell-type mapping for this run. A cell mapping takes priority; otherwise, clusters remain the provisional annotation."),
+      selectInput("scrna_run_engine", "Analysis engine", choices = c("Automatic (recommended)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
+      tags$p(class = "muted small-note", "Automatic uses Seurat for RDS or 10x inputs and Scanpy for H5AD. The inspection report tells you exactly what was detected.")
+    )
+  })
+
+  output$scrna_input_state_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    detected <- safe_read_table(file.path(scrna_output_dir(p), "tables", "input_processing_detected.tsv"), 10000)
+    if (!NROW(detected)) return(div(class = "empty-box", "No inspection report yet. Submit this short first step to see the source-object report here."))
+    has <- function(column) {
+      x <- detected[[column]] %||% rep(FALSE, NROW(detected))
+      any(toupper(trimws(as.character(x))) %in% c("TRUE", "YES", "1"), na.rm = TRUE)
+    }
+    yes_no <- function(value) if (isTRUE(value)) "Yes" else "No"
+    div(class = "cutrun-metric-grid compact",
+      scrna_metric_card("Raw counts", yes_no(has("rna_count_layers_detected")), "Required for reproducible processing", if (has("rna_count_layers_detected")) "green" else "gold"),
+      scrna_metric_card("Normalized data", yes_no(has("rna_normalized_layers_detected") || has("sct_detected")), "Detected in the supplied source", "blue"),
+      scrna_metric_card("PCA / UMAP", paste(yes_no(has("pca_detected")), "/", yes_no(has("umap_detected"))), "Detected in the supplied source", "purple"),
+      scrna_metric_card("Clusters", yes_no(has("clusters_detected")), "Detected in the supplied source", "gold"),
+      scrna_metric_card("Annotations", yes_no(has("annotation_columns_detected")), "Existing cell-type column detected", "blue")
+    )
+  })
+
+  output$scrna_qc_settings_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    choices <- scrna_ui_choices()
+    tagList(
+      numericInput("scrna_min_features", "Minimum detected genes per cell", value = input$scrna_min_features %||% 200, min = 0, step = 25),
+      numericInput("scrna_min_counts", "Minimum UMIs/counts per cell", value = input$scrna_min_counts %||% 0, min = 0, step = 100),
+      numericInput("scrna_max_percent_mt", "Maximum mitochondrial percent", value = input$scrna_max_percent_mt %||% 20, min = 0, max = 100, step = 1),
+      selectInput("scrna_doublet_method", "Doublet detection", choices = choices$doublets, selected = selected_choice(input$scrna_doublet_method, unname(choices$doublets), "auto"), selectize = FALSE),
+      numericInput("scrna_doublet_rate", "Expected doublet rate", value = input$scrna_doublet_rate %||% 0.05, min = 0.001, max = 0.5, step = 0.01),
+      checkboxInput("scrna_remove_doublets", "Remove predicted doublets before downstream analysis", value = if (is.null(input$scrna_remove_doublets)) TRUE else isTRUE(input$scrna_remove_doublets)),
+      tags$details(tags$summary("Advanced QC setting"), numericInput("scrna_max_features", "Maximum detected genes per cell (0 = disabled)", value = input$scrna_max_features %||% 0, min = 0, step = 100))
+    )
+  })
+
+  output$scrna_preprocess_settings_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    choices <- scrna_ui_choices()
+    tagList(
+      selectInput("scrna_normalization", "Normalization", choices = choices$normalization, selected = selected_choice(input$scrna_normalization, unname(choices$normalization), "auto"), selectize = FALSE),
+      numericInput("scrna_min_cells_per_gene", "Minimum cells expressing a retained gene", value = input$scrna_min_cells_per_gene %||% 3, min = 1, step = 1),
+      tags$p(class = "muted small-note", "Automatic selects the recommended normalization for the chosen engine.")
+    )
+  })
+
+  output$scrna_cluster_settings_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    choices <- scrna_ui_choices()
+    tagList(
+      uiOutput("scrna_batch_column_ui"),
+      selectInput("scrna_integration", "Technical batch handling", choices = choices$integration, selected = selected_choice(input$scrna_integration, unname(choices$integration), "auto"), selectize = FALSE),
+      numericInput("scrna_cluster_resolution", "Clustering resolution", value = input$scrna_cluster_resolution %||% 0.6, min = 0.05, max = 5, step = 0.05),
+      tags$details(tags$summary("Advanced clustering settings"), numericInput("scrna_n_pcs", "Principal components for neighbours and UMAP", value = input$scrna_n_pcs %||% 30, min = 5, max = 100, step = 1), numericInput("scrna_seed", "Random seed", value = input$scrna_seed %||% 1234, min = 1, step = 1), if (identical(scrna_ui_engine(), "scanpy")) numericInput("scrna_scvi_max_epochs", "Maximum scVI training epochs", value = input$scrna_scvi_max_epochs %||% 400, min = 10, max = 5000, step = 50) else NULL),
+      uiOutput("scrna_recommendations_ui")
+    )
+  })
+
+  output$scrna_annotation_settings_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    tagList(
+      tags$p(class = "muted small-note", "Optional. A cell-to-cell-type mapping takes priority; otherwise the app keeps clusters as provisional labels."),
       radioButtons("scrna_marker_source", "Marker list source", choices = c("Browse or paste a server path" = "server", "Upload from laptop" = "upload"), selected = input$scrna_marker_source %||% "server", inline = TRUE),
-      conditionalPanel("input.scrna_marker_source == 'server'",
-        div(class = "new-project-path-control",
-          textInput("scrna_marker_file", "Marker list", value = input$scrna_marker_file %||% "", placeholder = "Absolute server .tsv with cell_type and gene columns"),
-          actionButton("browse_scrna_marker_file", "Browse server", class = "btn-default")
-        )
-      ),
+      conditionalPanel("input.scrna_marker_source == 'server'", div(class = "new-project-path-control", textInput("scrna_marker_file", "Marker list", value = input$scrna_marker_file %||% "", placeholder = "Absolute server .tsv with cell_type and gene columns"), actionButton("browse_scrna_marker_file", "Browse server", class = "btn-default"))),
       conditionalPanel("input.scrna_marker_source == 'upload'", fileInput("scrna_marker_upload", "Marker list from laptop", accept = c(".tsv", ".txt"))),
       radioButtons("scrna_celltype_source", "Cell-to-cell-type mapping source", choices = c("Browse or paste a server path" = "server", "Upload from laptop" = "upload"), selected = input$scrna_celltype_source %||% "server", inline = TRUE),
-      conditionalPanel("input.scrna_celltype_source == 'server'",
-        div(class = "new-project-path-control",
-          textInput("scrna_celltype_file", "Cell-to-cell-type mapping", value = input$scrna_celltype_file %||% "", placeholder = "Absolute server .tsv with cell/barcode and cell_type columns"),
-          actionButton("browse_scrna_celltype_file", "Browse server", class = "btn-default")
-        )
-      ),
+      conditionalPanel("input.scrna_celltype_source == 'server'", div(class = "new-project-path-control", textInput("scrna_celltype_file", "Cell-to-cell-type mapping", value = input$scrna_celltype_file %||% "", placeholder = "Absolute server .tsv with cell/barcode and cell_type columns"), actionButton("browse_scrna_celltype_file", "Browse server", class = "btn-default"))),
       conditionalPanel("input.scrna_celltype_source == 'upload'", fileInput("scrna_celltype_upload", "Cell-to-cell-type mapping from laptop", accept = c(".tsv", ".txt")))
     )
   })
@@ -12643,13 +12684,11 @@ server <- function(input, output, session) {
     } else {
       "No multi-level technical batch is selected, so keep integration at Automatic/None; do not use biological condition as a batch field."
     }
-    normalizer <- if (identical(engine, "scanpy")) "LogNormalize/log1p is the supported default for Scanpy." else "SCTransform v2 is the recommended default for UMI-based Seurat runs; LogNormalize remains available for compatibility."
+    normalizer <- if (identical(engine, "scanpy")) "Automatic normalization will use log1p." else "Automatic normalization will use SCTransform v2."
     div(class = "read-source-note",
-      tags$strong("Input-aware recommended starting point"),
-      tags$p(paste0(NROW(manifest), " input sample", if (NROW(manifest) == 1L) "" else "s", " (", paste(sort(unique(input_kinds)), collapse = ", "), "). ", normalizer)),
-      tags$p(integration_note),
-      tags$p("Start with ≥200 detected genes, no upper gene cap, ≤20% mitochondrial RNA, genes detected in ≥3 cells, 30 PCs, resolution 0.6, and a fixed seed. Review the per-sample QC plots and summary after the run; QC thresholds are dataset-specific and should not be copied blindly across tissues or nuclei datasets."),
-      tags$p("The 5% doublet-rate default is only a starting point. If a library-specific expected rate is known from the capture/loading information, add an optional expected_doublet_rate column to the manifest to override it for that sample.")
+      tags$strong("Recommended starting point"),
+      tags$p(paste0(NROW(manifest), " input sample", if (NROW(manifest) == 1L) "" else "s", "; ", normalizer)),
+      tags$p(integration_note)
     )
   })
 
