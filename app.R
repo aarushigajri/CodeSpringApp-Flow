@@ -9351,7 +9351,12 @@ load_native_rnaseq_viewer <- function(project) {
 
 run_step_meta <- function(project = NULL) {
   steps <- pipeline_order(project)
-  descriptions <- if (!is.null(project) && isTRUE(project$counts_only)) {
+  descriptions <- if (!is.null(project) && is_scrna_project(project)) {
+    c(
+      "Review the saved single-cell input manifest and optional sample metadata.",
+      "Run QC, doublet handling, feature selection, normalization, integration when applicable, clustering, annotation, and marker discovery."
+    )
+  } else if (!is.null(project) && isTRUE(project$counts_only)) {
     c(
       "Review or complete sample metadata for the uploaded count matrix.",
       "Run differential expression with the selected DESeq2 model.",
@@ -10854,10 +10859,10 @@ ui <- fluidPage(
                                  if (file.exists(LOGO_PATH)) tags$img(src = file.path("codespring_logo", basename(LOGO_PATH))) else NULL,
                                  if (file.exists(LOGO_CSL_PATH)) tags$img(src = file.path("csl_logo", basename(LOGO_CSL_PATH))) else NULL))
                  )),
-        tabPanel("Design Matrix", br(), h3("Design Matrix Builder"),
+        tabPanel("Design Matrix", br(), uiOutput("design_editor_heading"),
                  uiOutput("design_matrix_help_ui"),
                  fluidRow(
-                   column(7, textInput("metadata_cols", "Metadata columns", value = "treatment", placeholder = "cell_type, condition, replicate")),
+                   column(7, uiOutput("metadata_columns_control_ui")),
                    column(5, br(),
                           uiOutput("design_matrix_actions_ui"))
                  ),
@@ -11681,9 +11686,16 @@ server <- function(input, output, session) {
 
   output$design_matrix_help_ui <- renderUI({
     if (is_scrna_project(current_project())) {
-      return(tags$p(
-        class = "muted",
-        "Edit the project-local single-cell manifest directly. Each row needs a unique sample_id and an absolute readable input_path. Extra columns (for example condition, donor, or batch) are attached to cells and can be used for integration or downstream plots. Save before submitting the workflow."
+      manifest <- scrna_manifest(current_project())
+      single_input_note <- if (NROW(manifest) == 1L) {
+        div(class = "read-source-note",
+          tags$strong("One input detected — no comparison design is required."),
+          tags$p("You can run QC, doublet handling, normalization, UMAP, clustering, marker discovery, and optional cell-type annotation immediately. Add condition/batch metadata only when it is present in the input object or when you add additional input samples. Do not use a biological condition as a technical batch.")
+        )
+      } else NULL
+      return(tagList(
+        tags$p(class = "muted", "This is an input manifest, not a bulk-RNA design matrix. Each row identifies one single-cell input. Edit sample IDs or add optional condition, donor, and technical batch columns, then save before submitting the workflow."),
+        single_input_note
       ))
     }
     if (isTRUE(current_project()$counts_only)) {
@@ -11697,6 +11709,19 @@ server <- function(input, output, session) {
         "If no design_matrix.txt was provided during setup, scan the raw FASTQ folder, then edit include/sample/metadata cells directly. Filenames stay on the right so run steps know which reads belong to each sample."
       )
     }
+  })
+
+  output$design_editor_heading <- renderUI({
+    if (is_scrna_project(current_project())) h3("Single-cell Input Manifest") else h3("Design Matrix Builder")
+  })
+
+  output$metadata_columns_control_ui <- renderUI({
+    p <- current_project()
+    is_single_scrna_input <- is_scrna_project(p) && NROW(scrna_manifest(p)) <= 1L
+    label <- if (is_single_scrna_input) "Optional sample metadata columns" else "Metadata columns"
+    placeholder <- if (is_single_scrna_input) "Only if known: donor, technical_batch" else "condition, donor, technical_batch"
+    fallback <- if (is_single_scrna_input) "" else "treatment"
+    textInput("metadata_cols", label, value = isolate(input$metadata_cols) %||% fallback, placeholder = placeholder)
   })
 
   output$design_matrix_actions_ui <- renderUI({
@@ -11959,7 +11984,9 @@ server <- function(input, output, session) {
     p <- current_project()
     updateActionButton(session, "save_design", label = if (is_scrna_project(p)) "Save single-cell manifest" else "Save design_matrix.txt")
     scrna_manifest_state(if (is_scrna_project(p)) scrna_manifest(p) else data.frame())
-    df <- design_editor_from_project(p, default_metadata_cols(p))
+    metadata <- if (is_scrna_project(p) && NROW(scrna_manifest(p)) <= 1L) character(0) else default_metadata_cols(p)
+    updateTextInput(session, "metadata_cols", value = paste(metadata, collapse = ", "))
+    df <- design_editor_from_project(p, metadata)
     if (is_cutrun_project(p)) df <- infer_cutrun_metadata(df)
     design_state(df)
   }, ignoreInit = FALSE)

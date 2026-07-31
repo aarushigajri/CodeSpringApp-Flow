@@ -19,6 +19,17 @@ server_source <- paste(deparse(body(app_env$MAIN_SERVER)), collapse = "\n")
 cutrun_batch_status_source <- paste(deparse(body(app_env$cutrun_diffbind_batch_status_ui)), collapse = "\n")
 owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamdev)"
 assert(!any(grepl(owner_path_pattern, runtime_text, ignore.case = TRUE)), "runtime code contains no hardcoded rouse home, login, or server path")
+scrna_step_meta <- app_env$run_step_meta(list(analysis_key = "scrna", analysis = "scRNA-seq", counts_only = FALSE))
+assert(
+  identical(as.character(scrna_step_meta$step), c("Input manifest", "scRNA processing")) && NROW(scrna_step_meta) == 2L,
+  "single-cell run-step metadata has one description per single-cell pipeline step"
+)
+assert(
+  !grepl("scrna_runtime_executable", app_text, fixed = TRUE) &&
+    grepl("Cell-type annotation (optional)", app_text, fixed = TRUE) &&
+    grepl("Upload one Seurat/Scanpy object from laptop", app_text, fixed = TRUE),
+  "single-cell setup uses cluster-managed runtimes and exposes annotation and upload controls in the appropriate workflow steps"
+)
 assert(
   grepl('NODE_HOST="$(hostname -s', launcher_text, fixed = TRUE) &&
     grepl("CSL_WEB_SSH_HOST", launcher_text, fixed = TRUE) &&
