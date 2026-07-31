@@ -496,7 +496,7 @@ results_explorer_tabs <- function(x) {
   switch(
     analysis_key(x),
     rna = c("Overview", "QC", "Counts", "Differential Expression", "Plots", "GSEA", "Files"),
-    scrna = c("Overview", "QC", "Preprocessing", "Explore Cells", "Markers", "Downloads"),
+    scrna = c("Overview", "QC", "Preprocessing", "Explore Cells", "Composition", "Markers", "Downloads"),
     atac = c("Overview", "QC", "Signal & Peaks", "Genome Browser", "Differential Accessibility", "Files"),
     cutrun = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files"),
     chip = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files")
@@ -9782,11 +9782,32 @@ scrna_summary_values <- function(project) {
   stats::setNames(values[nzchar(keys)], keys[nzchar(keys)])
 }
 
+scrna_composition_table <- function(project) {
+  path <- file.path(scrna_output_dir(project), "tables", "cell_type_by_sample.tsv")
+  x <- safe_read_table(path, 10000)
+  required <- c("sample_id", "cell_type", "cells")
+  if (!NROW(x) || !all(required %in% names(x))) return(data.frame())
+  x$sample_id <- as.character(x$sample_id)
+  x$cell_type <- as.character(x$cell_type)
+  x$cells <- suppressWarnings(as.numeric(x$cells))
+  if (!"proportion_within_sample" %in% names(x)) {
+    x$proportion_within_sample <- x$cells / ave(x$cells, x$sample_id, FUN = sum)
+  }
+  x$proportion_within_sample <- suppressWarnings(as.numeric(x$proportion_within_sample))
+  x[is.finite(x$cells) & x$cells > 0 & is.finite(x$proportion_within_sample), , drop = FALSE]
+}
+
 scrna_metric_card <- function(label, value, note = "", tone = "blue") {
   div(class = paste("cutrun-metric-card", tone),
       tags$div(class = "cutrun-metric-label", label),
       tags$div(class = "cutrun-metric-value", value),
       tags$div(class = "cutrun-metric-note", note))
+}
+
+scrna_discrete_palette <- function(n) {
+  n <- suppressWarnings(as.integer(n))
+  if (is.na(n) || n < 1L) return(character(0))
+  grDevices::hcl.colors(n, palette = "Dynamic")
 }
 
 scrna_results_explorer_ui <- function() {
@@ -9796,6 +9817,7 @@ scrna_results_explorer_ui <- function() {
     tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary"), br(), h4("Individual doublet calls"), table_output("scrna_doublet_calls")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), uiOutput("scrna_selected_cells_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
+    tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Exact composition table"), table_output("scrna_composition_table")),
     tabPanel("Markers", br(), h3("Cluster Markers"), uiOutput("scrna_marker_score_ui"), table_output("scrna_marker_table")),
     tabPanel("Downloads", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
   )
@@ -13250,6 +13272,10 @@ server <- function(input, output, session) {
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "cluster_cell_type_sizes.tsv"), 10000)
   }, page_length = 50)
+  output$scrna_composition_table <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    scrna_composition_table(p)
+  }, page_length = 50)
   output$scrna_input_processing <- render_csl_table({
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "input_processing_detected.tsv"), 10000)
@@ -13327,6 +13353,29 @@ server <- function(input, output, session) {
     if (!PLOTLY_AVAILABLE) return(div(class = "empty-box", "Interactive UMAP support is not installed on this app server yet. The publication-ready UMAP figures are available below."))
     plotly::plotlyOutput("scrna_embedding_plot", height = "700px")
   })
+  output$scrna_composition_plot_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    x <- scrna_composition_table(p)
+    if (!NROW(x)) return(div(class = "empty-box", "This completed run predates the exact cell-type composition table. Re-run the scRNA workflow with the current CodeSpringLab version to add it."))
+    if (!PLOTLY_AVAILABLE) return(tags$p(class = "muted", "Interactive composition plotting is unavailable on this app server; the exact table is shown below."))
+    plotly::plotlyOutput("scrna_composition_plot", height = "620px")
+  })
+  if (PLOTLY_AVAILABLE) output$scrna_composition_plot <- plotly::renderPlotly({
+    p <- current_project()
+    x <- scrna_composition_table(p)
+    validate(need(NROW(x), "No exact cell-type composition table is available for this run."))
+    x$sample_id <- factor(x$sample_id, levels = unique(x$sample_id))
+    x$cell_type <- factor(x$cell_type, levels = rev(names(sort(tapply(x$cells, x$cell_type, sum), decreasing = TRUE))))
+    x$.codespring_hover <- paste0("sample: ", x$sample_id, "<br>cell type: ", x$cell_type, "<br>cells: ", format(x$cells, big.mark = ",", trim = TRUE), "<br>within-sample proportion: ", sprintf("%.1f%%", 100 * x$proportion_within_sample))
+    plot <- plotly::plot_ly(x, x = ~sample_id, y = ~proportion_within_sample, type = "bar", color = ~cell_type, colors = scrna_discrete_palette(nlevels(x$cell_type)), text = ~.codespring_hover, hoverinfo = "text")
+    plotly::layout(plot,
+      barmode = "stack",
+      xaxis = list(title = "Sample"),
+      yaxis = list(title = "Cell proportion", tickformat = ".0%", range = c(0, 1)),
+      legend = list(title = list(text = "Cell type")),
+      margin = list(l = 65, r = 35, t = 30, b = 110)
+    )
+  })
   if (PLOTLY_AVAILABLE) output$scrna_selected_cells_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
     selected <- plotly::event_data("plotly_selected", source = "scrna_embedding")
@@ -13355,11 +13404,13 @@ server <- function(input, output, session) {
       validate(need(length(unique(values)) <= 80L, paste0("‘", color_column, "’ has ", length(unique(values)), " distinct values and is not suitable for categorical coloring. Choose a sample, condition, cluster, or cell-type field instead.")))
       x$.codespring_color <- values
       groups <- split(x, x$.codespring_color, drop = TRUE)
+      colors <- scrna_discrete_palette(length(groups))
       plot <- plotly::plot_ly(source = "scrna_embedding")
-      for (label in names(groups)) {
-        group <- groups[[label]]
+      for (i in seq_along(groups)) {
+        label <- names(groups)[[i]]
+        group <- groups[[i]]
         group_hover <- hover[match(group$cell, x$cell)]
-        plot <- plotly::add_markers(plot, data = group, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", name = label, key = ~cell, text = group_hover, hoverinfo = "text", marker = list(size = 4, opacity = 0.72))
+        plot <- plotly::add_markers(plot, data = group, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", name = label, key = ~cell, text = group_hover, hoverinfo = "text", marker = list(color = colors[[i]], size = 4, opacity = 0.72))
       }
     }
     plot <- plotly::event_register(plot, "plotly_selected")
