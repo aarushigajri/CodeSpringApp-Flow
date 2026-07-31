@@ -9833,6 +9833,20 @@ scrna_top_markers_table <- function(project) {
   x[nzchar(x$cluster) & nzchar(x$gene), , drop = FALSE]
 }
 
+# Marker files from Seurat and Scanpy use different column names.  Normalize
+# their ordering for display so the first rows are the most statistically
+# supported positive markers regardless of which engine produced the run.
+scrna_order_markers <- function(x) {
+  if (!NROW(x)) return(x)
+  p_column <- intersect(c("p_val_adj", "pvals_adj", "p_val", "pvals", "pvalue", "p_value"), names(x))
+  effect_column <- intersect(c("avg_log2FC", "avg_logFC", "logfoldchanges", "log2FoldChange", "score"), names(x))
+  p_value <- if (length(p_column)) suppressWarnings(as.numeric(x[[p_column[[1]]]])) else rep(Inf, NROW(x))
+  effect <- if (length(effect_column)) suppressWarnings(as.numeric(x[[effect_column[[1]]]])) else rep(0, NROW(x))
+  p_value[!is.finite(p_value)] <- Inf
+  effect[!is.finite(effect)] <- -Inf
+  x[order(p_value, -effect, as.character(x$gene), na.last = TRUE), , drop = FALSE]
+}
+
 scrna_metric_card <- function(label, value, note = "", tone = "blue") {
   div(class = paste("cutrun-metric-card", tone),
       tags$div(class = "cutrun-metric-label", label),
@@ -13522,7 +13536,9 @@ server <- function(input, output, session) {
     if (!NROW(x)) return(data.frame())
     cluster <- input$scrna_marker_cluster %||% unique(as.character(x$cluster))[[1]]
     x <- x[as.character(x$cluster) == as.character(cluster), , drop = FALSE]
-    preferred <- intersect(c("cluster", "gene", "avg_log2FC", "avg_logFC", "logfoldchanges", "pct.1", "pct.2", "p_val_adj", "pvals_adj", "p_val", "pvals"), names(x))
+    x <- scrna_order_markers(x)
+    x$rank <- seq_len(NROW(x))
+    preferred <- intersect(c("rank", "cluster", "gene", "avg_log2FC", "avg_logFC", "logfoldchanges", "pct.1", "pct.2", "p_val_adj", "pvals_adj", "p_val", "pvals"), names(x))
     x[, unique(c(preferred, setdiff(names(x), preferred))), drop = FALSE]
   }, page_length = 10, scroll_y = "340px")
   output$scrna_marker_score_ui <- renderUI({
