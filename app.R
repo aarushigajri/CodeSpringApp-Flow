@@ -9797,6 +9797,20 @@ scrna_composition_table <- function(project) {
   x[is.finite(x$cells) & x$cells > 0 & is.finite(x$proportion_within_sample), , drop = FALSE]
 }
 
+scrna_top_markers_table <- function(project) {
+  path <- file.path(scrna_output_dir(project), "tables", "top10_markers_per_cluster.tsv")
+  x <- safe_read_table(path, 10000)
+  if (!NROW(x)) return(data.frame())
+  cluster_col <- intersect(c("cluster", "group"), names(x))
+  gene_col <- intersect(c("gene", "features", "names"), names(x))
+  if (!length(cluster_col) || !length(gene_col)) return(data.frame())
+  names(x)[match(cluster_col[[1]], names(x))] <- "cluster"
+  names(x)[match(gene_col[[1]], names(x))] <- "gene"
+  x$cluster <- as.character(x$cluster)
+  x$gene <- as.character(x$gene)
+  x[nzchar(x$cluster) & nzchar(x$gene), , drop = FALSE]
+}
+
 scrna_metric_card <- function(label, value, note = "", tone = "blue") {
   div(class = paste("cutrun-metric-card", tone),
       tags$div(class = "cutrun-metric-label", label),
@@ -9818,7 +9832,7 @@ scrna_results_explorer_ui <- function() {
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), uiOutput("scrna_selected_cells_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
     tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Exact composition table"), table_output("scrna_composition_table")),
-    tabPanel("Markers", br(), h3("Cluster Markers"), uiOutput("scrna_marker_score_ui"), table_output("scrna_marker_table")),
+    tabPanel("Markers", br(), h3("Cluster Markers"), tags$p(class = "muted", "Start with the ten strongest markers for one cluster; the complete ranked marker table remains available below and in Downloads."), uiOutput("scrna_top_markers_ui"), table_output("scrna_top_markers"), br(), uiOutput("scrna_marker_score_ui"), tags$details(tags$summary("Full ranked marker table"), br(), table_output("scrna_marker_table"))),
     tabPanel("Downloads", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
   )
 }
@@ -13434,6 +13448,24 @@ server <- function(input, output, session) {
     preferred <- intersect(c("cell", "sample_id", "condition", "batch", "cluster", "cell_type", "annotation_source", "UMAP_1", "UMAP_2"), names(x))
     x[, preferred, drop = FALSE]
   }, page_length = 50, scroll_y = "360px")
+  output$scrna_top_markers_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    x <- scrna_top_markers_table(p)
+    if (!NROW(x)) return(div(class = "empty-box", "Top cluster-marker results have not been created yet."))
+    clusters <- unique(as.character(x$cluster))
+    clusters <- clusters[order(suppressWarnings(as.numeric(clusters)), clusters, na.last = TRUE)]
+    selected <- selected_choice(input$scrna_marker_cluster, clusters, clusters[[1]])
+    selectInput("scrna_marker_cluster", "Cluster", choices = clusters, selected = selected, selectize = FALSE)
+  })
+  output$scrna_top_markers <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    x <- scrna_top_markers_table(p)
+    if (!NROW(x)) return(data.frame())
+    cluster <- input$scrna_marker_cluster %||% unique(as.character(x$cluster))[[1]]
+    x <- x[as.character(x$cluster) == as.character(cluster), , drop = FALSE]
+    preferred <- intersect(c("cluster", "gene", "avg_log2FC", "avg_logFC", "logfoldchanges", "pct.1", "pct.2", "p_val_adj", "pvals_adj", "p_val", "pvals"), names(x))
+    x[, unique(c(preferred, setdiff(names(x), preferred))), drop = FALSE]
+  }, page_length = 10, scroll_y = "340px")
   output$scrna_marker_score_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
     path <- file.path(scrna_output_dir(p), "tables", "marker_annotation_cluster_scores.tsv")
