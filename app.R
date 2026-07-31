@@ -453,10 +453,11 @@ cleanup_previous_shiny_processes <- function() {
 }
 
 ANALYSIS_CATALOG <- data.frame(
-  key = c("rna", "atac", "cutrun", "chip"),
-  label = c("RNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq"),
+  key = c("rna", "scrna", "atac", "cutrun", "chip"),
+  label = c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq"),
   description = c(
     "Gene expression, transcript quantification, differential expression, and pathway analysis",
+    "Single-cell QC, normalization, integration, clustering, annotation, and result visualization",
     "Chromatin accessibility, signal tracks, peak calling, and differential accessibility",
     "Targeted chromatin profiling, spike-in-aware signal, peak QC, and differential binding",
     "Matched-input chromatin profiling, signal tracks, peak calling, and differential binding"
@@ -468,6 +469,7 @@ analysis_choices <- function() stats::setNames(ANALYSIS_CATALOG$label, ANALYSIS_
 
 analysis_label <- function(x) {
   x <- tolower(as.character(x %||% "rna"))
+  if (grepl("single.?cell|scrna", x)) return("scRNA-seq")
   if (grepl("cut.?run|cutandrun", x)) return("CUT&RUN")
   if (grepl("atac", x)) return("ATAC-seq")
   if (grepl("chip", x)) return("ChIP-seq")
@@ -476,6 +478,7 @@ analysis_label <- function(x) {
 
 analysis_key <- function(x) {
   x <- tolower(as.character(x %||% "rna"))
+  if (grepl("single.?cell|scrna", x)) return("scrna")
   if (grepl("cut.?run|cutandrun", x)) return("cutrun")
   if (grepl("atac", x)) return("atac")
   if (grepl("chip", x)) return("chip")
@@ -491,6 +494,7 @@ results_explorer_tabs <- function(x) {
   switch(
     analysis_key(x),
     rna = c("Overview", "QC", "Counts", "Differential Expression", "Plots", "GSEA", "Files"),
+    scrna = c("Overview", "QC", "UMAP & Annotation", "Markers", "Files"),
     atac = c("Overview", "QC", "Signal & Peaks", "Genome Browser", "Differential Accessibility", "Files"),
     cutrun = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files"),
     chip = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files")
@@ -498,7 +502,11 @@ results_explorer_tabs <- function(x) {
 }
 
 analysis_notebook_dir <- function(key) {
-  switch(analysis_key(key), atac = "bulkATACseq", chip = "bulkChIPseq", cutrun = "bulkCUTRUNseq", rna = "bulkRNAseq")
+  switch(analysis_key(key), atac = "bulkATACseq", chip = "bulkChIPseq", cutrun = "bulkCUTRUNseq", scrna = "singleCellRNAseq", rna = "bulkRNAseq")
+}
+
+is_scrna_project <- function(project) {
+  identical(analysis_key(project$analysis_key %||% project$analysis), "scrna")
 }
 
 is_cutrun_project <- function(project) {
@@ -615,6 +623,10 @@ legacy_project_from_config <- function(path) {
     fastq_dir = fastq_dir,
     fastq_dirs = fastq_dirs,
     design_matrix_path = design_path_from_dir(inpath_design),
+    scrna_input_manifest = resolve_legacy_path(vals$scrna_input_manifest %||% "", key),
+    scrna_engine = tolower(vals$scrna_engine %||% "auto"),
+    scrna_marker_file = resolve_legacy_path(vals$scrna_marker_file %||% "", key),
+    scrna_celltype_file = resolve_legacy_path(vals$scrna_celltype_file %||% "", key),
     external_results = tolower(vals$external_results %||% "false") %in% c("true", "t", "yes", "y", "1"),
     counts_only = tolower(vals$counts_only %||% "false") %in% c("true", "t", "yes", "y", "1"),
     source_config = normalizePath(path, winslash = "/", mustWork = FALSE),
@@ -712,16 +724,21 @@ new_project_from_inputs <- function(input) {
   } else {
     results_root <- normalizePath(path.expand(input$new_results_root %||% DEFAULT_RESULTS_ROOT), winslash = "/", mustWork = FALSE)
     data_dir <- file.path(results_root, project_name, "data")
-    design_path <- trimws(input$new_design_matrix_path %||% "")
-    if (!nzchar(design_path)) design_path <- file.path(data_dir, "manifest", "design_matrix.txt")
-    else if (dir.exists(path.expand(design_path))) {
-      design_path <- file.path(normalizePath(path.expand(design_path), winslash = "/", mustWork = FALSE), "design_matrix.txt")
-    } else if (basename(design_path) != "design_matrix.txt") {
-      design_path <- file.path(normalizePath(dirname(path.expand(design_path)), winslash = "/", mustWork = FALSE), "design_matrix.txt")
+    if (identical(key, "scrna")) {
+      design_path <- file.path(data_dir, "manifest", "scrna_samples.tsv")
+      fastq_dirs <- character(0)
+    } else {
+      design_path <- trimws(input$new_design_matrix_path %||% "")
+      if (!nzchar(design_path)) design_path <- file.path(data_dir, "manifest", "design_matrix.txt")
+      else if (dir.exists(path.expand(design_path))) {
+        design_path <- file.path(normalizePath(path.expand(design_path), winslash = "/", mustWork = FALSE), "design_matrix.txt")
+      } else if (basename(design_path) != "design_matrix.txt") {
+        design_path <- file.path(normalizePath(dirname(path.expand(design_path)), winslash = "/", mustWork = FALSE), "design_matrix.txt")
+      }
+      design_path <- normalizePath(path.expand(design_path), winslash = "/", mustWork = FALSE)
+      fastq_mode <- tolower(input$new_fastq_location_mode %||% "one")
+      fastq_dirs <- if (counts_only) character(0) else if (identical(fastq_mode, "multiple")) parse_fastq_dirs(input$new_fastq_dirs %||% "") else parse_fastq_dirs(input$new_fastq_dir %||% "")
     }
-    design_path <- normalizePath(path.expand(design_path), winslash = "/", mustWork = FALSE)
-    fastq_mode <- tolower(input$new_fastq_location_mode %||% "one")
-    fastq_dirs <- if (counts_only) character(0) else if (identical(fastq_mode, "multiple")) parse_fastq_dirs(input$new_fastq_dirs %||% "") else parse_fastq_dirs(input$new_fastq_dir %||% "")
   }
   fastq_dir <- if (length(fastq_dirs)) fastq_dirs[[1]] else ""
   paired <- !tolower(input$new_paired_end %||% "paired") %in% c("single", "se", "n", "no", "false")
@@ -739,6 +756,10 @@ new_project_from_inputs <- function(input) {
     fastq_dir = fastq_dir,
     fastq_dirs = fastq_dirs,
     design_matrix_path = design_path,
+    scrna_input_manifest = trimws(input$new_scrna_manifest_path %||% ""),
+    scrna_engine = tolower(trimws(input$new_scrna_engine %||% "auto")),
+    scrna_marker_file = trimws(input$new_scrna_marker_file %||% ""),
+    scrna_celltype_file = trimws(input$new_scrna_celltype_file %||% ""),
     external_results = existing_results,
     counts_only = counts_only,
     source_config = "",
@@ -898,7 +919,11 @@ write_project_config <- function(project) {
     sprintf("genome_version = %s", deparse(genome_reference_key(project))),
     sprintf("pairing = %s", deparse(if (isTRUE(project$paired_end)) "y" else "n")),
     sprintf("external_results = %s", deparse(isTRUE(project$external_results))),
-    sprintf("counts_only = %s", deparse(isTRUE(project$counts_only)))
+    sprintf("counts_only = %s", deparse(isTRUE(project$counts_only))),
+    sprintf("scrna_input_manifest = %s", deparse(project$scrna_input_manifest %||% "")),
+    sprintf("scrna_engine = %s", deparse(project$scrna_engine %||% "auto")),
+    sprintf("scrna_marker_file = %s", deparse(project$scrna_marker_file %||% "")),
+    sprintf("scrna_celltype_file = %s", deparse(project$scrna_celltype_file %||% ""))
   )
   if (is_atac_project(project)) {
     ref <- atac_reference_resources(project)
@@ -3060,6 +3085,20 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
   design <- project$design_matrix_path
   if (is.null(jobs)) jobs <- job_history(project)
   if (is.null(active_states)) active_states <- active_job_state_map_from_jobs(jobs)
+  if (is_scrna_project(project)) {
+    out_dir <- file.path(data_dir, "scrna")
+    raw <- data.frame(
+      step = c("Input manifest", "scRNA processing"),
+      status = c(if (file.exists(design)) "Complete" else "Not started", if (file.exists(file.path(out_dir, "_COMPLETE"))) "Complete" else "Not started"),
+      path = c(design, out_dir),
+      input = c("", project$scrna_engine %||% "auto"),
+      detail = c("", ""),
+      stringsAsFactors = FALSE
+    )
+    if ("scRNA processing" %in% names(active_states)) raw$status[raw$step == "scRNA processing"] <- "Active"
+    raw$status <- normalize_pipeline_status(raw$status)
+    return(raw)
+  }
   if (is_atac_project(project) || is_chip_project(project)) {
     project_order <- if (is_chip_project(project)) chip_pipeline_order() else atac_pipeline_order()
     peak_statuses <- c(
@@ -3294,10 +3333,11 @@ chip_pipeline_order <- function() {
 }
 
 all_pipeline_steps <- function() {
-  unique(c(rna_pipeline_order(), cutrun_pipeline_order(), atac_pipeline_order(), chip_pipeline_order()))
+  unique(c(rna_pipeline_order(), c("Input manifest", "scRNA processing"), cutrun_pipeline_order(), atac_pipeline_order(), chip_pipeline_order()))
 }
 
 pipeline_order <- function(project = NULL) {
+  if (!is.null(project) && is_scrna_project(project)) return(c("Input manifest", "scRNA processing"))
   if (!is.null(project) && is_cutrun_project(project)) return(cutrun_pipeline_order())
   if (!is.null(project) && is_atac_project(project)) return(atac_pipeline_order())
   if (!is.null(project) && is_chip_project(project)) return(chip_pipeline_order())
@@ -8519,6 +8559,54 @@ submit_cutrun_macs2_jobs <- function(project, qvalue = "0.01", peak_type = "auto
   paste(append_plan_message(messages, plan), collapse = "\n")
 }
 
+scrna_manifest <- function(project) {
+  path <- project$scrna_input_manifest %||% project$design_matrix_path %||% ""
+  if (!nzchar(path) || !file.exists(path)) return(data.frame())
+  tryCatch(utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) data.frame())
+}
+
+scrna_engine_for_manifest <- function(project, requested = "auto") {
+  requested <- tolower(requested %||% project$scrna_engine %||% "auto")
+  if (!requested %in% c("auto", "seurat", "scanpy")) stop("Processing engine must be automatic, Seurat, or Scanpy.")
+  manifest <- scrna_manifest(project)
+  if (!NROW(manifest) || !"input_path" %in% names(manifest)) stop("The single-cell input manifest is missing or invalid.")
+  paths <- tolower(trimws(as.character(manifest$input_path)))
+  has_rds <- any(grepl("\\.rds$", paths))
+  has_h5ad <- any(grepl("\\.h5ad$", paths))
+  if (has_rds && has_h5ad) stop("Do not mix Seurat .rds and Scanpy .h5ad inputs in one run. Process them separately or begin from filtered 10x matrices.")
+  if (identical(requested, "auto")) return(if (has_h5ad) "scanpy" else "seurat")
+  if (identical(requested, "seurat") && has_h5ad) stop("Scanpy .h5ad input requires the Scanpy engine. Use automatic selection or choose Scanpy.")
+  if (identical(requested, "scanpy") && has_rds) stop("Seurat .rds input requires the Seurat engine. Use automatic selection or choose Seurat.")
+  requested
+}
+
+submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, max_percent_mt = 20, n_pcs = 30) {
+  if (!is_scrna_project(project)) return(record_preflight_failure(project, "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
+  manifest <- scrna_manifest(project)
+  if (!NROW(manifest) || !all(c("sample_id", "input_path") %in% names(manifest))) return(record_preflight_failure(project, "scRNA processing", "The sample manifest must contain sample_id and input_path columns.", "scrna"))
+  resolved_engine <- tryCatch(scrna_engine_for_manifest(project, engine), error = function(e) e)
+  if (inherits(resolved_engine, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(resolved_engine), "scrna"))
+  out_dir <- file.path(project$data_dir, "scrna")
+  params_path <- file.path(project$data_dir, "manifest", "scrna_parameters.tsv")
+  dir.create(dirname(params_path), recursive = TRUE, showWarnings = FALSE)
+  normalization <- tolower(normalization %||% "auto")
+  if (identical(normalization, "auto")) normalization <- if (identical(resolved_engine, "seurat")) "sct" else "lognormalize"
+  if (identical(resolved_engine, "scanpy") && identical(normalization, "sct")) normalization <- "lognormalize"
+  integration <- tolower(integration %||% "auto")
+  allowed_integration <- if (identical(resolved_engine, "seurat")) c("auto", "none", "rpca", "cca") else c("auto", "none", "scvi", "harmony")
+  if (!integration %in% allowed_integration) integration <- "auto"
+  params <- data.frame(
+    key = c("normalization", "integration", "batch_column", "cluster_resolution", "min_features", "max_percent_mt", "n_pcs", "min_cells_per_gene", "marker_file", "celltype_file", "seed", "scvi_max_epochs"),
+    value = as.character(c(normalization, integration, batch_column, cluster_resolution, min_features, max_percent_mt, n_pcs, 3, project$scrna_marker_file %||% "", project$scrna_celltype_file %||% "", 1234, 400)),
+    stringsAsFactors = FALSE
+  )
+  utils::write.table(params, params_path, sep = "\t", row.names = FALSE, quote = FALSE)
+  qsub <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "qsub_scrna_pipeline.sh")
+  runner <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "scrna_pipeline.sh")
+  if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, "scRNA processing", "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna"))
+  submit_sbatch(project, "scRNA processing", qsub, c(runner, resolved_engine, project$scrna_input_manifest, out_dir, params_path), "scrna_pipeline", paste(resolved_engine, normalization, integration), target = file.path(out_dir, "_COMPLETE"), reference = resolved_engine)
+}
+
 submit_star_jobs <- function(project, trimmed = FALSE, samples = NULL) {
   res <- genome_resources(project)
   outdir <- file.path(project$data_dir, "star")
@@ -9505,6 +9593,30 @@ image_or_file_ui <- function(path, height = "900px") {
   } else {
     tags$div(class = "empty-box", tags$p(basename(path)), tags$p(path))
   }
+}
+
+scrna_output_dir <- function(project) file.path(project$data_dir, "scrna")
+
+scrna_result_file_choices <- function(project, pattern = "\\.(tsv|txt|csv|png|pdf|rds|h5ad)$") {
+  root <- scrna_output_dir(project)
+  files <- if (dir.exists(root)) list.files(root, pattern = pattern, recursive = TRUE, full.names = TRUE, ignore.case = TRUE) else character(0)
+  files <- sort(unique(files[file.exists(files)]))
+  if (!length(files)) return(character(0))
+  root_norm <- normalizePath(root, winslash = "/", mustWork = FALSE)
+  file_norm <- normalizePath(files, winslash = "/", mustWork = FALSE)
+  labels <- substring(file_norm, nchar(root_norm) + 2L)
+  stats::setNames(files, labels)
+}
+
+scrna_results_explorer_ui <- function() {
+  tabsetPanel(
+    id = "scrna_results_tabs",
+    tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
+    tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary")),
+    tabPanel("UMAP & Annotation", br(), h3("Embedding and Annotation"), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata"), table_output("scrna_cell_metadata")),
+    tabPanel("Markers", br(), h3("Cluster Markers"), uiOutput("scrna_marker_score_ui"), table_output("scrna_marker_table")),
+    tabPanel("Files", br(), h3("Completed Files"), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"))
+  )
 }
 
 pdf_first_page_data_uri <- function(path, dpi = 180) {
@@ -10521,7 +10633,7 @@ server <- function(input, output, session) {
   cutrun_normalization_choice <- reactiveVal("spikein")
   genome_browser_mode_state <- reactiveVal("")
   path_browser <- reactiveValues(target = "", mode = "dir", path = CURRENT_HOME, selected_file = "", message = "")
-  project_selection <- reactiveValues(rna = "", cutrun = "", atac = "", chip = "")
+  project_selection <- reactiveValues(rna = "", scrna = "", cutrun = "", atac = "", chip = "")
   new_fastq_folders <- reactiveVal(character(0))
 
   new_project_input_values <- function() {
@@ -10849,6 +10961,15 @@ server <- function(input, output, session) {
   observeEvent(input$browse_new_counts_design_server_file, {
     open_server_browser("new_counts_design_server_file", "file", input$new_counts_design_server_file %||% "")
   })
+  observeEvent(input$browse_new_scrna_manifest_path, {
+    open_server_browser("new_scrna_manifest_path", "file", input$new_scrna_manifest_path %||% "")
+  })
+  observeEvent(input$browse_new_scrna_marker_file, {
+    open_server_browser("new_scrna_marker_file", "file", input$new_scrna_marker_file %||% "")
+  })
+  observeEvent(input$browse_new_scrna_celltype_file, {
+    open_server_browser("new_scrna_celltype_file", "file", input$new_scrna_celltype_file %||% "")
+  })
 
   observeEvent(input$browser_go_path, {
     candidate <- path.expand(trimws(input$browser_manual_path %||% ""))
@@ -10962,7 +11083,7 @@ server <- function(input, output, session) {
       radioButtons(
         "new_project_mode", "Project source",
         choices = c(
-          "Start from FASTQs" = "new",
+          if (identical(new_analysis_key, "scrna")) c("Start from single-cell inputs" = "new") else c("Start from FASTQs" = "new"),
           if (identical(new_analysis_key, "rna")) c("Upload a count matrix" = "counts_upload"),
           "Open completed results (read-only)" = "existing_results"
         ),
@@ -10977,7 +11098,25 @@ server <- function(input, output, session) {
         )
       ),
       conditionalPanel(
-        "input.new_project_mode == 'new'",
+        "input.new_project_mode == 'new' && input.new_project_analysis == 'scRNA-seq'",
+        div(class = "read-source-note",
+            tags$strong("Single-cell input manifest"),
+            tags$p("Provide a tab-delimited server file with sample_id and input_path columns. Each input_path may be a Seurat .rds object, a Scanpy .h5ad object, or a filtered 10x matrix folder. Optional columns, such as condition, donor, and batch, are copied to cell metadata."),
+            tags$p("Raw counts are retained. Do not mix Seurat and Scanpy objects in the same run; filtered 10x folders can be combined with the selected engine.")),
+        div(class = "new-project-path-control",
+            textInput("new_scrna_manifest_path", "Single-cell sample manifest (.tsv)", value = "", placeholder = "Absolute server path to samples.tsv"),
+            actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default")),
+        selectInput("new_scrna_engine", "Processing engine", choices = c("Automatic from input type" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = "auto", selectize = FALSE),
+        div(class = "new-project-path-control",
+            textInput("new_scrna_marker_file", "Marker list (optional .tsv)", value = "", placeholder = "cell_type and gene columns"),
+            actionButton("browse_new_scrna_marker_file", "Browse server", class = "btn-default")),
+        div(class = "new-project-path-control",
+            textInput("new_scrna_celltype_file", "Cell-to-cell-type mapping (optional .tsv)", value = "", placeholder = "cell/barcode and cell_type columns"),
+            actionButton("browse_new_scrna_celltype_file", "Browse server", class = "btn-default")),
+        tags$p(class = "muted small-note", "A provided cell mapping takes priority over a marker list. Without either, the workflow preserves clusters as the provisional annotation." )
+      ),
+      conditionalPanel(
+        "input.new_project_mode == 'new' && input.new_project_analysis != 'scRNA-seq'",
       radioButtons(
         "new_fastq_location_mode", "Where are the raw FASTQs?",
         choices = c("One folder" = "one", "Multiple folders (treat as one input pool)" = "multiple"),
@@ -11323,7 +11462,33 @@ server <- function(input, output, session) {
       }
       example_design_copied <- ""
       counts_message <- ""
-      if (isTRUE(p$counts_only)) {
+      if (is_scrna_project(p)) {
+        source_manifest <- path.expand(trimws(p$scrna_input_manifest %||% ""))
+        if (!nzchar(source_manifest) || !file.exists(source_manifest) || dir.exists(source_manifest) || file.access(source_manifest, mode = 4) != 0) {
+          stop("Choose a readable single-cell sample manifest before creating this project.")
+        }
+        manifest <- tryCatch(utils::read.delim(source_manifest, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) stop("Could not read the single-cell manifest: ", conditionMessage(e)))
+        if (!all(c("sample_id", "input_path") %in% names(manifest))) stop("The single-cell manifest must contain sample_id and input_path columns.")
+        manifest <- manifest[nzchar(trimws(as.character(manifest$sample_id))) & nzchar(trimws(as.character(manifest$input_path))), , drop = FALSE]
+        if (!NROW(manifest)) stop("The single-cell manifest has no usable sample rows.")
+        if (anyDuplicated(as.character(manifest$sample_id))) stop("Each sample_id in the single-cell manifest must be unique.")
+        input_paths <- path.expand(trimws(as.character(manifest$input_path)))
+        if (any(!startsWith(input_paths, "/"))) stop("Each single-cell input_path must be an absolute server path so the SLURM job can find it reliably.")
+        missing <- input_paths[!file.exists(input_paths)]
+        unreadable <- input_paths[file.exists(input_paths) & file.access(input_paths, mode = 4) != 0]
+        if (length(missing)) stop("Input path(s) do not exist, for example: ", missing[[1]])
+        if (length(unreadable)) stop("The app cannot read input path(s), for example: ", unreadable[[1]])
+        dir.create(dirname(p$design_matrix_path), recursive = TRUE, showWarnings = FALSE)
+        utils::write.table(manifest, p$design_matrix_path, sep = "\t", row.names = FALSE, quote = FALSE)
+        p$scrna_input_manifest <- p$design_matrix_path
+        for (annotation_path in c(p$scrna_marker_file %||% "", p$scrna_celltype_file %||% "")) {
+          if (nzchar(annotation_path) && !startsWith(path.expand(annotation_path), "/")) stop("Annotation-file paths must be absolute server paths.")
+          if (nzchar(annotation_path) && (!file.exists(path.expand(annotation_path)) || file.access(path.expand(annotation_path), mode = 4) != 0)) {
+            stop("The selected annotation file is not readable: ", annotation_path)
+          }
+        }
+        counts_message <- paste0("Single-cell sample manifest: ", p$scrna_input_manifest, "\nInputs: ", NROW(manifest))
+      } else if (isTRUE(p$counts_only)) {
         counts_source_mode <- input$new_counts_source_mode %||% "upload"
         upload <- input$new_counts_file
         count_source <- if (identical(counts_source_mode, "server")) {
@@ -11369,7 +11534,7 @@ server <- function(input, output, session) {
         missing_fastq_dirs <- fastq_dirs[!dir.exists(fastq_dirs)]
         if (length(missing_fastq_dirs)) stop("These raw FASTQ folders do not exist: ", paste(missing_fastq_dirs, collapse = ", "))
       }
-      if (!isTRUE(p$counts_only) && is_bundled_example_design(p$design_matrix_path)) {
+      if (!is_scrna_project(p) && !isTRUE(p$counts_only) && is_bundled_example_design(p$design_matrix_path)) {
         source_design <- p$design_matrix_path
         destination_design <- file.path(p$data_dir, "manifest", "design_matrix.txt")
         dir.create(dirname(destination_design), recursive = TRUE, showWarnings = FALSE)
@@ -11443,6 +11608,13 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
 
   output$design_editor_ui <- renderUI({
+    if (is_scrna_project(current_project())) {
+      return(tagList(
+        div(class = "read-source-note", tags$strong("Single-cell sample manifest"), tags$p("This manifest is copied into the project when it is created. It preserves the input paths plus optional condition, donor, and batch columns used by the workflow.")),
+        table_output("scrna_manifest_table"),
+        tags$p(class = "muted small-note", "To change input paths or metadata, update the source manifest and create a new project so completed results remain reproducible.")
+      ))
+    }
     df <- design_state()
     if (!NROW(df)) {
       df <- blank_design_matrix_rows(default_metadata_cols(current_project()))
@@ -11453,6 +11625,10 @@ server <- function(input, output, session) {
   output$design_editor_table <- renderUI({
     design_form_table_ui(design_state())
   })
+  output$scrna_manifest_table <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    scrna_manifest(p)
+  }, page_length = 100)
 
   apply_design_cell_edit <- function(info) {
     df <- design_state()
@@ -11506,6 +11682,10 @@ server <- function(input, output, session) {
   output$design_save_status <- renderText("")
   observeEvent(input$save_design, {
     p <- current_project()
+    if (is_scrna_project(p)) {
+      output$design_save_status <- renderText("The scRNA input manifest is fixed when the project is created so completed runs remain reproducible. Create a new project after changing its source manifest.")
+      return()
+    }
     if (isTRUE(p$external_results)) {
       output$design_save_status <- renderText("This completed-results project is read-only. Its original design matrix was not modified.")
       return()
@@ -11587,6 +11767,12 @@ server <- function(input, output, session) {
 
   output$run_resource_strip <- renderUI({
     p <- current_project()
+    if (is_scrna_project(p)) {
+      return(div(class = "resource-strip",
+        div(class = "resource-card", tags$strong("Single-cell workflow"), tags$p(class = "muted", "Raw counts are preserved; QC, normalization, integration, clustering, annotation, and markers run together.")),
+        div(class = "resource-card", tags$strong("Input"), tags$p(class = "muted status-path", p$scrna_input_manifest %||% p$design_matrix_path))
+      ))
+    }
     if (!isTRUE(existing_project_selected())) {
       return(div(class = "resource-strip",
         div(class = "resource-card",
@@ -11620,6 +11806,25 @@ server <- function(input, output, session) {
     r1_choices <- adapter_choices_r1()
     r2_choices <- adapter_choices_r2()
     adapter_defaults <- default_adapter_pair(p)
+    if (is_scrna_project(p)) {
+      return(div(class = "run-grid",
+        tool_panel(
+          "scRNA processing", status,
+          "Run QC, filtering, normalization, integration when multiple samples are present, PCA/neighbors/UMAP/clustering, annotation, and cluster markers as one reproducible SLURM job.",
+          tagList(
+            selectInput("scrna_run_engine", "Processing engine", choices = c("Automatic from input type" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
+            selectInput("scrna_normalization", "Normalization", choices = c("Automatic best-practice default" = "auto", "SCTransform v2 (Seurat)" = "sct", "LogNormalize/log1p" = "lognormalize"), selected = selected_choice(input$scrna_normalization, c("auto", "sct", "lognormalize"), "auto"), selectize = FALSE),
+            selectInput("scrna_integration", "Integration", choices = c("Automatic (RPCA for multi-sample Seurat; scVI for multi-sample Scanpy)" = "auto", "None" = "none", "RPCA (Seurat)" = "rpca", "CCA (Seurat)" = "cca", "scVI (Scanpy)" = "scvi", "Harmony (Scanpy)" = "harmony"), selected = selected_choice(input$scrna_integration, c("auto", "none", "rpca", "cca", "scvi", "harmony"), "auto"), selectize = FALSE),
+            textInput("scrna_batch_column", "Batch metadata column", value = input$scrna_batch_column %||% "batch"),
+            numericInput("scrna_min_features", "Minimum detected genes per cell", value = input$scrna_min_features %||% 200, min = 0, step = 25),
+            numericInput("scrna_max_percent_mt", "Maximum mitochondrial percent", value = input$scrna_max_percent_mt %||% 20, min = 0, max = 100, step = 1),
+            numericInput("scrna_cluster_resolution", "Clustering resolution", value = input$scrna_cluster_resolution %||% 0.6, min = 0.05, max = 5, step = 0.05),
+            tags$p(class = "muted small-note", "Seurat objects use Seurat; AnnData .h5ad objects use Scanpy. The automatic option prevents an incompatible engine/object combination. A supplied cell mapping is used first; otherwise marker lists score and label clusters.")
+          ),
+          "run_scrna_pipeline", "Submit complete scRNA workflow", show_sample_progress = FALSE
+        )
+      ))
+    }
     if (is_chip_project(p)) {
       return(div(class = "run-grid",
         tool_panel("Cutadapt", status, "Trim adapters and short reads from selected ChIP-seq FASTQs.", tagList(
@@ -12227,6 +12432,24 @@ server <- function(input, output, session) {
     })
   }
 
+  observeEvent(input$run_scrna_pipeline, {
+    p <- current_project()
+    run_submission(
+      "scRNA processing",
+      submit_scrna_pipeline_job(
+        p,
+        engine = input$scrna_run_engine %||% "auto",
+        normalization = input$scrna_normalization %||% "auto",
+        integration = input$scrna_integration %||% "auto",
+        batch_column = input$scrna_batch_column %||% "batch",
+        cluster_resolution = input$scrna_cluster_resolution %||% 0.6,
+        min_features = input$scrna_min_features %||% 200,
+        max_percent_mt = input$scrna_max_percent_mt %||% 20
+      ),
+      "complete scRNA workflow"
+    )
+  })
+
   observeEvent(input$run_fastqc, {
     trimmed <- isTRUE(input$fastqc_use_trimmed)
     p <- current_project()
@@ -12644,7 +12867,7 @@ server <- function(input, output, session) {
   native_results_app <- reactive({
     native_results_refresh()
     if (!isTRUE(existing_project_selected())) return(NULL)
-    if (is_cutrun_project(current_project()) || is_atac_project(current_project()) || is_chip_project(current_project())) return(NULL)
+    if (is_scrna_project(current_project()) || is_cutrun_project(current_project()) || is_atac_project(current_project()) || is_chip_project(current_project())) return(NULL)
     load_native_rnaseq_viewer(current_project())
   })
 
@@ -12677,6 +12900,7 @@ server <- function(input, output, session) {
     if (is_cutrun_project(current_project())) {
       return(cutrun_results_explorer_ui())
     }
+    if (is_scrna_project(current_project())) return(scrna_results_explorer_ui())
     if (is_atac_project(current_project())) {
       initial_tab <- if (isTRUE(current_project()$external_results)) "Genome Browser" else "Overview"
       return(atac_results_explorer_ui(initial_tab))
@@ -12718,6 +12942,74 @@ server <- function(input, output, session) {
   }, ignoreInit = TRUE)
 
   output$results_overview <- render_csl_table(project_status(current_project()), page_length = 20)
+  output$scrna_overview_ui <- renderUI({
+    p <- current_project()
+    if (!is_scrna_project(p)) return(NULL)
+    progress_refresh()
+    summary_path <- file.path(scrna_output_dir(p), "run_summary.txt")
+    if (!file.exists(summary_path)) return(div(class = "empty-box", "No completed scRNA workflow is available yet. Submit it from Run Pipeline."))
+    tagList(
+      tags$pre(class = "log-viewer", paste(readLines(summary_path, warn = FALSE), collapse = "\n")),
+      tags$p(class = "muted small-note", "The processed object, full cell metadata, QC tables, marker tables, and figures are retained below the scRNA output folder.")
+    )
+  })
+  output$scrna_cluster_sizes <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "cluster_cell_type_sizes.tsv"), 10000)
+  }, page_length = 50)
+  output$scrna_qc_summary <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "qc_summary_by_sample.tsv"), 10000)
+  }, page_length = 50)
+  output$scrna_cell_metadata <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "cell_metadata.tsv"), 5000)
+  }, page_length = 100)
+  output$scrna_marker_table <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "cluster_markers.tsv"), 5000)
+  }, page_length = 100)
+  output$scrna_qc_plot_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    files <- scrna_result_file_choices(p, "^0[12]_.*\\.png$")
+    if (!length(files)) return(div(class = "empty-box", "QC figures have not been created yet."))
+    selected <- selected_choice(input$scrna_qc_plot, files, unname(files)[[1]])
+    tagList(selectInput("scrna_qc_plot", "QC figure", choices = files, selected = selected, selectize = FALSE), image_or_file_ui(selected, "760px"))
+  })
+  output$scrna_umap_plot_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    files <- scrna_result_file_choices(p, "^0[3-6]_.*\\.png$")
+    if (!length(files)) return(div(class = "empty-box", "UMAP figures have not been created yet."))
+    selected <- selected_choice(input$scrna_umap_plot, files, unname(files)[[1]])
+    tagList(selectInput("scrna_umap_plot", "Embedding", choices = files, selected = selected, selectize = FALSE), image_or_file_ui(selected, "760px"))
+  })
+  output$scrna_marker_score_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    path <- file.path(scrna_output_dir(p), "tables", "marker_annotation_cluster_scores.tsv")
+    if (!file.exists(path)) return(tags$p(class = "muted", "No marker list was provided, or none of its genes were found in the input object."))
+    tagList(h4("Marker score by cluster"), table_output("scrna_marker_scores"))
+  })
+  output$scrna_marker_scores <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "marker_annotation_cluster_scores.tsv"), 1000)
+  }, page_length = 50)
+  output$scrna_file_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    files <- scrna_result_file_choices(p)
+    if (!length(files)) return(div(class = "empty-box", "No completed scRNA output files are available yet."))
+    selectInput("scrna_file", "Result file", choices = files, selected = selected_choice(input$scrna_file, files, unname(files)[[1]]), selectize = FALSE)
+  })
+  output$scrna_file_view <- renderUI({
+    p <- current_project(); path <- validated_project_result_path(p, input$scrna_file)
+    if (!is_scrna_project(p) || !nzchar(path)) return(NULL)
+    if (tolower(tools::file_ext(path)) %in% c("tsv", "txt", "csv")) return(table_output("scrna_selected_table"))
+    image_or_file_ui(path, "850px")
+  })
+  output$scrna_selected_table <- render_csl_table({
+    p <- current_project(); path <- validated_project_result_path(p, input$scrna_file)
+    if (!is_scrna_project(p) || !nzchar(path)) return(data.frame())
+    safe_read_result_table(path, 10000)
+  }, page_length = 100)
   output$design_table <- render_csl_table({
     df <- design_state()
     if (!NROW(df)) return(data.frame())
