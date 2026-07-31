@@ -10978,6 +10978,10 @@ server <- function(input, output, session) {
   native_results_loaded_project <- reactiveVal("")
   job_history_state <- reactiveVal(data.frame())
   project_status_state <- reactiveVal(data.frame())
+  # A scheduler can take a few seconds to expose a newly accepted job. Keep
+  # the accepted submission visibly Active during that hand-off, but never
+  # mask a terminal scheduler result or a completion marker.
+  submission_holds <- reactiveVal(list())
   featurecounts_matrix_autosubmitted <- reactiveVal(character(0))
   sample_size_cache <- reactiveVal(data.frame(path = character(), size = numeric(), checked = character(), stringsAsFactors = FALSE))
   sample_progress_state <- reactiveVal(data.frame())
@@ -11040,6 +11044,19 @@ server <- function(input, output, session) {
     active_states <- active_job_state_map_from_jobs(jobs)
     res <- sample_progress(p, active_states, isolate(sample_size_cache()), jobs = jobs)
     status <- project_status(p, jobs = jobs, progress = res$table, active_states = active_states)
+    holds <- isolate(submission_holds())
+    if (length(holds) && NROW(status)) {
+      age_seconds <- vapply(holds, function(x) as.numeric(difftime(Sys.time(), as.POSIXct(x), units = "secs")), numeric(1))
+      active_holds <- names(holds)[is.finite(age_seconds) & age_seconds < 180]
+      for (step in active_holds) {
+        index <- match(step, status$step)
+        if (!is.na(index) && identical(status$status[[index]], "Not started")) {
+          status$status[[index]] <- "Active"
+          status$detail[[index]] <- "Submission accepted; awaiting scheduler status"
+        }
+      }
+      submission_holds(holds[active_holds])
+    }
     old_status <- isolate(project_status_state())
     job_history_state(jobs)
     sample_size_cache(res$cache)
@@ -11116,6 +11133,9 @@ server <- function(input, output, session) {
         sample_progress_state(rbind(old, optimistic))
       }
     }
+    holds <- isolate(submission_holds())
+    holds[[step]] <- Sys.time()
+    submission_holds(holds)
     project_status_state(optimistic_status(isolate(project_status_state()), step, input_mode))
     run_cards_refresh(Sys.time())
     progress_refresh(Sys.time())
@@ -12594,9 +12614,12 @@ server <- function(input, output, session) {
       x <- detected[[column]] %||% rep(FALSE, NROW(detected))
       any(toupper(trimws(as.character(x))) %in% c("TRUE", "YES", "1"), na.rm = TRUE)
     }
+    has_raw_counts <- has("rna_count_layers_detected") || (
+      "raw_count_source" %in% names(detected) && any(!tolower(trimws(as.character(detected$raw_count_source))) %in% c("", "unavailable", "na"), na.rm = TRUE)
+    )
     yes_no <- function(value) if (isTRUE(value)) "Yes" else "No"
     div(class = "cutrun-metric-grid compact",
-      scrna_metric_card("Raw counts", yes_no(has("rna_count_layers_detected")), "Required for reproducible processing", if (has("rna_count_layers_detected")) "green" else "gold"),
+      scrna_metric_card("Raw counts", yes_no(has_raw_counts), "Required for reproducible processing", if (has_raw_counts) "green" else "gold"),
       scrna_metric_card("Normalized data", yes_no(has("rna_normalized_layers_detected") || has("sct_detected")), "Detected in the supplied source", "blue"),
       scrna_metric_card("PCA / UMAP", paste(yes_no(has("pca_detected")), "/", yes_no(has("umap_detected"))), "Detected in the supplied source", "purple"),
       scrna_metric_card("Clusters", yes_no(has("clusters_detected")), "Detected in the supplied source", "gold"),
