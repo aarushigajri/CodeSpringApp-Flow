@@ -8706,6 +8706,50 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
   requested
 }
 
+scanpy_runtime_python <- function() {
+  file.path(APP_HOME, "runtimes", "scanpy", "bin", "python")
+}
+
+scanpy_runtime_check <- function() {
+  python <- scanpy_runtime_python()
+  if (!file.exists(python) || file.access(python, mode = 1) != 0) {
+    return(list(ready = FALSE, state = "Not installed", detail = "No managed Scanpy environment was found for this Unix user."))
+  }
+  check <- tryCatch(
+    system2(python, c("-c", shQuote("import anndata, scanpy, igraph, leidenalg, numpy, pandas, scipy")), stdout = TRUE, stderr = TRUE),
+    error = function(e) structure(conditionMessage(e), status = 1L)
+  )
+  status <- attr(check, "status") %||% 0L
+  if (identical(as.integer(status), 0L)) {
+    return(list(ready = TRUE, state = "Ready", detail = "The managed Scanpy environment is complete and can be reused by every H5AD project for this Unix user."))
+  }
+  list(ready = FALSE, state = "Incomplete", detail = paste(c("The managed environment exists but cannot import the required Scanpy packages.", utils::head(as.character(check), 2L)), collapse = " "))
+}
+
+submit_scrna_scanpy_runtime_job <- function(project) {
+  if (!is_scrna_project(project)) return(record_preflight_failure(project, "Scanpy runtime", "This is not an scRNA-seq project.", "scrna_runtime"))
+  manifest_path <- trimws(as.character(project$scrna_input_manifest %||% project$design_matrix_path %||% ""))
+  manifest <- tryCatch(validate_scrna_manifest(scrna_manifest(project)), error = function(e) e)
+  if (!nzchar(manifest_path) || inherits(manifest, "error")) {
+    detail <- if (inherits(manifest, "error")) conditionMessage(manifest) else "This project has no saved single-cell input record."
+    return(record_preflight_failure(project, "Scanpy runtime", detail, "scrna_runtime"))
+  }
+  engine <- tryCatch(scrna_engine_for_manifest(project, "auto"), error = function(e) e)
+  if (inherits(engine, "error") || !identical(engine, "scanpy")) {
+    detail <- if (inherits(engine, "error")) conditionMessage(engine) else "The managed Scanpy runtime is only needed for H5AD inputs."
+    return(record_preflight_failure(project, "Scanpy runtime", detail, "scrna_runtime"))
+  }
+  out_dir <- file.path(project$data_dir, "scrna")
+  params_path <- file.path(project$data_dir, "manifest", "scrna_parameters.tsv")
+  dir.create(dirname(params_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.table(manifest, manifest_path, sep = "\t", row.names = FALSE, quote = FALSE)
+  if (!file.exists(params_path)) utils::write.table(data.frame(key = "runtime_setup", value = "true"), params_path, sep = "\t", row.names = FALSE, quote = FALSE)
+  qsub <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "qsub_scrna_pipeline.sh")
+  runner <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "scrna_pipeline.sh")
+  if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, "Scanpy runtime", "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna_runtime"))
+  submit_sbatch(project, "Scanpy runtime", qsub, c(runner, "scanpy", manifest_path, out_dir, params_path, "setup-runtime"), "scrna_runtime", "one-time managed environment setup", target = file.path(out_dir, "_SCANPY_RUNTIME_READY"), reference = "scanpy")
+}
+
 submit_scrna_pipeline_job <- function(project, stage = "inspect", engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "", marker_upload = NULL, celltype_upload = NULL, marker_source = "server", celltype_source = "server") {
   stage <- tolower(trimws(as.character(stage %||% "inspect")))
   step_label <- tryCatch(scrna_stage_step(stage), error = function(e) "")
@@ -8717,6 +8761,12 @@ submit_scrna_pipeline_job <- function(project, stage = "inspect", engine = "auto
   if (inherits(manifest, "error")) return(record_preflight_failure(project, step_label, conditionMessage(manifest), "scrna"))
   resolved_engine <- tryCatch(scrna_engine_for_manifest(project, engine), error = function(e) e)
   if (inherits(resolved_engine, "error")) return(record_preflight_failure(project, step_label, conditionMessage(resolved_engine), "scrna"))
+  if (identical(resolved_engine, "scanpy")) {
+    runtime <- scanpy_runtime_check()
+    if (!isTRUE(runtime$ready)) {
+      return(record_preflight_failure(project, step_label, "The Scanpy environment is not ready. Use the 'Set up Scanpy environment' card first, then click Check environment before submitting this stage.", "scrna"))
+    }
+  }
   numeric_setting <- function(value, label, minimum, maximum = Inf, integer = FALSE) {
     parsed <- suppressWarnings(as.numeric(value))
     if (length(parsed) != 1L || is.na(parsed) || parsed < minimum || parsed > maximum || (isTRUE(integer) && parsed != round(parsed))) {
@@ -10973,6 +11023,7 @@ server <- function(input, output, session) {
   tool_messages <- reactiveVal(list())
   progress_refresh <- reactiveVal(Sys.time())
   run_cards_refresh <- reactiveVal(Sys.time())
+  scanpy_runtime_check_refresh <- reactiveVal(Sys.time())
   native_registered_id <- reactiveVal("")
   native_results_refresh <- reactiveVal(0L)
   native_results_loaded_project <- reactiveVal("")
@@ -12329,6 +12380,7 @@ server <- function(input, output, session) {
     adapter_defaults <- default_adapter_pair(p)
     if (is_scrna_project(p)) {
       return(div(class = "run-grid",
+        uiOutput("scrna_scanpy_runtime_ui"),
         tool_panel("Input inspection", status, "Submit a short job that inspects your supplied object and records which data and analysis components it already contains.", tagList(uiOutput("scrna_inspect_settings_ui"), uiOutput("scrna_input_state_ui"), tags$p(class = "muted small-note", "The input is read only. This first job creates a project checkpoint and a clear yes/no source report.")), "run_scrna_inspect", "Inspect source input", show_sample_progress = FALSE),
         tool_panel("QC & doublets", status, "First review the unfiltered QC distributions, then choose filters and record predicted doublets from the raw-count checkpoint.", tagList(uiOutput("scrna_pre_qc_plot_ui"), uiOutput("scrna_qc_settings_ui"), tags$p(class = "muted small-note", "The plot above is generated by Input inspection before any cells are removed. Doublet calls are saved whether or not predicted doublets are removed.")), "run_scrna_qc", "Run QC & doublets", show_sample_progress = FALSE),
         tool_panel("Normalize & PCA", status, "Normalize retained cells, identify variable genes, scale, and calculate PCA.", uiOutput("scrna_preprocess_settings_ui"), "run_scrna_preprocess", "Run normalization & PCA", show_sample_progress = FALSE),
@@ -12597,6 +12649,30 @@ server <- function(input, output, session) {
       )
     }
   }
+
+  output$scrna_scanpy_runtime_ui <- renderUI({
+    scanpy_runtime_check_refresh()
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    engine <- tryCatch(scrna_engine_for_manifest(p, "auto"), error = function(e) "")
+    if (!identical(engine, "scanpy")) return(NULL)
+    runtime <- scanpy_runtime_check()
+    jobs <- job_history(p)
+    runtime_jobs <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) jobs[canonical_job_step(jobs$step) == canonical_job_step("Scanpy runtime"), , drop = FALSE] else data.frame()
+    latest_state <- if (NROW(runtime_jobs)) as.character(tail(runtime_jobs$slurm_state, 1L)) else ""
+    active <- toupper(latest_state) %in% toupper(active_slurm_states()) || identical(latest_state, "Submitted")
+    state <- if (runtime$ready) "Ready" else if (active) "Setting up" else runtime$state
+    tone <- if (runtime$ready) "green" else if (active) "gold" else "blue"
+    div(class = paste("tool-panel", if (runtime$ready) "complete" else if (active) "active" else "not-started"),
+      tags$h4("Scanpy environment"),
+      tags$p(class = "muted", "Required only for H5AD input. It is a private Python environment for this Unix user, shared across that user’s Scanpy projects—not a copy of your data."),
+      div(class = "cutrun-metric-grid compact", scrna_metric_card("Status", state, runtime$detail, tone)),
+      div(class = "button-row",
+        actionButton("check_scanpy_runtime", "Check environment", class = "btn-default"),
+        if (!runtime$ready && !active) actionButton("setup_scanpy_runtime", "Set up Scanpy environment", class = "btn-primary") else NULL
+      ),
+      if (active) tags$p(class = "muted small-note", "A one-time SLURM setup job is running. Refresh or click Check environment when it completes.") else NULL
+    )
+  })
 
   output$scrna_inspect_settings_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
@@ -13148,6 +13224,15 @@ server <- function(input, output, session) {
   observeEvent(input$run_scrna_preprocess, submit_scrna_stage("preprocess"), ignoreInit = TRUE)
   observeEvent(input$run_scrna_cluster, submit_scrna_stage("cluster"), ignoreInit = TRUE)
   observeEvent(input$run_scrna_annotate, submit_scrna_stage("annotate"), ignoreInit = TRUE)
+  observeEvent(input$check_scanpy_runtime, {
+    scanpy_runtime_check_refresh(Sys.time())
+    run_cards_refresh(Sys.time())
+  }, ignoreInit = TRUE)
+  observeEvent(input$setup_scanpy_runtime, {
+    run_submission("Scanpy runtime", submit_scrna_scanpy_runtime_job(current_project()), "one-time managed environment setup")
+    scanpy_runtime_check_refresh(Sys.time())
+    run_cards_refresh(Sys.time())
+  }, ignoreInit = TRUE)
 
   observeEvent(input$run_fastqc, {
     trimmed <- isTRUE(input$fastqc_use_trimmed)
