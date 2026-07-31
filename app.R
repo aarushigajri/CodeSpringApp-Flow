@@ -627,9 +627,6 @@ legacy_project_from_config <- function(path) {
     design_matrix_path = design_path_from_dir(inpath_design),
     scrna_input_manifest = resolve_legacy_path(vals$scrna_input_manifest %||% "", key),
     scrna_engine = tolower(vals$scrna_engine %||% "auto"),
-    scrna_runtime_executable = resolve_legacy_path(vals$scrna_runtime_executable %||% "", key),
-    scrna_marker_file = resolve_legacy_path(vals$scrna_marker_file %||% "", key),
-    scrna_celltype_file = resolve_legacy_path(vals$scrna_celltype_file %||% "", key),
     external_results = tolower(vals$external_results %||% "false") %in% c("true", "t", "yes", "y", "1"),
     counts_only = tolower(vals$counts_only %||% "false") %in% c("true", "t", "yes", "y", "1"),
     source_config = normalizePath(path, winslash = "/", mustWork = FALSE),
@@ -761,9 +758,6 @@ new_project_from_inputs <- function(input) {
     design_matrix_path = design_path,
     scrna_input_manifest = trimws(input$new_scrna_manifest_path %||% ""),
     scrna_engine = tolower(trimws(input$new_scrna_engine %||% "auto")),
-    scrna_runtime_executable = trimws(input$new_scrna_runtime_executable %||% ""),
-    scrna_marker_file = trimws(input$new_scrna_marker_file %||% ""),
-    scrna_celltype_file = trimws(input$new_scrna_celltype_file %||% ""),
     external_results = existing_results,
     counts_only = counts_only,
     source_config = "",
@@ -925,10 +919,7 @@ write_project_config <- function(project) {
     sprintf("external_results = %s", deparse(isTRUE(project$external_results))),
     sprintf("counts_only = %s", deparse(isTRUE(project$counts_only))),
     sprintf("scrna_input_manifest = %s", deparse(project$scrna_input_manifest %||% "")),
-    sprintf("scrna_engine = %s", deparse(project$scrna_engine %||% "auto")),
-    sprintf("scrna_runtime_executable = %s", deparse(project$scrna_runtime_executable %||% "")),
-    sprintf("scrna_marker_file = %s", deparse(project$scrna_marker_file %||% "")),
-    sprintf("scrna_celltype_file = %s", deparse(project$scrna_celltype_file %||% ""))
+    sprintf("scrna_engine = %s", deparse(project$scrna_engine %||% "auto"))
   )
   if (is_atac_project(project)) {
     ref <- atac_reference_resources(project)
@@ -8640,8 +8631,13 @@ scrna_manifest_from_setup <- function(manifest_path = "", sample_id = "", input_
   }
   sample_id <- trimws(as.character(sample_id %||% ""))
   input_path <- path.expand(trimws(as.character(input_path %||% "")))
-  if (!nzchar(sample_id) || !nzchar(input_path)) {
-    stop("Provide either an optional sample manifest or a first sample ID and single-cell input path.")
+  if (!nzchar(input_path)) stop("Provide a data location or an optional sample manifest.")
+  # A setup form should not make users invent a sample ID for one input. The
+  # editable manifest remains the place to rename samples or add metadata.
+  if (!nzchar(sample_id)) {
+    sample_id <- basename(sub("/+$", "", input_path))
+    sample_id <- sub("\\.(rds|h5ad)$", "", sample_id, ignore.case = TRUE)
+    sample_id <- clean_name(sample_id, "sample_1")
   }
   validate_scrna_manifest(data.frame(sample_id = sample_id, input_path = input_path, stringsAsFactors = FALSE, check.names = FALSE))
 }
@@ -8661,7 +8657,7 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
   requested
 }
 
-submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, runtime_executable = "") {
+submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "") {
   if (!is_scrna_project(project)) return(record_preflight_failure(project, "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
   manifest_path <- trimws(as.character(project$scrna_input_manifest %||% project$design_matrix_path %||% ""))
   if (!nzchar(manifest_path)) return(record_preflight_failure(project, "scRNA processing", "This project has no saved single-cell input manifest. Save the manifest before submitting.", "scrna"))
@@ -8699,11 +8695,14 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   if (!nzchar(batch_column) && integration %in% setdiff(allowed_integration, c("auto", "none"))) {
     return(record_preflight_failure(project, "scRNA processing", "A batch metadata column is required for explicitly requested integration. Choose a manifest column, or select Automatic/None integration.", "scrna"))
   }
-  runtime_executable <- trimws(as.character(runtime_executable %||% ""))
-  if (!nzchar(runtime_executable)) runtime_executable <- trimws(as.character(project$scrna_runtime_executable %||% ""))
-  runtime_executable <- path.expand(runtime_executable)
-  if (nzchar(runtime_executable) && (!file.exists(runtime_executable) || dir.exists(runtime_executable) || file.access(runtime_executable, mode = 1) != 0)) {
-    return(record_preflight_failure(project, "scRNA processing", paste("The custom", if (identical(resolved_engine, "scanpy")) "Python" else "Rscript", "runtime is not an executable file:", runtime_executable), "scrna"))
+  marker_file <- trimws(as.character(marker_file %||% ""))
+  celltype_file <- trimws(as.character(celltype_file %||% ""))
+  annotation_files <- c("Marker list" = marker_file, "Cell-to-cell-type mapping" = celltype_file)
+  for (label in names(annotation_files)) {
+    path <- path.expand(annotation_files[[label]])
+    if (nzchar(path) && (!startsWith(path, "/") || !file.exists(path) || dir.exists(path) || file.access(path, mode = 4) != 0)) {
+      return(record_preflight_failure(project, "scRNA processing", paste0(label, " must be a readable absolute server file: ", annotation_files[[label]]), "scrna"))
+    }
   }
   out_dir <- file.path(project$data_dir, "scrna")
   params_path <- file.path(project$data_dir, "manifest", "scrna_parameters.tsv")
@@ -8717,8 +8716,8 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
     return(record_preflight_failure(project, "scRNA processing", paste0("Doublet method '", doublet_method, "' is not compatible with the ", resolved_engine, " engine. Choose ", paste(allowed_doublet, collapse = ", "), "."), "scrna"))
   }
   params <- data.frame(
-    key = c("normalization", "integration", "batch_column", "cluster_resolution", "min_features", "min_counts", "max_features", "max_percent_mt", "n_pcs", "min_cells_per_gene", "doublet_method", "doublet_rate", "remove_doublets", "marker_file", "celltype_file", "runtime_executable", "seed", "scvi_max_epochs"),
-    value = as.character(c(normalization, integration, batch_column, checked$cluster_resolution, checked$min_features, checked$min_counts, checked$max_features, checked$max_percent_mt, checked$n_pcs, checked$min_cells_per_gene, doublet_method, checked$doublet_rate, isTRUE(remove_doublets), project$scrna_marker_file %||% "", project$scrna_celltype_file %||% "", runtime_executable, checked$seed, checked$scvi_max_epochs)),
+    key = c("normalization", "integration", "batch_column", "cluster_resolution", "min_features", "min_counts", "max_features", "max_percent_mt", "n_pcs", "min_cells_per_gene", "doublet_method", "doublet_rate", "remove_doublets", "marker_file", "celltype_file", "seed", "scvi_max_epochs"),
+    value = as.character(c(normalization, integration, batch_column, checked$cluster_resolution, checked$min_features, checked$min_counts, checked$max_features, checked$max_percent_mt, checked$n_pcs, checked$min_cells_per_gene, doublet_method, checked$doublet_rate, isTRUE(remove_doublets), marker_file, celltype_file, checked$seed, checked$scvi_max_epochs)),
     stringsAsFactors = FALSE
   )
   # Keep the copied, editable project manifest normalized immediately before
@@ -11250,11 +11249,11 @@ server <- function(input, output, session) {
     mode <- if (identical(input$new_scrna_input_location_type %||% "file", "dir")) "dir" else "file"
     open_server_browser("new_scrna_input_path", mode, input$new_scrna_input_path %||% "")
   })
-  observeEvent(input$browse_new_scrna_marker_file, {
-    open_server_browser("new_scrna_marker_file", "file", input$new_scrna_marker_file %||% "")
+  observeEvent(input$browse_scrna_marker_file, {
+    open_server_browser("scrna_marker_file", "file", input$scrna_marker_file %||% "")
   })
-  observeEvent(input$browse_new_scrna_celltype_file, {
-    open_server_browser("new_scrna_celltype_file", "file", input$new_scrna_celltype_file %||% "")
+  observeEvent(input$browse_scrna_celltype_file, {
+    open_server_browser("scrna_celltype_file", "file", input$scrna_celltype_file %||% "")
   })
 
   observeEvent(input$browser_go_path, {
@@ -11351,6 +11350,13 @@ server <- function(input, output, session) {
     example <- example_dataset_paths(new_analysis_key)
     default_fastq_dir <- example$fastq_dir %||% ""
     default_design_dir <- example$design_dir %||% ""
+    scrna_results_location_control <- if (identical(new_analysis_key, "scrna")) tagList(
+      div(class = "new-project-path-control",
+        textInput("new_results_root", "Results output storage location", value = DEFAULT_RESULTS_ROOT, placeholder = "Where CodeSpringApp should store this project's results"),
+        actionButton("browse_new_results_root", "Browse server", class = "btn-default")
+      ),
+      checkboxInput("new_clear_existing_results", "Clear existing results if this project folder already exists", value = FALSE)
+    ) else NULL
     tagList(
       tags$hr(),
       h4("New Project"),
@@ -11386,28 +11392,20 @@ server <- function(input, output, session) {
       conditionalPanel(
         "input.new_project_mode == 'new' && input.new_project_analysis == 'scRNA-seq'",
         div(class = "read-source-note",
-            tags$strong("Single-cell inputs and output location"),
-            tags$p("Start directly from one raw-count input below, or optionally provide an existing tab-delimited manifest. Inputs may be a Seurat .rds object, a Scanpy .h5ad object, or a filtered 10x matrix folder. For multiple samples, either use the optional manifest now or add/edit rows in the in-app manifest after project creation."),
+            tags$strong("Data and output locations"),
+            tags$p("Start from a Seurat .rds object, Scanpy .h5ad object, or filtered 10x matrix folder. For multiple samples, provide a manifest now or add/edit rows in the in-app manifest after creating the project."),
             tags$p("All heavy processing is submitted to SLURM. The app remains responsive and shows the workflow as In progress while the HPC job runs.")),
-        textInput("new_scrna_sample_id", "First sample ID (used when no manifest is supplied)", value = "sample_1", placeholder = "e.g. donor_01"),
-        radioButtons("new_scrna_input_location_type", "First input type", choices = c("Seurat RDS or Scanpy H5AD file" = "file", "Filtered 10x matrix folder" = "dir"), selected = "file", inline = TRUE),
         div(class = "new-project-path-control",
-            textInput("new_scrna_input_path", "First single-cell input path", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x folder"),
+            textInput("new_scrna_input_path", "Data location", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x matrix folder"),
             actionButton("browse_new_scrna_input_path", "Browse server", class = "btn-default")),
         div(class = "new-project-path-control",
-            textInput("new_scrna_manifest_path", "Optional existing sample manifest (.tsv)", value = "", placeholder = "Optional: absolute server path to samples.tsv"),
+            textInput("new_scrna_manifest_path", "Multiple-sample manifest (optional .tsv)", value = "", placeholder = "Absolute server path to samples.tsv"),
             actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default"),
-            tags$p(class = "muted small-note", "When supplied, the manifest takes precedence over the single input above. It must contain sample_id and input_path columns.")),
+            tags$p(class = "muted small-note", "When supplied, the manifest takes precedence over Data location. It must contain sample_id and input_path columns.")),
+        scrna_results_location_control,
+        radioButtons("new_scrna_input_location_type", "Data type", choices = c("Seurat RDS or Scanpy H5AD file" = "file", "Filtered 10x matrix folder" = "dir"), selected = "file", inline = TRUE),
         selectInput("new_scrna_engine", "Processing engine", choices = c("Automatic from input type" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = "auto", selectize = FALSE),
-        textInput("new_scrna_runtime_executable", "Optional custom runtime executable", value = "", placeholder = "Optional: /path/to/Rscript for Seurat or /path/to/python for Scanpy"),
-        tags$p(class = "muted small-note", "Leave blank to use the cluster module runtime. Use this only when your lab has a validated Seurat R library or Scanpy Conda environment elsewhere on the HPC."),
-        div(class = "new-project-path-control",
-            textInput("new_scrna_marker_file", "Marker list (optional .tsv)", value = "", placeholder = "cell_type and gene columns"),
-            actionButton("browse_new_scrna_marker_file", "Browse server", class = "btn-default")),
-        div(class = "new-project-path-control",
-            textInput("new_scrna_celltype_file", "Cell-to-cell-type mapping (optional .tsv)", value = "", placeholder = "cell/barcode and cell_type columns"),
-            actionButton("browse_new_scrna_celltype_file", "Browse server", class = "btn-default")),
-        tags$p(class = "muted small-note", "A provided cell mapping takes priority over a marker list. Without either, the workflow preserves clusters as the provisional annotation." )
+        tags$p(class = "muted small-note", "The cluster runtime is configured by CodeSpringLab. Cell-type annotation files are selected at the annotation step in Run Pipeline.")
       ),
       conditionalPanel(
         "input.new_project_mode == 'new' && input.new_project_analysis != 'scRNA-seq'",
@@ -11470,7 +11468,7 @@ server <- function(input, output, session) {
         textInput("new_counts_metadata_cols", "Metadata columns if no design is uploaded", value = "treatment", placeholder = "treatment, batch, sex"),
         tags$p(class = "muted", "Without a design file, sample names are taken from the count-matrix column names. Complete the metadata values in the Design Matrix tab before running DESeq2.")
       ),
-      conditionalPanel(
+      if (!identical(new_analysis_key, "scrna")) conditionalPanel(
         "input.new_project_mode != 'existing_results'",
         div(class = "new-project-path-control",
             textInput("new_results_root", "Results root", value = DEFAULT_RESULTS_ROOT, placeholder = "Where CodeSpringApp should write project results"),
@@ -11772,18 +11770,12 @@ server <- function(input, output, session) {
       if (is_scrna_project(p)) {
         manifest <- scrna_manifest_from_setup(
           p$scrna_input_manifest %||% "",
-          input$new_scrna_sample_id %||% "",
+          "",
           input$new_scrna_input_path %||% ""
         )
         dir.create(dirname(p$design_matrix_path), recursive = TRUE, showWarnings = FALSE)
         utils::write.table(manifest, p$design_matrix_path, sep = "\t", row.names = FALSE, quote = FALSE)
         p$scrna_input_manifest <- p$design_matrix_path
-        for (annotation_path in c(p$scrna_marker_file %||% "", p$scrna_celltype_file %||% "")) {
-          if (nzchar(annotation_path) && !startsWith(path.expand(annotation_path), "/")) stop("Annotation-file paths must be absolute server paths.")
-          if (nzchar(annotation_path) && (!file.exists(path.expand(annotation_path)) || file.access(path.expand(annotation_path), mode = 4) != 0)) {
-            stop("The selected annotation file is not readable: ", annotation_path)
-          }
-        }
         counts_message <- paste0("Single-cell sample manifest: ", p$scrna_input_manifest, "\nInputs: ", NROW(manifest))
       } else if (isTRUE(p$counts_only)) {
         counts_source_mode <- input$new_counts_source_mode %||% "upload"
@@ -12428,13 +12420,17 @@ server <- function(input, output, session) {
       selectInput("scrna_normalization", "Normalization", choices = normalization_choices, selected = selected_choice(input$scrna_normalization, unname(normalization_choices), "auto"), selectize = FALSE),
       selectInput("scrna_integration", "Integration", choices = integration_choices, selected = selected_choice(input$scrna_integration, unname(integration_choices), "auto"), selectize = FALSE),
       selectInput("scrna_doublet_method", "Doublet detection", choices = doublet_choices, selected = selected_choice(input$scrna_doublet_method, unname(doublet_choices), "auto"), selectize = FALSE),
-      textInput(
-        "scrna_runtime_executable",
-        if (identical(engine, "scanpy")) "Optional custom Scanpy Python executable" else "Optional custom Seurat Rscript executable",
-        value = input$scrna_runtime_executable %||% p$scrna_runtime_executable %||% "",
-        placeholder = if (identical(engine, "scanpy")) "/path/to/conda-env/bin/python" else "/path/to/Rscript"
+      tags$hr(),
+      tags$h4("Cell-type annotation (optional)"),
+      tags$p(class = "muted small-note", "Supply a marker list or a cell-to-cell-type mapping for this run. A cell mapping takes priority; otherwise, clusters remain the provisional annotation."),
+      div(class = "new-project-path-control",
+        textInput("scrna_marker_file", "Marker list", value = input$scrna_marker_file %||% "", placeholder = "Absolute server .tsv with cell_type and gene columns"),
+        actionButton("browse_scrna_marker_file", "Browse server", class = "btn-default")
       ),
-      tags$p(class = "muted small-note", "Leave blank to use the cluster's configured module runtime. A custom executable is checked before job submission and is recorded with the run parameters.")
+      div(class = "new-project-path-control",
+        textInput("scrna_celltype_file", "Cell-to-cell-type mapping", value = input$scrna_celltype_file %||% "", placeholder = "Absolute server .tsv with cell/barcode and cell_type columns"),
+        actionButton("browse_scrna_celltype_file", "Browse server", class = "btn-default")
+      )
     )
   })
 
@@ -12890,7 +12886,8 @@ server <- function(input, output, session) {
         remove_doublets = isTRUE(input$scrna_remove_doublets),
         seed = input$scrna_seed %||% 1234,
         scvi_max_epochs = input$scrna_scvi_max_epochs %||% 400,
-        runtime_executable = input$scrna_runtime_executable %||% ""
+        marker_file = input$scrna_marker_file %||% "",
+        celltype_file = input$scrna_celltype_file %||% ""
       ),
       "complete scRNA workflow"
     )
