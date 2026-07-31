@@ -12583,7 +12583,7 @@ server <- function(input, output, session) {
       doublet_choices <- c("Automatic (scDblFinder)" = "auto", "No doublet detection/removal" = "none", "scDblFinder" = "scdblfinder")
     } else {
       normalization_choices <- c("Automatic best-practice default" = "auto", "LogNormalize/log1p" = "lognormalize")
-      integration_choices <- c("Automatic (scVI for multi-sample data)" = "auto", "None" = "none", "scVI" = "scvi", "Harmony" = "harmony")
+      integration_choices <- c("Automatic (Harmony for technical batches)" = "auto", "None" = "none", "Harmony" = "harmony", "scVI (dedicated runtime required)" = "scvi")
       doublet_choices <- c("Automatic (Scrublet)" = "auto", "No doublet detection/removal" = "none", "Scrublet" = "scrublet")
     }
     tagList(
@@ -12639,7 +12639,7 @@ server <- function(input, output, session) {
     batch_values <- batch_values[nzchar(batch_values)]
     input_kinds <- ifelse(grepl("\\.h5ad$", manifest$input_path, ignore.case = TRUE), "AnnData", ifelse(grepl("\\.rds$", manifest$input_path, ignore.case = TRUE), "Seurat", "10x matrix"))
     integration_note <- if (length(batch_values) >= 2L) {
-      if (identical(engine, "scanpy")) paste0("Use automatic integration (scVI) for the ", length(batch_values), " values in technical field ‘", batch_column, "’.") else paste0("Use automatic integration (conservative RPCA) for the ", length(batch_values), " values in technical field ‘", batch_column, "’.")
+      if (identical(engine, "scanpy")) paste0("Use automatic integration (Harmony) for the ", length(batch_values), " values in technical field ‘", batch_column, "’. Choose scVI only when its dedicated runtime is available.") else paste0("Use automatic integration (conservative RPCA) for the ", length(batch_values), " values in technical field ‘", batch_column, "’.")
     } else {
       "No multi-level technical batch is selected, so keep integration at Automatic/None; do not use biological condition as a batch field."
     }
