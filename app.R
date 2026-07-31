@@ -9616,7 +9616,7 @@ scrna_result_file_choices <- function(project, pattern = "\\.(tsv|txt|csv|png|pd
 scrna_results_explorer_ui <- function() {
   tabsetPanel(
     id = "scrna_results_tabs",
-    tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
+    tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Detected input processing"), table_output("scrna_input_processing"), br(), uiOutput("scrna_input_plot_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
     tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("UMAP & Annotation", br(), h3("Embedding and Annotation"), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata"), table_output("scrna_cell_metadata")),
@@ -12971,6 +12971,10 @@ server <- function(input, output, session) {
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "cluster_cell_type_sizes.tsv"), 10000)
   }, page_length = 50)
+  output$scrna_input_processing <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "input_processing_detected.tsv"), 10000)
+  }, page_length = 50, scroll_y = "340px")
   output$scrna_qc_summary <- render_csl_table({
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "qc_summary_by_sample.tsv"), 10000)
@@ -13001,6 +13005,13 @@ server <- function(input, output, session) {
     if (!length(files)) return(div(class = "empty-box", "QC figures have not been created yet."))
     selected <- selected_choice(input$scrna_qc_plot, files, unname(files)[[1]])
     tagList(selectInput("scrna_qc_plot", "QC figure", choices = files, selected = selected, selectize = FALSE), image_or_file_ui(selected, "760px"))
+  })
+  output$scrna_input_plot_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    files <- scrna_result_file_choices(p, "^00_input_.*\\.png$")
+    if (!length(files)) return(tags$p(class = "muted", "This input did not include a saved UMAP. The workflow-generated UMAPs are available in the UMAP & Annotation tab."))
+    selected <- selected_choice(input$scrna_input_plot, files, unname(files)[[1]])
+    tagList(h4("Embedding supplied with the input object"), selectInput("scrna_input_plot", "Input embedding", choices = files, selected = selected, selectize = FALSE), image_or_file_ui(selected, "760px"))
   })
   output$scrna_umap_plot_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
