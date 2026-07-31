@@ -74,6 +74,26 @@ Example launcher output. The port in your terminal may differ if the default por
 
 ## What It Does
 
+### Single-cell RNA-seq
+
+The scRNA-seq project type accepts a Seurat RDS, Scanpy H5AD, or filtered 10x
+matrix directory from a server path. A manifest is optional: choose one input
+and sample ID during setup, then add/edit further samples in the project-local
+manifest in the app. Existing manifests remain supported for multi-sample
+projects.
+
+Choose the **Results root** in project setup; the app writes the processed
+object, figures, tables, logs, and job temporary storage under
+`<results_root>/<project_name>/data/scrna/`. Source objects and matrices are
+never changed. All computational scRNA steps run as a single SLURM job, so the
+app shows **Active** while the job runs and remains responsive for other work.
+
+The selected engine is explicit: Seurat for RDS/10x and Scanpy for H5AD/10x.
+The job wrapper loads the relevant cluster runtime only on the compute node.
+For a lab-managed environment, enter a custom `Rscript` or Conda `python`
+executable in the app; it is validated before submission and saved in the run
+parameters.
+
 - Creates or resumes CodeSpringLab projects from saved project configs.
 - Builds and edits design matrices from FASTQ folders.
 - Submits real SLURM `sbatch` jobs for RNA-seq tools plus ATAC-seq, CUT&RUN, and ChIP-seq Bowtie2/peak-calling/differential workflows.

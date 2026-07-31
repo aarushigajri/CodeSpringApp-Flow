@@ -1197,4 +1197,32 @@ assert(
   "Results Explorer selectors only list files from completed DESeq2 and GSEA runs"
 )
 
+scrna_source <- file.path(root, "single_input.rds")
+file.create(scrna_source)
+scrna_direct <- app_env$scrna_manifest_from_setup("", "donor_01", scrna_source)
+assert(
+  NROW(scrna_direct) == 1L && identical(scrna_direct$sample_id[[1]], "donor_01") && identical(scrna_direct$input_path[[1]], scrna_source),
+  "scRNA projects can start directly from a single server input without a manifest"
+)
+scrna_manifest_path <- file.path(root, "provided_scRNA_manifest.tsv")
+write.table(data.frame(sample_id = "donor_02", input_path = scrna_source), scrna_manifest_path, sep = "\t", row.names = FALSE, quote = FALSE)
+assert(
+  identical(app_env$scrna_manifest_from_setup(scrna_manifest_path)$sample_id[[1]], "donor_02"),
+  "scRNA projects still accept an optional supplied manifest"
+)
+scrna_project <- list(
+  id = "scrna/test", name = "test", analysis_key = "scrna", analysis = "scRNA-seq",
+  data_dir = file.path(root, "scRNA-results", "data"), results_root = file.path(root, "scRNA-results"),
+  design_matrix_path = scrna_manifest_path, scrna_input_manifest = scrna_manifest_path, scrna_engine = "auto"
+)
+failed_scrna_job <- data.frame(step = "scrna_pipeline", slurm_state = "FAILED", stringsAsFactors = FALSE)
+assert(
+  identical(app_env$project_status(scrna_project, jobs = failed_scrna_job)$status[[2]], "Likely failed"),
+  "scRNA terminal failures are surfaced as failed rather than not started"
+)
+assert(
+  grepl("runtime_executable", app_text, fixed = TRUE) && grepl("scrna_manifest_from_setup", app_text, fixed = TRUE),
+  "scRNA setup supports an optional manifest and explicit compute runtime"
+)
+
 cat("CodeSpringApp fake-data helper smoke tests passed.\n")
