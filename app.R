@@ -9741,6 +9741,20 @@ scrna_embedding_columns <- function(project) {
   strsplit(header[[1]], "\t", fixed = TRUE)[[1]]
 }
 
+scrna_embedding_color_choices <- function(project) {
+  columns <- scrna_embedding_columns(project)
+  excluded <- c("cell", "UMAP_1", "UMAP_2", "input_path", "source_barcode")
+  candidates <- setdiff(columns, excluded)
+  preferred <- intersect(c("cell_type", "cluster", "sample_id", "condition", "batch", "annotation_source"), candidates)
+  unique(c(preferred, sort(setdiff(candidates, preferred))))
+}
+
+scrna_embedding_color_column <- function(project, requested = "") {
+  choices <- scrna_embedding_color_choices(project)
+  if (!length(choices)) return("")
+  selected_choice(requested, choices, choices[[1]])
+}
+
 scrna_embedding_table <- function(project, columns = character(0), max_points = 30000L, cells = character(0)) {
   path <- file.path(scrna_output_dir(project), "tables", "umap_coordinates.tsv")
   headers <- scrna_embedding_columns(project)
@@ -13402,15 +13416,14 @@ server <- function(input, output, session) {
     if (!all(c("UMAP_1", "UMAP_2") %in% columns)) {
       return(div(class = "empty-box", "This completed run predates the interactive embedding table. Re-run the scRNA workflow with the current CodeSpringLab version to add it; the static UMAP figures remain available below."))
     }
-    excluded <- c("cell", "UMAP_1", "UMAP_2", "input_path", "source_barcode")
-    candidates <- setdiff(columns, excluded)
-    preferred <- intersect(c("cell_type", "cluster", "sample_id", "condition", "batch", "annotation_source"), candidates)
-    choices <- unique(c(preferred, sort(setdiff(candidates, preferred))))
+    choices <- scrna_embedding_color_choices(p)
     if (!length(choices)) return(div(class = "empty-box", "The embedding table has coordinates but no cell-level annotation columns to color."))
+    requested_points <- suppressWarnings(as.integer(input$scrna_embedding_max_points %||% 30000L))
+    if (is.na(requested_points)) requested_points <- 30000L
     tagList(
       fluidRow(
         column(5, selectInput("scrna_embedding_color", "Color cells by", choices = choices, selected = selected_choice(input$scrna_embedding_color, choices, choices[[1]]), selectize = FALSE)),
-        column(4, numericInput("scrna_embedding_max_points", "Maximum cells shown", value = min(30000L, max(2000L, as.integer(input$scrna_embedding_max_points %||% 30000L))), min = 2000, max = 50000, step = 1000)),
+        column(4, numericInput("scrna_embedding_max_points", "Maximum cells shown", value = min(30000L, max(2000L, requested_points)), min = 2000, max = 50000, step = 1000)),
         column(3, br(), checkboxInput("scrna_embedding_legend", "Show legend", value = if (is.null(input$scrna_embedding_legend)) TRUE else isTRUE(input$scrna_embedding_legend)))
       )
     )
@@ -13475,8 +13488,10 @@ server <- function(input, output, session) {
   })
   if (PLOTLY_AVAILABLE) output$scrna_embedding_plot <- plotly::renderPlotly({
     p <- current_project()
-    color_column <- input$scrna_embedding_color %||% "cell_type"
-    point_limit <- as.integer(input$scrna_embedding_max_points %||% 30000L)
+    color_column <- scrna_embedding_color_column(p, input$scrna_embedding_color %||% "")
+    validate(need(nzchar(color_column), "The embedding table has no cell-level annotation columns to color."))
+    point_limit <- suppressWarnings(as.integer(input$scrna_embedding_max_points %||% 30000L))
+    if (is.na(point_limit)) point_limit <- 30000L
     point_limit <- max(2000L, min(50000L, point_limit))
     x <- scrna_embedding_table(p, columns = c(color_column, "sample_id", "condition", "batch", "cluster", "cell_type", "annotation_source"), max_points = point_limit)
     validate(need(NROW(x), "No valid UMAP coordinates are available for this selection."))
