@@ -9797,6 +9797,28 @@ scrna_composition_table <- function(project) {
   x[is.finite(x$cells) & x$cells > 0 & is.finite(x$proportion_within_sample), , drop = FALSE]
 }
 
+# The saved composition table is deliberately never abbreviated.  This helper
+# only simplifies the browser view when a run has many annotated populations.
+scrna_composition_for_plot <- function(x, max_types = 20L) {
+  if (!NROW(x)) return(x)
+  max_types <- suppressWarnings(as.integer(max_types))
+  if (is.na(max_types) || max_types < 1L) return(x)
+  totals <- sort(tapply(x$cells, x$cell_type, sum, na.rm = TRUE), decreasing = TRUE)
+  keep <- head(names(totals), max_types)
+  if (length(keep) >= length(totals)) return(x)
+  other_label <- "Other (remaining cell types)"
+  while (other_label %in% x$cell_type) other_label <- paste0(other_label, " grouped")
+  x$.codespring_cell_type <- ifelse(x$cell_type %in% keep, x$cell_type, other_label)
+  out <- stats::aggregate(
+    cbind(cells, proportion_within_sample) ~ sample_id + .codespring_cell_type,
+    data = x,
+    FUN = sum
+  )
+  names(out)[names(out) == ".codespring_cell_type"] <- "cell_type"
+  out$cell_type <- as.character(out$cell_type)
+  out
+}
+
 scrna_top_markers_table <- function(project) {
   path <- file.path(scrna_output_dir(project), "tables", "top10_markers_per_cluster.tsv")
   x <- safe_read_table(path, 10000)
@@ -9833,7 +9855,7 @@ scrna_results_explorer_ui <- function() {
     tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary"), br(), h4("Individual doublet calls"), table_output("scrna_doublet_calls")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), uiOutput("scrna_selected_cells_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
-    tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Exact composition table"), table_output("scrna_composition_table")),
+    tabPanel("Composition", br(), h3("Cell-type Composition"), tags$p(class = "muted", "Exact cell counts and within-sample proportions are calculated by the workflow before any browser rendering or UMAP sampling."), uiOutput("scrna_composition_plot_ui"), br(), h4("Exact composition table"), tags$p(class = "muted small-note", "This complete table is never grouped or rounded; use it for reporting and download it from Downloads."), table_output("scrna_composition_table")),
     tabPanel("Markers", br(), h3("Cluster Markers"), tags$p(class = "muted", "Start with the ten strongest markers for one cluster; the complete ranked marker table remains available below and in Downloads."), uiOutput("scrna_top_markers_ui"), table_output("scrna_top_markers"), br(), uiOutput("scrna_marker_score_ui"), tags$details(tags$summary("Full ranked marker table"), br(), table_output("scrna_marker_table"))),
       tabPanel("Downloads", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
     ))
@@ -13389,12 +13411,32 @@ server <- function(input, output, session) {
     x <- scrna_composition_table(p)
     if (!NROW(x)) return(div(class = "empty-box", "This completed run predates the exact cell-type composition table. Re-run the scRNA workflow with the current CodeSpringLab version to add it."))
     if (!PLOTLY_AVAILABLE) return(tags$p(class = "muted", "Interactive composition plotting is unavailable on this app server; the exact table is shown below."))
-    plotly::plotlyOutput("scrna_composition_plot", height = "620px")
+    total_types <- length(unique(x$cell_type))
+    choices <- c("All cell types" = "0")
+    for (n in c(12L, 20L, 30L)) if (total_types > n) choices[[paste0("Top ", n, " cell types + Other")]] <- as.character(n)
+    selected <- selected_choice(input$scrna_composition_max_types, choices, if (total_types > 20L) "20" else "0")
+    tagList(
+      fluidRow(column(5, selectInput("scrna_composition_max_types", "Display", choices = choices, selected = selected, selectize = FALSE))),
+      uiOutput("scrna_composition_plot_note"),
+      plotly::plotlyOutput("scrna_composition_plot", height = "620px")
+    )
+  })
+  output$scrna_composition_plot_note <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    x <- scrna_composition_table(p)
+    max_types <- suppressWarnings(as.integer(input$scrna_composition_max_types %||% 0L))
+    total_types <- length(unique(x$cell_type))
+    if (!NROW(x) || is.na(max_types) || max_types < 1L || total_types <= max_types) {
+      return(tags$p(class = "muted small-note", paste0("Showing all ", total_types, " cell types.")))
+    }
+    tags$p(class = "muted small-note", paste0("Showing the ", max_types, " most abundant cell types across the run; the remaining ", total_types - max_types, " are grouped as Other (remaining cell types). The exact full table remains below."))
   })
   if (PLOTLY_AVAILABLE) output$scrna_composition_plot <- plotly::renderPlotly({
     p <- current_project()
     x <- scrna_composition_table(p)
     validate(need(NROW(x), "No exact cell-type composition table is available for this run."))
+    max_types <- suppressWarnings(as.integer(input$scrna_composition_max_types %||% 0L))
+    x <- scrna_composition_for_plot(x, max_types)
     x$sample_id <- factor(x$sample_id, levels = unique(x$sample_id))
     x$cell_type <- factor(x$cell_type, levels = rev(names(sort(tapply(x$cells, x$cell_type, sum), decreasing = TRUE))))
     x$.codespring_hover <- paste0("sample: ", x$sample_id, "<br>cell type: ", x$cell_type, "<br>cells: ", format(x$cells, big.mark = ",", trim = TRUE), "<br>within-sample proportion: ", sprintf("%.1f%%", 100 * x$proportion_within_sample))
