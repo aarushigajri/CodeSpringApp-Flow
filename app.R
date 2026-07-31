@@ -2535,6 +2535,9 @@ canonical_job_step <- function(x) {
     deseq2 = "DESeq2",
     gsea = "GSEA",
     gseapy = "GSEA",
+    scrna = "scRNA processing",
+    scrnapipeline = "scRNA processing",
+    scrnaprocessing = "scRNA processing",
     rsem = "RSEM (optional)",
     kallisto = "Kallisto (optional)"
   )
@@ -3087,9 +3090,28 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
   if (is.null(active_states)) active_states <- active_job_state_map_from_jobs(jobs)
   if (is_scrna_project(project)) {
     out_dir <- file.path(data_dir, "scrna")
+    scrna_status <- "Not started"
+    if (file.exists(file.path(out_dir, "_COMPLETE"))) {
+      scrna_status <- "Complete"
+    }
+    scrna_jobs <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) {
+      jobs[canonical_job_step(jobs$step) == "scRNA processing", , drop = FALSE]
+    } else data.frame()
+    if (NROW(scrna_jobs)) {
+      latest_state <- toupper(trimws(as.character(tail(scrna_jobs$slurm_state, 1))))
+      if (latest_state %in% toupper(active_slurm_states())) {
+        scrna_status <- "Active"
+      } else if (latest_state %in% c("FAILED", "CANCELLED", "CANCELLED+", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL")) {
+        scrna_status <- if (grepl("CANCELLED", latest_state, fixed = TRUE)) "Cancelled" else "Likely failed"
+      } else if (identical(latest_state, "COMPLETED") && !file.exists(file.path(out_dir, "_COMPLETE"))) {
+        # A successful scheduler allocation without the workflow completion marker
+        # means that the workflow itself stopped before its final validation step.
+        scrna_status <- "Likely failed"
+      }
+    }
     raw <- data.frame(
       step = c("Input manifest", "scRNA processing"),
-      status = c(if (file.exists(design)) "Complete" else "Not started", if (file.exists(file.path(out_dir, "_COMPLETE"))) "Complete" else "Not started"),
+      status = c(if (file.exists(design)) "Complete" else "Not started", scrna_status),
       path = c(design, out_dir),
       input = c("", project$scrna_engine %||% "auto"),
       detail = c("", ""),
@@ -8565,6 +8587,31 @@ scrna_manifest <- function(project) {
   tryCatch(utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) data.frame())
 }
 
+validate_scrna_manifest <- function(manifest, check_paths = TRUE) {
+  manifest <- as.data.frame(manifest, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!all(c("sample_id", "input_path") %in% names(manifest))) {
+    stop("The single-cell manifest must contain sample_id and input_path columns.")
+  }
+  if (!NROW(manifest)) stop("The single-cell manifest has no sample rows.")
+  manifest$sample_id <- trimws(as.character(manifest$sample_id))
+  manifest$input_path <- trimws(as.character(manifest$input_path))
+  if (any(!nzchar(manifest$sample_id))) stop("Every single-cell manifest row needs a sample_id.")
+  if (any(!nzchar(manifest$input_path))) stop("Every single-cell manifest row needs an input_path.")
+  if (anyDuplicated(manifest$sample_id)) stop("Each sample_id in the single-cell manifest must be unique.")
+  input_paths <- path.expand(manifest$input_path)
+  if (any(!startsWith(input_paths, "/"))) {
+    stop("Each single-cell input_path must be an absolute server path so the SLURM job can find it reliably.")
+  }
+  if (isTRUE(check_paths)) {
+    missing <- input_paths[!file.exists(input_paths)]
+    unreadable <- input_paths[file.exists(input_paths) & file.access(input_paths, mode = 4) != 0]
+    if (length(missing)) stop("Input path(s) do not exist, for example: ", missing[[1]])
+    if (length(unreadable)) stop("The app cannot read input path(s), for example: ", unreadable[[1]])
+  }
+  manifest$input_path <- input_paths
+  manifest
+}
+
 scrna_engine_for_manifest <- function(project, requested = "auto") {
   requested <- tolower(requested %||% project$scrna_engine %||% "auto")
   if (!requested %in% c("auto", "seurat", "scanpy")) stop("Processing engine must be automatic, Seurat, or Scanpy.")
@@ -8582,10 +8629,30 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
 
 submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_percent_mt = 20, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE) {
   if (!is_scrna_project(project)) return(record_preflight_failure(project, "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
-  manifest <- scrna_manifest(project)
-  if (!NROW(manifest) || !all(c("sample_id", "input_path") %in% names(manifest))) return(record_preflight_failure(project, "scRNA processing", "The sample manifest must contain sample_id and input_path columns.", "scrna"))
+  manifest_path <- trimws(as.character(project$scrna_input_manifest %||% project$design_matrix_path %||% ""))
+  if (!nzchar(manifest_path)) return(record_preflight_failure(project, "scRNA processing", "This project has no saved single-cell input manifest. Save the manifest before submitting.", "scrna"))
+  manifest <- tryCatch(validate_scrna_manifest(scrna_manifest(project)), error = function(e) e)
+  if (inherits(manifest, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(manifest), "scrna"))
   resolved_engine <- tryCatch(scrna_engine_for_manifest(project, engine), error = function(e) e)
   if (inherits(resolved_engine, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(resolved_engine), "scrna"))
+  numeric_setting <- function(value, label, minimum, maximum = Inf, integer = FALSE) {
+    parsed <- suppressWarnings(as.numeric(value))
+    if (length(parsed) != 1L || is.na(parsed) || parsed < minimum || parsed > maximum || (isTRUE(integer) && parsed != round(parsed))) {
+      stop(label, " must be ", if (is.finite(maximum)) paste0("between ", minimum, " and ", maximum) else paste0("at least ", minimum), if (isTRUE(integer)) " (a whole number)." else ".")
+    }
+    parsed
+  }
+  checked <- tryCatch(list(
+    cluster_resolution = numeric_setting(cluster_resolution, "Clustering resolution", 0.01, 10),
+    min_features = numeric_setting(min_features, "Minimum detected genes", 0, Inf, TRUE),
+    min_counts = numeric_setting(min_counts, "Minimum UMI/count threshold", 0, Inf, TRUE),
+    max_percent_mt = numeric_setting(max_percent_mt, "Maximum mitochondrial percent", 0, 100),
+    n_pcs = numeric_setting(n_pcs, "Number of principal components", 2, 200, TRUE),
+    doublet_rate = numeric_setting(doublet_rate, "Expected doublet rate", 0, 0.5)
+  ), error = function(e) e)
+  if (inherits(checked, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(checked), "scrna"))
+  batch_column <- trimws(as.character(batch_column %||% ""))
+  if (!nzchar(batch_column)) return(record_preflight_failure(project, "scRNA processing", "Batch metadata column cannot be blank. Use batch, a manifest metadata column, or choose integration = None.", "scrna"))
   out_dir <- file.path(project$data_dir, "scrna")
   params_path <- file.path(project$data_dir, "manifest", "scrna_parameters.tsv")
   dir.create(dirname(params_path), recursive = TRUE, showWarnings = FALSE)
@@ -8602,14 +8669,17 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   if (!integration %in% allowed_integration) integration <- "auto"
   params <- data.frame(
     key = c("normalization", "integration", "batch_column", "cluster_resolution", "min_features", "min_counts", "max_percent_mt", "n_pcs", "min_cells_per_gene", "doublet_method", "doublet_rate", "remove_doublets", "marker_file", "celltype_file", "seed", "scvi_max_epochs"),
-    value = as.character(c(normalization, integration, batch_column, cluster_resolution, min_features, min_counts, max_percent_mt, n_pcs, 3, doublet_method, doublet_rate, isTRUE(remove_doublets), project$scrna_marker_file %||% "", project$scrna_celltype_file %||% "", 1234, 400)),
+    value = as.character(c(normalization, integration, batch_column, checked$cluster_resolution, checked$min_features, checked$min_counts, checked$max_percent_mt, checked$n_pcs, 3, doublet_method, checked$doublet_rate, isTRUE(remove_doublets), project$scrna_marker_file %||% "", project$scrna_celltype_file %||% "", 1234, 400)),
     stringsAsFactors = FALSE
   )
+  # Keep the copied, editable project manifest normalized immediately before
+  # submission, rather than trusting an older source file that may have moved.
+  utils::write.table(manifest, manifest_path, sep = "\t", row.names = FALSE, quote = FALSE)
   utils::write.table(params, params_path, sep = "\t", row.names = FALSE, quote = FALSE)
   qsub <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "qsub_scrna_pipeline.sh")
   runner <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "scrna_pipeline.sh")
   if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, "scRNA processing", "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna"))
-  submit_sbatch(project, "scRNA processing", qsub, c(runner, resolved_engine, project$scrna_input_manifest, out_dir, params_path), "scrna_pipeline", paste(resolved_engine, normalization, integration), target = file.path(out_dir, "_COMPLETE"), reference = resolved_engine)
+  submit_sbatch(project, "scRNA processing", qsub, c(runner, resolved_engine, manifest_path, out_dir, params_path), "scrna_pipeline", paste(resolved_engine, normalization, integration), target = file.path(out_dir, "_COMPLETE"), reference = resolved_engine)
 }
 
 submit_star_jobs <- function(project, trimmed = FALSE, samples = NULL) {
@@ -9610,6 +9680,14 @@ scrna_result_file_choices <- function(project, pattern = "\\.(tsv|txt|csv|png|pd
   root_norm <- normalizePath(root, winslash = "/", mustWork = FALSE)
   file_norm <- normalizePath(files, winslash = "/", mustWork = FALSE)
   labels <- substring(file_norm, nchar(root_norm) + 2L)
+  # Put the analysis-ready object and the main tables first; alphabetical
+  # filesystem order otherwise buries the files most users need to inspect.
+  priority <- ifelse(grepl("^objects/processed_", labels), 1L,
+    ifelse(grepl("^tables/(cell_metadata|cluster_markers|qc_summary|doublet_calls)", labels), 2L,
+      ifelse(grepl("^figures/", labels), 3L, 4L)))
+  ord <- order(priority, labels)
+  files <- files[ord]
+  labels <- labels[ord]
   stats::setNames(files, labels)
 }
 
@@ -9617,11 +9695,11 @@ scrna_results_explorer_ui <- function() {
   tabsetPanel(
     id = "scrna_results_tabs",
     tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Detected input processing"), table_output("scrna_input_processing"), br(), uiOutput("scrna_input_plot_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
-    tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary")),
+    tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary"), br(), h4("Individual doublet calls"), table_output("scrna_doublet_calls")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
     tabPanel("UMAP & Annotation", br(), h3("Embedding and Annotation"), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata"), table_output("scrna_cell_metadata")),
     tabPanel("Markers", br(), h3("Cluster Markers"), uiOutput("scrna_marker_score_ui"), table_output("scrna_marker_table")),
-    tabPanel("Files", br(), h3("Completed Files"), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"))
+    tabPanel("Files", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
   )
 }
 
@@ -10623,6 +10701,10 @@ ui <- function(request) {
 server <- function(input, output, session) {
   projects <- reactiveVal(discover_projects())
   design_state <- reactiveVal(data.frame())
+  # scRNA inputs live in a project-local manifest, separate from the bulk-RNA
+  # design state. Keeping it reactive makes the same editable-table workflow
+  # available without mutating the source manifest selected at project setup.
+  scrna_manifest_state <- reactiveVal(data.frame())
   run_message <- reactiveVal("")
   tool_messages <- reactiveVal(list())
   progress_refresh <- reactiveVal(Sys.time())
@@ -11356,6 +11438,12 @@ server <- function(input, output, session) {
   })
 
   output$design_matrix_help_ui <- renderUI({
+    if (is_scrna_project(current_project())) {
+      return(tags$p(
+        class = "muted",
+        "Edit the project-local single-cell manifest directly. Each row needs a unique sample_id and an absolute readable input_path. Extra columns (for example condition, donor, or batch) are attached to cells and can be used for integration or downstream plots. Save before submitting the workflow."
+      ))
+    }
     if (isTRUE(current_project()$counts_only)) {
       tags$p(
         class = "muted",
@@ -11370,6 +11458,13 @@ server <- function(input, output, session) {
   })
 
   output$design_matrix_actions_ui <- renderUI({
+    if (is_scrna_project(current_project())) {
+      return(div(
+        class = "button-row",
+        actionButton("add_metadata_col", "Update metadata columns", class = "btn-primary"),
+        actionButton("add_design_rows", "Add 5 sample rows", class = "btn-default")
+      ))
+    }
     if (isTRUE(current_project()$counts_only)) {
       return(div(
         class = "button-row",
@@ -11474,16 +11569,7 @@ server <- function(input, output, session) {
           stop("Choose a readable single-cell sample manifest before creating this project.")
         }
         manifest <- tryCatch(utils::read.delim(source_manifest, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) stop("Could not read the single-cell manifest: ", conditionMessage(e)))
-        if (!all(c("sample_id", "input_path") %in% names(manifest))) stop("The single-cell manifest must contain sample_id and input_path columns.")
-        manifest <- manifest[nzchar(trimws(as.character(manifest$sample_id))) & nzchar(trimws(as.character(manifest$input_path))), , drop = FALSE]
-        if (!NROW(manifest)) stop("The single-cell manifest has no usable sample rows.")
-        if (anyDuplicated(as.character(manifest$sample_id))) stop("Each sample_id in the single-cell manifest must be unique.")
-        input_paths <- path.expand(trimws(as.character(manifest$input_path)))
-        if (any(!startsWith(input_paths, "/"))) stop("Each single-cell input_path must be an absolute server path so the SLURM job can find it reliably.")
-        missing <- input_paths[!file.exists(input_paths)]
-        unreadable <- input_paths[file.exists(input_paths) & file.access(input_paths, mode = 4) != 0]
-        if (length(missing)) stop("Input path(s) do not exist, for example: ", missing[[1]])
-        if (length(unreadable)) stop("The app cannot read input path(s), for example: ", unreadable[[1]])
+        manifest <- validate_scrna_manifest(manifest)
         dir.create(dirname(p$design_matrix_path), recursive = TRUE, showWarnings = FALSE)
         utils::write.table(manifest, p$design_matrix_path, sep = "\t", row.names = FALSE, quote = FALSE)
         p$scrna_input_manifest <- p$design_matrix_path
@@ -11584,11 +11670,27 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$add_metadata_col, {
+    if (is_scrna_project(current_project())) {
+      df <- scrna_manifest_state()
+      if (!NROW(df)) df <- data.frame(sample_id = character(0), input_path = character(0), stringsAsFactors = FALSE, check.names = FALSE)
+      requested <- parse_metadata_cols(input$metadata_cols, current_project())
+      for (column in requested) if (!column %in% names(df)) df[[column]] <- ""
+      scrna_manifest_state(df)
+      return()
+    }
     df <- apply_design_form_values(design_state(), reactiveValuesToList(input))
     design_state(sync_metadata_columns(df, metadata_cols_from_input()))
   })
 
   observeEvent(input$add_design_rows, {
+    if (is_scrna_project(current_project())) {
+      df <- scrna_manifest_state()
+      if (!NROW(df)) df <- data.frame(sample_id = character(0), input_path = character(0), stringsAsFactors = FALSE, check.names = FALSE)
+      extra <- as.data.frame(lapply(df, function(x) rep("", 5L)), stringsAsFactors = FALSE, check.names = FALSE)
+      if (!NCOL(extra)) extra <- data.frame(sample_id = rep("", 5L), input_path = rep("", 5L), stringsAsFactors = FALSE, check.names = FALSE)
+      scrna_manifest_state(rbind(df, extra[, names(df), drop = FALSE]))
+      return()
+    }
     df <- apply_design_form_values(design_state(), reactiveValuesToList(input))
     metadata <- unique(c(metadata_cols_from_input(), setdiff(names(df), c("include", "sample", "filename", "status"))))
     extra <- blank_design_matrix_rows(metadata, rows = 5)
@@ -11598,6 +11700,8 @@ server <- function(input, output, session) {
 
   observeEvent(current_project(), {
     p <- current_project()
+    updateActionButton(session, "save_design", label = if (is_scrna_project(p)) "Save single-cell manifest" else "Save design_matrix.txt")
+    scrna_manifest_state(if (is_scrna_project(p)) scrna_manifest(p) else data.frame())
     df <- design_editor_from_project(p, default_metadata_cols(p))
     if (is_cutrun_project(p)) df <- infer_cutrun_metadata(df)
     design_state(df)
@@ -11616,9 +11720,9 @@ server <- function(input, output, session) {
   output$design_editor_ui <- renderUI({
     if (is_scrna_project(current_project())) {
       return(tagList(
-        div(class = "read-source-note", tags$strong("Single-cell sample manifest"), tags$p("This manifest is copied into the project when it is created. It preserves the input paths plus optional condition, donor, and batch columns used by the workflow.")),
+        div(class = "read-source-note", tags$strong("Single-cell sample manifest"), tags$p("This project-local copy preserves input paths plus optional condition, donor, and batch columns. Edit cells directly, then save before running.")),
         table_output("scrna_manifest_table"),
-        tags$p(class = "muted small-note", "To change input paths or metadata, update the source manifest and create a new project so completed results remain reproducible.")
+        tags$p(class = "muted small-note", "The original source manifest is never modified. Inputs must remain readable absolute server paths; completed results retain the saved manifest used for that run.")
       ))
     }
     df <- design_state()
@@ -11632,9 +11736,9 @@ server <- function(input, output, session) {
     design_form_table_ui(design_state())
   })
   output$scrna_manifest_table <- render_csl_table({
-    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
-    scrna_manifest(p)
-  }, page_length = 100)
+    if (!is_scrna_project(current_project())) return(data.frame())
+    scrna_manifest_state()
+  }, page_length = 100, editable = TRUE)
 
   apply_design_cell_edit <- function(info) {
     df <- design_state()
@@ -11658,7 +11762,36 @@ server <- function(input, output, session) {
     apply_design_cell_edit(input$design_table_cell_edit)
   }, ignoreInit = TRUE)
 
+  observeEvent(input$scrna_manifest_table_cell_edit, {
+    df <- scrna_manifest_state()
+    info <- input$scrna_manifest_table_cell_edit
+    if (!NROW(df) || is.null(info$row) || is.null(info$col)) return()
+    row <- as.integer(info$row)
+    col <- as.integer(info$col) + 1L
+    if (is.na(row) || is.na(col) || row < 1L || row > NROW(df) || col < 1L || col > NCOL(df)) return()
+    df[[col]][row] <- as.character(info$value %||% "")
+    scrna_manifest_state(df)
+  }, ignoreInit = TRUE)
+
   save_design_state <- function(p, is_new = FALSE) {
+    if (is_scrna_project(p)) {
+      if (isTRUE(p$external_results)) stop("This completed-results project is read-only. Its original input manifest was not modified.")
+      manifest <- validate_scrna_manifest(scrna_manifest_state())
+      path <- p$scrna_input_manifest %||% p$design_matrix_path
+      if (!nzchar(path)) path <- file.path(p$data_dir, "manifest", "design_matrix.txt")
+      dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+      utils::write.table(manifest, path, sep = "\t", row.names = FALSE, quote = FALSE)
+      p$scrna_input_manifest <- path
+      p$design_matrix_path <- path
+      cfg <- write_project_config(p)
+      refreshed <- discover_projects()
+      projects(refreshed)
+      write_last_project_id(p$id)
+      updateSelectInput(session, "project_id", choices = project_select_choices(refreshed, p$analysis), selected = p$id)
+      scrna_manifest_state(manifest)
+      safe_refresh_progress_now("single-cell manifest saved")
+      return(paste("Saved project-local single-cell manifest:", path, "\nUpdated project file:", cfg))
+    }
     df <- apply_design_form_values(design_state(), reactiveValuesToList(input))
     metadata <- unique(c(
       metadata_cols_from_input(),
@@ -11688,10 +11821,6 @@ server <- function(input, output, session) {
   output$design_save_status <- renderText("")
   observeEvent(input$save_design, {
     p <- current_project()
-    if (is_scrna_project(p)) {
-      output$design_save_status <- renderText("The scRNA input manifest is fixed when the project is created so completed runs remain reproducible. Create a new project after changing its source manifest.")
-      return()
-    }
     if (isTRUE(p$external_results)) {
       output$design_save_status <- renderText("This completed-results project is read-only. Its original design matrix was not modified.")
       return()
@@ -11819,8 +11948,7 @@ server <- function(input, output, session) {
           "Run QC, filtering, normalization, integration when multiple samples are present, PCA/neighbors/UMAP/clustering, annotation, and cluster markers as one reproducible SLURM job.",
           tagList(
             selectInput("scrna_run_engine", "Processing engine", choices = c("Automatic (Seurat for .rds/10x; Scanpy for .h5ad)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
-            selectInput("scrna_normalization", "Normalization", choices = c("Automatic best-practice default" = "auto", "SCTransform v2 (Seurat)" = "sct", "LogNormalize/log1p" = "lognormalize"), selected = selected_choice(input$scrna_normalization, c("auto", "sct", "lognormalize"), "auto"), selectize = FALSE),
-            selectInput("scrna_integration", "Integration", choices = c("Automatic (RPCA for multi-sample Seurat; scVI for multi-sample Scanpy)" = "auto", "None" = "none", "RPCA (Seurat)" = "rpca", "CCA (Seurat)" = "cca", "scVI (Scanpy)" = "scvi", "Harmony (Scanpy)" = "harmony"), selected = selected_choice(input$scrna_integration, c("auto", "none", "rpca", "cca", "scvi", "harmony"), "auto"), selectize = FALSE),
+            uiOutput("scrna_engine_settings_ui"),
             textInput("scrna_batch_column", "Batch metadata column", value = input$scrna_batch_column %||% "batch"),
             numericInput("scrna_min_features", "Minimum detected genes per cell", value = input$scrna_min_features %||% 200, min = 0, step = 25),
             numericInput("scrna_min_counts", "Minimum UMIs/counts per cell", value = input$scrna_min_counts %||% 0, min = 0, step = 100),
@@ -12070,6 +12198,31 @@ server <- function(input, output, session) {
         "run_kallisto", "Submit Kallisto")
     )
     })
+  })
+
+  output$scrna_engine_settings_ui <- renderUI({
+    p <- current_project()
+    if (!is_scrna_project(p)) return(NULL)
+    requested <- tolower(input$scrna_run_engine %||% p$scrna_engine %||% "auto")
+    resolved <- tryCatch(scrna_engine_for_manifest(p, requested), error = function(e) "")
+    # Before a valid manifest is available, retain neutral choices. Once it is
+    # readable, expose only settings that the chosen engine can actually run.
+    engine <- if (resolved %in% c("seurat", "scanpy")) resolved else requested
+    if (!engine %in% c("seurat", "scanpy")) engine <- "seurat"
+    if (identical(engine, "seurat")) {
+      normalization_choices <- c("Automatic best-practice default" = "auto", "SCTransform v2" = "sct", "LogNormalize" = "lognormalize")
+      integration_choices <- c("Automatic (RPCA for multi-sample data)" = "auto", "None" = "none", "RPCA" = "rpca", "CCA" = "cca")
+      doublet_choices <- c("Automatic (scDblFinder)" = "auto", "No doublet detection/removal" = "none", "scDblFinder" = "scdblfinder")
+    } else {
+      normalization_choices <- c("Automatic best-practice default" = "auto", "LogNormalize/log1p" = "lognormalize")
+      integration_choices <- c("Automatic (scVI for multi-sample data)" = "auto", "None" = "none", "scVI" = "scvi", "Harmony" = "harmony")
+      doublet_choices <- c("Automatic (Scrublet)" = "auto", "No doublet detection/removal" = "none", "Scrublet" = "scrublet")
+    }
+    tagList(
+      selectInput("scrna_normalization", "Normalization", choices = normalization_choices, selected = selected_choice(input$scrna_normalization, unname(normalization_choices), "auto"), selectize = FALSE),
+      selectInput("scrna_integration", "Integration", choices = integration_choices, selected = selected_choice(input$scrna_integration, unname(integration_choices), "auto"), selectize = FALSE),
+      selectInput("scrna_doublet_method", "Doublet detection", choices = doublet_choices, selected = selected_choice(input$scrna_doublet_method, unname(doublet_choices), "auto"), selectize = FALSE)
+    )
   })
 
   output$cutrun_diffbind_reference_ui <- renderUI({
@@ -12983,6 +13136,10 @@ server <- function(input, output, session) {
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "doublet_summary_by_sample.tsv"), 10000)
   }, page_length = 50)
+  output$scrna_doublet_calls <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    safe_read_table(file.path(scrna_output_dir(p), "tables", "doublet_calls.tsv"), 10000)
+  }, page_length = 100)
   output$scrna_pca_variance <- render_csl_table({
     p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
     safe_read_table(file.path(scrna_output_dir(p), "tables", "pca_variance_explained.tsv"), 1000)
@@ -13047,6 +13204,18 @@ server <- function(input, output, session) {
     if (!is_scrna_project(p) || !nzchar(path)) return(data.frame())
     safe_read_result_table(path, 10000)
   }, page_length = 100)
+  output$download_scrna_file <- downloadHandler(
+    filename = function() {
+      path <- validated_project_result_path(current_project(), input$scrna_file)
+      if (nzchar(path)) basename(path) else "codespring_scRNA_result"
+    },
+    content = function(file) {
+      p <- current_project()
+      path <- validated_project_result_path(p, input$scrna_file)
+      validate(need(is_scrna_project(p) && nzchar(path) && file.exists(path), "Choose a completed scRNA result file first."))
+      file.copy(path, file, overwrite = TRUE)
+    }
+  )
   output$design_table <- render_csl_table({
     df <- design_state()
     if (!NROW(df)) return(data.frame())
