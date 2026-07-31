@@ -1596,6 +1596,25 @@ read_uploaded_table <- function(path) {
   )
 }
 
+copy_uploaded_project_file <- function(upload, destination_dir, label, extensions = character(0)) {
+  if (is.null(upload) || !NROW(upload) || !nzchar(upload$datapath[[1]]) || !file.exists(upload$datapath[[1]])) {
+    stop("Choose a ", label, " from your laptop.")
+  }
+  original_name <- basename(as.character(upload$name[[1]] %||% ""))
+  extension <- tolower(tools::file_ext(original_name))
+  if (length(extensions) && !extension %in% tolower(extensions)) {
+    stop(label, " must use one of these file extensions: ", paste0(".", extensions, collapse = ", "), ".")
+  }
+  stem <- clean_name(tools::file_path_sans_ext(original_name), "uploaded_file")
+  destination_name <- paste0(stem, if (nzchar(extension)) paste0(".", extension) else "")
+  dir.create(destination_dir, recursive = TRUE, showWarnings = FALSE)
+  destination <- file.path(destination_dir, destination_name)
+  if (!isTRUE(file.copy(upload$datapath[[1]], destination, overwrite = TRUE))) {
+    stop("Could not copy the uploaded ", label, " into the project results folder.")
+  }
+  normalizePath(destination, winslash = "/", mustWork = TRUE)
+}
+
 standardize_uploaded_count_matrix <- function(path, output_path) {
   counts <- read_uploaded_table(path)
   if (NCOL(counts) < 3L) stop("The count matrix needs one gene column and at least two sample columns.")
@@ -8657,7 +8676,7 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
   requested
 }
 
-submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "") {
+submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "", marker_upload = NULL, celltype_upload = NULL, marker_source = "server", celltype_source = "server") {
   if (!is_scrna_project(project)) return(record_preflight_failure(project, "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
   manifest_path <- trimws(as.character(project$scrna_input_manifest %||% project$design_matrix_path %||% ""))
   if (!nzchar(manifest_path)) return(record_preflight_failure(project, "scRNA processing", "This project has no saved single-cell input manifest. Save the manifest before submitting.", "scrna"))
@@ -8697,6 +8716,12 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   }
   marker_file <- trimws(as.character(marker_file %||% ""))
   celltype_file <- trimws(as.character(celltype_file %||% ""))
+  if (identical(marker_source, "upload")) {
+    marker_file <- copy_uploaded_project_file(marker_upload, file.path(project$data_dir, "uploads", "annotations", "markers"), "marker list", c("tsv", "txt"))
+  }
+  if (identical(celltype_source, "upload")) {
+    celltype_file <- copy_uploaded_project_file(celltype_upload, file.path(project$data_dir, "uploads", "annotations", "celltype_mappings"), "cell-to-cell-type mapping", c("tsv", "txt"))
+  }
   annotation_files <- c("Marker list" = marker_file, "Cell-to-cell-type mapping" = celltype_file)
   for (label in names(annotation_files)) {
     path <- path.expand(annotation_files[[label]])
@@ -11395,13 +11420,26 @@ server <- function(input, output, session) {
             tags$strong("Data and output locations"),
             tags$p("Start from a Seurat .rds object, Scanpy .h5ad object, or filtered 10x matrix folder. For multiple samples, provide a manifest now or add/edit rows in the in-app manifest after creating the project."),
             tags$p("All heavy processing is submitted to SLURM. The app remains responsive and shows the workflow as In progress while the HPC job runs.")),
-        div(class = "new-project-path-control",
-            textInput("new_scrna_input_path", "Data location", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x matrix folder"),
-            actionButton("browse_new_scrna_input_path", "Browse server", class = "btn-default")),
-        div(class = "new-project-path-control",
-            textInput("new_scrna_manifest_path", "Multiple-sample manifest (optional .tsv)", value = "", placeholder = "Absolute server path to samples.tsv"),
-            actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default"),
-            tags$p(class = "muted small-note", "When supplied, the manifest takes precedence over Data location. It must contain sample_id and input_path columns.")),
+        radioButtons("new_scrna_input_source", "Data location", choices = c("Browse or paste a server path" = "server", "Upload one Seurat/Scanpy object from laptop" = "upload"), selected = "server", inline = TRUE),
+        conditionalPanel("input.new_scrna_input_source == 'server'",
+          div(class = "new-project-path-control",
+              textInput("new_scrna_input_path", "Server data path", value = "", placeholder = "Absolute server path to a .rds, .h5ad, or filtered 10x matrix folder"),
+              actionButton("browse_new_scrna_input_path", "Browse server", class = "btn-default"))
+        ),
+        conditionalPanel("input.new_scrna_input_source == 'upload'",
+          fileInput("new_scrna_input_upload", "Single-cell object from laptop", accept = c(".rds", ".h5ad")),
+          tags$p(class = "muted small-note", "The uploaded object is copied to data/uploads/inputs inside this project. For a filtered 10x matrix folder, use a server path or add its folder paths in the manifest." )
+        ),
+        radioButtons("new_scrna_manifest_source", "Multiple-sample manifest (optional)", choices = c("Browse or paste a server path" = "server", "Upload a manifest from laptop" = "upload"), selected = "server", inline = TRUE),
+        conditionalPanel("input.new_scrna_manifest_source == 'server'",
+          div(class = "new-project-path-control",
+              textInput("new_scrna_manifest_path", "Server manifest path", value = "", placeholder = "Absolute server path to samples.tsv"),
+              actionButton("browse_new_scrna_manifest_path", "Browse server", class = "btn-default"))
+        ),
+        conditionalPanel("input.new_scrna_manifest_source == 'upload'",
+          fileInput("new_scrna_manifest_upload", "Manifest from laptop", accept = c(".tsv", ".txt"))
+        ),
+        tags$p(class = "muted small-note", "When supplied, the manifest takes precedence over the single input. It must contain sample_id and input_path columns."),
         scrna_results_location_control,
         radioButtons("new_scrna_input_location_type", "Data type", choices = c("Seurat RDS or Scanpy H5AD file" = "file", "Filtered 10x matrix folder" = "dir"), selected = "file", inline = TRUE),
         selectInput("new_scrna_engine", "Processing engine", choices = c("Automatic from input type" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = "auto", selectize = FALSE),
@@ -11768,10 +11806,32 @@ server <- function(input, output, session) {
       example_design_copied <- ""
       counts_message <- ""
       if (is_scrna_project(p)) {
-        manifest <- scrna_manifest_from_setup(
-          p$scrna_input_manifest %||% "",
-          "",
+        input_source <- input$new_scrna_input_source %||% "server"
+        manifest_source_mode <- input$new_scrna_manifest_source %||% "server"
+        input_path <- if (identical(input_source, "upload")) {
+          copy_uploaded_project_file(
+            input$new_scrna_input_upload,
+            file.path(p$data_dir, "uploads", "inputs"),
+            "single-cell object",
+            c("rds", "h5ad")
+          )
+        } else {
           input$new_scrna_input_path %||% ""
+        }
+        manifest_source <- if (identical(manifest_source_mode, "upload")) {
+          copy_uploaded_project_file(
+            input$new_scrna_manifest_upload,
+            file.path(p$data_dir, "uploads", "manifests"),
+            "single-cell manifest",
+            c("tsv", "txt")
+          )
+        } else {
+          p$scrna_input_manifest %||% ""
+        }
+        manifest <- scrna_manifest_from_setup(
+          manifest_source,
+          "",
+          input_path
         )
         dir.create(dirname(p$design_matrix_path), recursive = TRUE, showWarnings = FALSE)
         utils::write.table(manifest, p$design_matrix_path, sep = "\t", row.names = FALSE, quote = FALSE)
@@ -12423,14 +12483,22 @@ server <- function(input, output, session) {
       tags$hr(),
       tags$h4("Cell-type annotation (optional)"),
       tags$p(class = "muted small-note", "Supply a marker list or a cell-to-cell-type mapping for this run. A cell mapping takes priority; otherwise, clusters remain the provisional annotation."),
-      div(class = "new-project-path-control",
-        textInput("scrna_marker_file", "Marker list", value = input$scrna_marker_file %||% "", placeholder = "Absolute server .tsv with cell_type and gene columns"),
-        actionButton("browse_scrna_marker_file", "Browse server", class = "btn-default")
+      radioButtons("scrna_marker_source", "Marker list source", choices = c("Browse or paste a server path" = "server", "Upload from laptop" = "upload"), selected = input$scrna_marker_source %||% "server", inline = TRUE),
+      conditionalPanel("input.scrna_marker_source == 'server'",
+        div(class = "new-project-path-control",
+          textInput("scrna_marker_file", "Marker list", value = input$scrna_marker_file %||% "", placeholder = "Absolute server .tsv with cell_type and gene columns"),
+          actionButton("browse_scrna_marker_file", "Browse server", class = "btn-default")
+        )
       ),
-      div(class = "new-project-path-control",
-        textInput("scrna_celltype_file", "Cell-to-cell-type mapping", value = input$scrna_celltype_file %||% "", placeholder = "Absolute server .tsv with cell/barcode and cell_type columns"),
-        actionButton("browse_scrna_celltype_file", "Browse server", class = "btn-default")
-      )
+      conditionalPanel("input.scrna_marker_source == 'upload'", fileInput("scrna_marker_upload", "Marker list from laptop", accept = c(".tsv", ".txt"))),
+      radioButtons("scrna_celltype_source", "Cell-to-cell-type mapping source", choices = c("Browse or paste a server path" = "server", "Upload from laptop" = "upload"), selected = input$scrna_celltype_source %||% "server", inline = TRUE),
+      conditionalPanel("input.scrna_celltype_source == 'server'",
+        div(class = "new-project-path-control",
+          textInput("scrna_celltype_file", "Cell-to-cell-type mapping", value = input$scrna_celltype_file %||% "", placeholder = "Absolute server .tsv with cell/barcode and cell_type columns"),
+          actionButton("browse_scrna_celltype_file", "Browse server", class = "btn-default")
+        )
+      ),
+      conditionalPanel("input.scrna_celltype_source == 'upload'", fileInput("scrna_celltype_upload", "Cell-to-cell-type mapping from laptop", accept = c(".tsv", ".txt")))
     )
   })
 
@@ -12887,7 +12955,11 @@ server <- function(input, output, session) {
         seed = input$scrna_seed %||% 1234,
         scvi_max_epochs = input$scrna_scvi_max_epochs %||% 400,
         marker_file = input$scrna_marker_file %||% "",
-        celltype_file = input$scrna_celltype_file %||% ""
+        celltype_file = input$scrna_celltype_file %||% "",
+        marker_upload = input$scrna_marker_upload,
+        celltype_upload = input$scrna_celltype_upload,
+        marker_source = input$scrna_marker_source %||% "server",
+        celltype_source = input$scrna_celltype_source %||% "server"
       ),
       "complete scRNA workflow"
     )
