@@ -8716,7 +8716,7 @@ scanpy_runtime_check <- function() {
     return(list(ready = FALSE, state = "Not installed", detail = "No managed Scanpy environment was found for this Unix user."))
   }
   check <- tryCatch(
-    system2(python, c("-c", shQuote("import anndata, scanpy, igraph, leidenalg, numpy, pandas, scipy")), stdout = TRUE, stderr = TRUE),
+    system2(python, c("-c", shQuote("import anndata, scanpy, igraph, leidenalg, numpy, pandas, scipy, scrublet, harmonypy")), stdout = TRUE, stderr = TRUE),
     error = function(e) structure(conditionMessage(e), status = 1L)
   )
   status <- attr(check, "status") %||% 0L
