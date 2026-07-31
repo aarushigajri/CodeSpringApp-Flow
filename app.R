@@ -496,7 +496,7 @@ results_explorer_tabs <- function(x) {
   switch(
     analysis_key(x),
     rna = c("Overview", "QC", "Counts", "Differential Expression", "Plots", "GSEA", "Files"),
-    scrna = c("Overview", "QC", "Preprocessing", "UMAP & Annotation", "Markers", "Files"),
+    scrna = c("Overview", "QC", "Preprocessing", "Explore Cells", "Markers", "Downloads"),
     atac = c("Overview", "QC", "Signal & Peaks", "Genome Browser", "Differential Accessibility", "Files"),
     cutrun = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files"),
     chip = c("Overview", "QC", "Signal & Peaks", "Differential Binding", "Files")
@@ -8612,6 +8612,18 @@ validate_scrna_manifest <- function(manifest, check_paths = TRUE) {
     unreadable <- input_paths[file.exists(input_paths) & file.access(input_paths, mode = 4) != 0]
     if (length(missing)) stop("Input path(s) do not exist, for example: ", missing[[1]])
     if (length(unreadable)) stop("The app cannot read input path(s), for example: ", unreadable[[1]])
+    invalid_files <- input_paths[!dir.exists(input_paths) & !grepl("\\.(rds|h5ad)$", input_paths, ignore.case = TRUE)]
+    if (length(invalid_files)) stop("Single-cell file inputs must be a Seurat .rds or Scanpy .h5ad file, for example: ", invalid_files[[1]])
+    tenx_dirs <- input_paths[dir.exists(input_paths)]
+    valid_10x <- vapply(tenx_dirs, function(path) {
+      present <- function(stems) any(file.exists(file.path(path, stems)))
+      present(c("matrix.mtx", "matrix.mtx.gz")) &&
+        present(c("features.tsv", "features.tsv.gz", "genes.tsv", "genes.tsv.gz")) &&
+        present(c("barcodes.tsv", "barcodes.tsv.gz"))
+    }, logical(1))
+    if (length(tenx_dirs) && any(!valid_10x)) {
+      stop("A filtered 10x input folder needs matrix.mtx(.gz), features.tsv/genes.tsv(.gz), and barcodes.tsv(.gz), for example: ", tenx_dirs[[which(!valid_10x)[[1]]]])
+    }
   }
   manifest$input_path <- input_paths
   manifest
@@ -8673,8 +8685,13 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
     doublet_rate = numeric_setting(doublet_rate, "Expected doublet rate", 0, 0.5)
   ), error = function(e) e)
   if (inherits(checked, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(checked), "scrna"))
+  integration <- tolower(integration %||% "auto")
+  allowed_integration <- if (identical(resolved_engine, "seurat")) c("auto", "none", "rpca", "cca") else c("auto", "none", "scvi", "harmony")
+  if (!integration %in% allowed_integration) integration <- "auto"
   batch_column <- trimws(as.character(batch_column %||% ""))
-  if (!nzchar(batch_column)) return(record_preflight_failure(project, "scRNA processing", "Batch metadata column cannot be blank. Use batch, a manifest metadata column, or choose integration = None.", "scrna"))
+  if (!nzchar(batch_column) && integration %in% setdiff(allowed_integration, c("auto", "none"))) {
+    return(record_preflight_failure(project, "scRNA processing", "A batch metadata column is required for explicitly requested integration. Choose a manifest column, or select Automatic/None integration.", "scrna"))
+  }
   runtime_executable <- trimws(as.character(runtime_executable %||% ""))
   if (!nzchar(runtime_executable)) runtime_executable <- trimws(as.character(project$scrna_runtime_executable %||% ""))
   runtime_executable <- path.expand(runtime_executable)
@@ -8692,9 +8709,6 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   if (!doublet_method %in% allowed_doublet) {
     return(record_preflight_failure(project, "scRNA processing", paste0("Doublet method '", doublet_method, "' is not compatible with the ", resolved_engine, " engine. Choose ", paste(allowed_doublet, collapse = ", "), "."), "scrna"))
   }
-  integration <- tolower(integration %||% "auto")
-  allowed_integration <- if (identical(resolved_engine, "seurat")) c("auto", "none", "rpca", "cca") else c("auto", "none", "scvi", "harmony")
-  if (!integration %in% allowed_integration) integration <- "auto"
   params <- data.frame(
     key = c("normalization", "integration", "batch_column", "cluster_resolution", "min_features", "min_counts", "max_percent_mt", "n_pcs", "min_cells_per_gene", "doublet_method", "doublet_rate", "remove_doublets", "marker_file", "celltype_file", "runtime_executable", "seed", "scvi_max_epochs"),
     value = as.character(c(normalization, integration, batch_column, checked$cluster_resolution, checked$min_features, checked$min_counts, checked$max_percent_mt, checked$n_pcs, 3, doublet_method, checked$doublet_rate, isTRUE(remove_doublets), project$scrna_marker_file %||% "", project$scrna_celltype_file %||% "", runtime_executable, 1234, 400)),
@@ -9727,27 +9741,34 @@ scrna_embedding_columns <- function(project) {
   strsplit(header[[1]], "\t", fixed = TRUE)[[1]]
 }
 
-scrna_embedding_table <- function(project, columns = character(0), max_points = 30000L) {
+scrna_embedding_table <- function(project, columns = character(0), max_points = 30000L, cells = character(0)) {
   path <- file.path(scrna_output_dir(project), "tables", "umap_coordinates.tsv")
   headers <- scrna_embedding_columns(project)
   required <- c("cell", "UMAP_1", "UMAP_2")
   if (!file.exists(path) || !all(required %in% headers)) return(data.frame())
   keep <- unique(c(required, intersect(as.character(columns %||% character(0)), headers)))
   info <- file.info(path)
+  requested_cells <- unique(as.character(cells %||% character(0)))
+  # Cell selections are deliberately uncached: a lasso selection is normally
+  # small and must return the exact selected cells rather than a sampled view.
+  use_cache <- !length(requested_cells)
   signature <- paste(normalizePath(path, winslash = "/", mustWork = TRUE), info$size[[1]], as.numeric(info$mtime[[1]]), paste(keep, collapse = "\r"), sep = "|")
-  if (exists(signature, envir = SCRNA_EMBEDDING_CACHE, inherits = FALSE)) return(get(signature, envir = SCRNA_EMBEDDING_CACHE, inherits = FALSE))
+  if (use_cache && exists(signature, envir = SCRNA_EMBEDDING_CACHE, inherits = FALSE)) return(get(signature, envir = SCRNA_EMBEDDING_CACHE, inherits = FALSE))
   classes <- stats::setNames(rep("NULL", length(headers)), headers)
   classes[keep] <- NA_character_
   x <- tryCatch(utils::read.delim(path, check.names = FALSE, stringsAsFactors = FALSE, colClasses = classes), error = function(e) data.frame())
   if (!NROW(x) || !all(required %in% names(x))) return(data.frame())
   x$UMAP_1 <- suppressWarnings(as.numeric(x$UMAP_1)); x$UMAP_2 <- suppressWarnings(as.numeric(x$UMAP_2))
   x <- x[is.finite(x$UMAP_1) & is.finite(x$UMAP_2), , drop = FALSE]
-  if (NROW(x) > max_points) {
+  if (length(requested_cells)) x <- x[x$cell %in% requested_cells, , drop = FALSE]
+  if (!length(requested_cells) && NROW(x) > max_points) {
     set.seed(1234L)
     x <- x[sample.int(NROW(x), max_points), , drop = FALSE]
   }
-  if (length(ls(SCRNA_EMBEDDING_CACHE, all.names = TRUE)) > 20L) rm(list = ls(SCRNA_EMBEDDING_CACHE, all.names = TRUE), envir = SCRNA_EMBEDDING_CACHE)
-  assign(signature, x, envir = SCRNA_EMBEDDING_CACHE)
+  if (use_cache) {
+    if (length(ls(SCRNA_EMBEDDING_CACHE, all.names = TRUE)) > 20L) rm(list = ls(SCRNA_EMBEDDING_CACHE, all.names = TRUE), envir = SCRNA_EMBEDDING_CACHE)
+    assign(signature, x, envir = SCRNA_EMBEDDING_CACHE)
+  }
   x
 }
 
@@ -9774,7 +9795,7 @@ scrna_results_explorer_ui <- function() {
     tabPanel("Overview", br(), h3("scRNA-seq Overview"), uiOutput("scrna_overview_ui"), br(), h4("Detected input processing"), table_output("scrna_input_processing"), br(), uiOutput("scrna_input_plot_ui"), br(), h4("Cells by cluster and annotation"), table_output("scrna_cluster_sizes")),
     tabPanel("QC", br(), h3("Quality Control"), uiOutput("scrna_qc_plot_ui"), br(), h4("QC summary by sample"), table_output("scrna_qc_summary"), br(), h4("Doublet calls by sample"), table_output("scrna_doublet_summary"), br(), h4("Individual doublet calls"), table_output("scrna_doublet_calls")),
     tabPanel("Preprocessing", br(), h3("Feature Selection and PCA"), h4("PCA variance explained"), table_output("scrna_pca_variance"), br(), h4("Highly variable genes"), table_output("scrna_hvg_table")),
-    tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
+    tabPanel("Explore Cells", br(), h3("Interactive Cell Explorer"), tags$p(class = "muted", "Color the UMAP by any saved cell-level annotation. Hover for cell identity and key metadata; large datasets are sampled only for browser rendering, while complete tables remain downloadable."), uiOutput("scrna_embedding_controls_ui"), uiOutput("scrna_embedding_widget_ui"), uiOutput("scrna_selected_cells_ui"), br(), tags$details(tags$summary("Publication-ready UMAP figures and cell metadata"), br(), uiOutput("scrna_umap_plot_ui"), br(), h4("Cell metadata preview"), tags$p(class = "muted small-note", "Previewing the first 5,000 cells. Download the complete metadata table from Downloads."), table_output("scrna_cell_metadata"))),
     tabPanel("Markers", br(), h3("Cluster Markers"), uiOutput("scrna_marker_score_ui"), table_output("scrna_marker_table")),
     tabPanel("Downloads", br(), h3("Completed Files"), tags$p(class = "muted", "Select a result to preview it in the app or download the original file."), uiOutput("scrna_file_ui"), uiOutput("scrna_file_view"), br(), downloadButton("download_scrna_file", "Download selected file", class = "btn-default"))
   )
@@ -13306,6 +13327,16 @@ server <- function(input, output, session) {
     if (!PLOTLY_AVAILABLE) return(div(class = "empty-box", "Interactive UMAP support is not installed on this app server yet. The publication-ready UMAP figures are available below."))
     plotly::plotlyOutput("scrna_embedding_plot", height = "700px")
   })
+  if (PLOTLY_AVAILABLE) output$scrna_selected_cells_ui <- renderUI({
+    p <- current_project(); if (!is_scrna_project(p)) return(NULL)
+    selected <- plotly::event_data("plotly_selected", source = "scrna_embedding")
+    if (is.null(selected) || !NROW(selected) || !"key" %in% names(selected)) {
+      return(tags$p(class = "muted small-note", "Use the lasso or box-select tool in the UMAP toolbar to inspect selected cells."))
+    }
+    tagList(br(), h4(paste0("Selected cells (", NROW(selected), ")")),
+            tags$p(class = "muted small-note", "The table shows up to 2,000 exact selections. Download the full metadata table for complete export."),
+            table_output("scrna_selected_cells"))
+  })
   if (PLOTLY_AVAILABLE) output$scrna_embedding_plot <- plotly::renderPlotly({
     p <- current_project()
     color_column <- input$scrna_embedding_color %||% "cell_type"
@@ -13318,19 +13349,20 @@ server <- function(input, output, session) {
     hover <- apply(x[, hover_columns, drop = FALSE], 1, function(row) paste(paste(names(row), row, sep = ": "), collapse = "<br>"))
     if (is.numeric(value) || is.integer(value)) {
       x$.codespring_color <- value
-      plot <- plotly::plot_ly(x, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers", color = ~.codespring_color, colors = "Viridis", text = hover, hoverinfo = "text", marker = list(size = 4, opacity = 0.72))
+      plot <- plotly::plot_ly(x, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", mode = "markers", source = "scrna_embedding", key = ~cell, color = ~.codespring_color, colors = "Viridis", text = hover, hoverinfo = "text", marker = list(size = 4, opacity = 0.72))
     } else {
       values <- as.character(value); values[is.na(values) | !nzchar(values)] <- "Unassigned"
       validate(need(length(unique(values)) <= 80L, paste0("‘", color_column, "’ has ", length(unique(values)), " distinct values and is not suitable for categorical coloring. Choose a sample, condition, cluster, or cell-type field instead.")))
       x$.codespring_color <- values
       groups <- split(x, x$.codespring_color, drop = TRUE)
-      plot <- plotly::plot_ly()
+      plot <- plotly::plot_ly(source = "scrna_embedding")
       for (label in names(groups)) {
         group <- groups[[label]]
         group_hover <- hover[match(group$cell, x$cell)]
-        plot <- plotly::add_markers(plot, data = group, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", name = label, text = group_hover, hoverinfo = "text", marker = list(size = 4, opacity = 0.72))
+        plot <- plotly::add_markers(plot, data = group, x = ~UMAP_1, y = ~UMAP_2, type = "scattergl", name = label, key = ~cell, text = group_hover, hoverinfo = "text", marker = list(size = 4, opacity = 0.72))
       }
     }
+    plot <- plotly::event_register(plot, "plotly_selected")
     plotly::layout(plot,
       xaxis = list(title = "UMAP 1", zeroline = FALSE),
       yaxis = list(title = "UMAP 2", zeroline = FALSE, scaleanchor = "x", scaleratio = 1),
@@ -13339,6 +13371,18 @@ server <- function(input, output, session) {
       margin = list(l = 55, r = 30, t = 25, b = 50)
     )
   })
+  if (PLOTLY_AVAILABLE) output$scrna_selected_cells <- render_csl_table({
+    p <- current_project(); if (!is_scrna_project(p)) return(data.frame())
+    selected <- plotly::event_data("plotly_selected", source = "scrna_embedding")
+    if (is.null(selected) || !NROW(selected) || !"key" %in% names(selected)) return(data.frame())
+    cells <- unique(as.character(selected$key))
+    cells <- cells[nzchar(cells)]
+    if (!length(cells)) return(data.frame())
+    cells <- utils::head(cells, 2000L)
+    x <- scrna_embedding_table(p, columns = c("sample_id", "condition", "batch", "cluster", "cell_type", "annotation_source"), cells = cells)
+    preferred <- intersect(c("cell", "sample_id", "condition", "batch", "cluster", "cell_type", "annotation_source", "UMAP_1", "UMAP_2"), names(x))
+    x[, preferred, drop = FALSE]
+  }, page_length = 50, scroll_y = "360px")
   output$scrna_marker_score_ui <- renderUI({
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
     path <- file.path(scrna_output_dir(p), "tables", "marker_annotation_cluster_scores.tsv")
