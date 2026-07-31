@@ -12602,7 +12602,7 @@ server <- function(input, output, session) {
     p <- current_project(); if (!is_scrna_project(p)) return(NULL)
     tagList(
       selectInput("scrna_run_engine", "Analysis engine", choices = c("Automatic (recommended)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
-      tags$p(class = "muted small-note", "Automatic uses Seurat for RDS or 10x inputs and Scanpy for H5AD. The inspection report tells you exactly what was detected.")
+      tags$p(class = "muted small-note", "Automatic uses Seurat for RDS or 10x inputs and Scanpy for H5AD. On first use, Scanpy creates one managed per-user runtime and later H5AD jobs reuse it. The inspection report tells you exactly what was detected.")
     )
   })
 
