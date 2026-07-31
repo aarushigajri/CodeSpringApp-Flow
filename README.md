@@ -93,8 +93,10 @@ manifests remain supported.
 Choose the **Results root** in project setup; the app writes the processed
 object, figures, tables, logs, and job temporary storage under
 `<results_root>/<project_name>/data/scrna/`. Source objects and matrices are
-never changed. All computational scRNA steps run as a single SLURM job, so the
-app shows **Active** while the job runs and remains responsive for other work.
+never changed. Input inspection, QC/doublets, normalization/PCA,
+integration/clustering, and annotation/markers each run as their own SLURM
+job. Each successful stage writes a checkpoint, so later stages resume from
+the appropriate saved state rather than repeating earlier work.
 
 The selected engine is explicit: Seurat for RDS/10x and Scanpy for H5AD/10x.
 The job wrapper loads and checks the relevant cluster runtime only on the

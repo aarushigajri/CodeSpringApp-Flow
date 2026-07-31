@@ -3108,34 +3108,39 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
   if (is.null(active_states)) active_states <- active_job_state_map_from_jobs(jobs)
   if (is_scrna_project(project)) {
     out_dir <- file.path(data_dir, "scrna")
-    scrna_status <- "Not started"
-    if (file.exists(file.path(out_dir, "_COMPLETE"))) {
-      scrna_status <- "Complete"
+    stages <- scrna_pipeline_order()
+    stage_keys <- c("inspect", "qc", "preprocess", "cluster", "annotate")
+    marker <- file.path(out_dir, paste0("_STAGE_", toupper(stage_keys), "_COMPLETE"))
+    detected <- safe_read_table(file.path(out_dir, "tables", "input_processing_detected.tsv"), 10000)
+    detected_any <- function(column) {
+      column %in% names(detected) && any(tolower(trimws(as.character(detected[[column]]))) %in% c("true", "t", "yes", "y", "1"), na.rm = TRUE)
     }
-    scrna_jobs <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) {
-      jobs[canonical_job_step(jobs$step) == "scRNA processing", , drop = FALSE]
-    } else data.frame()
-    if (NROW(scrna_jobs)) {
-      latest_state <- toupper(trimws(as.character(tail(scrna_jobs$slurm_state, 1))))
-      if (latest_state %in% toupper(active_slurm_states())) {
-        scrna_status <- "Active"
-      } else if (latest_state %in% c("FAILED", "CANCELLED", "CANCELLED+", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL")) {
-        scrna_status <- if (grepl("CANCELLED", latest_state, fixed = TRUE)) "Cancelled" else "Likely failed"
-      } else if (identical(latest_state, "COMPLETED") && !file.exists(file.path(out_dir, "_COMPLETE"))) {
-        # A successful scheduler allocation without the workflow completion marker
-        # means that the workflow itself stopped before its final validation step.
-        scrna_status <- "Likely failed"
+    source_details <- c(
+      if (NROW(detected)) "Source object state detected" else "Inspect the source object on HPC",
+      if (NROW(detected)) "QC is rerun from raw counts for a reproducible checkpoint" else "",
+      if (detected_any("pca_detected")) "PCA detected in the source object; CodeSpring will create its own checkpoint" else "",
+      if (detected_any("umap_detected") || detected_any("clusters_detected")) "UMAP/clusters detected in the source object; CodeSpring will create its own checkpoint" else "",
+      if ("annotation_columns_detected" %in% names(detected) && any(nzchar(trimws(as.character(detected$annotation_columns_detected))), na.rm = TRUE)) "Existing annotation field detected and available for retention" else ""
+    )
+    status_one <- function(step, marker_path) {
+      complete <- file.exists(marker_path) || (identical(step, "Annotate & markers") && file.exists(file.path(out_dir, "_COMPLETE")))
+      hit <- if (NROW(jobs) && all(c("step", "slurm_state") %in% names(jobs))) jobs[canonical_job_step(jobs$step) == canonical_job_step(step), , drop = FALSE] else data.frame()
+      if (NROW(hit)) {
+        latest <- toupper(trimws(as.character(tail(hit$slurm_state, 1))))
+        if (latest %in% toupper(active_slurm_states())) return("Active")
+        if (latest %in% c("FAILED", "CANCELLED", "CANCELLED+", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL")) return(if (grepl("CANCELLED", latest, fixed = TRUE)) "Cancelled" else "Likely failed")
       }
+      if (complete) "Complete" else "Not started"
     }
     raw <- data.frame(
-      step = c("Input manifest", "scRNA processing"),
-      status = c(if (file.exists(design)) "Complete" else "Not started", scrna_status),
-      path = c(design, out_dir),
-      input = c("", project$scrna_engine %||% "auto"),
-      detail = c("", ""),
+      step = stages,
+      status = mapply(status_one, stages, marker, USE.NAMES = FALSE),
+      path = c(file.path(out_dir, "tables", "input_processing_detected.tsv"), file.path(out_dir, "tables", "qc_summary_by_sample.tsv"), file.path(out_dir, "tables", "pca_variance_explained.tsv"), file.path(out_dir, "checkpoints"), file.path(out_dir, "objects")),
+      input = c(project$scrna_engine %||% "auto", "", "", "", ""),
+      detail = source_details,
       stringsAsFactors = FALSE
     )
-    if ("scRNA processing" %in% names(active_states)) raw$status[raw$step == "scRNA processing"] <- "Active"
+    raw$status[raw$step %in% names(active_states)] <- "Active"
     raw$status <- normalize_pipeline_status(raw$status)
     return(raw)
   }
@@ -3372,12 +3377,24 @@ chip_pipeline_order <- function() {
   c("Design matrix", "Cutadapt", "FastQC", "Bowtie2", "MACS2 Peaks", "Differential Peaks", "Peak Annotation")
 }
 
+scrna_pipeline_order <- function() {
+  c("Input inspection", "QC & doublets", "Normalize & PCA", "Integrate & cluster", "Annotate & markers")
+}
+
+scrna_stage_step <- function(stage = "inspect") {
+  stage <- tolower(trimws(as.character(stage %||% "inspect")))
+  labels <- c(inspect = "Input inspection", qc = "QC & doublets", preprocess = "Normalize & PCA", cluster = "Integrate & cluster", annotate = "Annotate & markers")
+  value <- unname(labels[[stage]])
+  if (is.null(value) || !nzchar(value)) stop("Unknown scRNA stage: ", stage)
+  value
+}
+
 all_pipeline_steps <- function() {
-  unique(c(rna_pipeline_order(), c("Input manifest", "scRNA processing"), cutrun_pipeline_order(), atac_pipeline_order(), chip_pipeline_order()))
+  unique(c(rna_pipeline_order(), scrna_pipeline_order(), cutrun_pipeline_order(), atac_pipeline_order(), chip_pipeline_order()))
 }
 
 pipeline_order <- function(project = NULL) {
-  if (!is.null(project) && is_scrna_project(project)) return(c("Input manifest", "scRNA processing"))
+  if (!is.null(project) && is_scrna_project(project)) return(scrna_pipeline_order())
   if (!is.null(project) && is_cutrun_project(project)) return(cutrun_pipeline_order())
   if (!is.null(project) && is_atac_project(project)) return(atac_pipeline_order())
   if (!is.null(project) && is_chip_project(project)) return(chip_pipeline_order())
@@ -8689,14 +8706,17 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
   requested
 }
 
-submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "", marker_upload = NULL, celltype_upload = NULL, marker_source = "server", celltype_source = "server") {
-  if (!is_scrna_project(project)) return(record_preflight_failure(project, "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
+submit_scrna_pipeline_job <- function(project, stage = "inspect", engine = "auto", normalization = "auto", integration = "auto", batch_column = "batch", cluster_resolution = 0.6, min_features = 200, min_counts = 0, max_features = 0, max_percent_mt = 20, min_cells_per_gene = 3, n_pcs = 30, doublet_method = "auto", doublet_rate = 0.05, remove_doublets = TRUE, seed = 1234, scvi_max_epochs = 400, marker_file = "", celltype_file = "", marker_upload = NULL, celltype_upload = NULL, marker_source = "server", celltype_source = "server") {
+  stage <- tolower(trimws(as.character(stage %||% "inspect")))
+  step_label <- tryCatch(scrna_stage_step(stage), error = function(e) "")
+  if (!is_scrna_project(project)) return(record_preflight_failure(project, step_label %||% "scRNA processing", "This is not an scRNA-seq project.", "scrna"))
+  if (!nzchar(step_label)) return(record_preflight_failure(project, "scRNA processing", "Choose a valid single-cell pipeline stage.", "scrna"))
   manifest_path <- trimws(as.character(project$scrna_input_manifest %||% project$design_matrix_path %||% ""))
-  if (!nzchar(manifest_path)) return(record_preflight_failure(project, "scRNA processing", "This project has no saved single-cell input manifest. Save the manifest before submitting.", "scrna"))
+  if (!nzchar(manifest_path)) return(record_preflight_failure(project, step_label, "This project has no saved single-cell input record. Re-select the input object, then try again.", "scrna"))
   manifest <- tryCatch(validate_scrna_manifest(scrna_manifest(project)), error = function(e) e)
-  if (inherits(manifest, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(manifest), "scrna"))
+  if (inherits(manifest, "error")) return(record_preflight_failure(project, step_label, conditionMessage(manifest), "scrna"))
   resolved_engine <- tryCatch(scrna_engine_for_manifest(project, engine), error = function(e) e)
-  if (inherits(resolved_engine, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(resolved_engine), "scrna"))
+  if (inherits(resolved_engine, "error")) return(record_preflight_failure(project, step_label, conditionMessage(resolved_engine), "scrna"))
   numeric_setting <- function(value, label, minimum, maximum = Inf, integer = FALSE) {
     parsed <- suppressWarnings(as.numeric(value))
     if (length(parsed) != 1L || is.na(parsed) || parsed < minimum || parsed > maximum || (isTRUE(integer) && parsed != round(parsed))) {
@@ -8716,16 +8736,16 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
     seed = numeric_setting(seed, "Random seed", 1, .Machine$integer.max, TRUE),
     scvi_max_epochs = numeric_setting(scvi_max_epochs, "Maximum scVI epochs", 10, 5000, TRUE)
   ), error = function(e) e)
-  if (inherits(checked, "error")) return(record_preflight_failure(project, "scRNA processing", conditionMessage(checked), "scrna"))
+  if (inherits(checked, "error")) return(record_preflight_failure(project, step_label, conditionMessage(checked), "scrna"))
   if (checked$max_features > 0 && checked$max_features <= checked$min_features) {
-    return(record_preflight_failure(project, "scRNA processing", "Maximum detected genes must be greater than minimum detected genes, or set it to 0 to disable the upper feature filter.", "scrna"))
+    return(record_preflight_failure(project, step_label, "Maximum detected genes must be greater than minimum detected genes, or set it to 0 to disable the upper feature filter.", "scrna"))
   }
   integration <- tolower(integration %||% "auto")
   allowed_integration <- if (identical(resolved_engine, "seurat")) c("auto", "none", "rpca", "cca") else c("auto", "none", "scvi", "harmony")
   if (!integration %in% allowed_integration) integration <- "auto"
   batch_column <- trimws(as.character(batch_column %||% ""))
-  if (!nzchar(batch_column) && integration %in% setdiff(allowed_integration, c("auto", "none"))) {
-    return(record_preflight_failure(project, "scRNA processing", "A batch metadata column is required for explicitly requested integration. Choose a manifest column, or select Automatic/None integration.", "scrna"))
+  if (identical(stage, "cluster") && !nzchar(batch_column) && integration %in% setdiff(allowed_integration, c("auto", "none"))) {
+    return(record_preflight_failure(project, step_label, "A batch metadata column is required for explicitly requested integration. Choose a manifest column, or select Automatic/None integration.", "scrna"))
   }
   marker_file <- trimws(as.character(marker_file %||% ""))
   celltype_file <- trimws(as.character(celltype_file %||% ""))
@@ -8739,7 +8759,7 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   for (label in names(annotation_files)) {
     path <- path.expand(annotation_files[[label]])
     if (nzchar(path) && (!startsWith(path, "/") || !file.exists(path) || dir.exists(path) || file.access(path, mode = 4) != 0)) {
-      return(record_preflight_failure(project, "scRNA processing", paste0(label, " must be a readable absolute server file: ", annotation_files[[label]]), "scrna"))
+      return(record_preflight_failure(project, step_label, paste0(label, " must be a readable absolute server file: ", annotation_files[[label]]), "scrna"))
     }
   }
   out_dir <- file.path(project$data_dir, "scrna")
@@ -8764,8 +8784,11 @@ submit_scrna_pipeline_job <- function(project, engine = "auto", normalization = 
   utils::write.table(params, params_path, sep = "\t", row.names = FALSE, quote = FALSE)
   qsub <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "qsub_scrna_pipeline.sh")
   runner <- file.path(SCRIPTS_DIR, "singleCellRNAseq", "scrna_pipeline.sh")
-  if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, "scRNA processing", "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna"))
-  submit_sbatch(project, "scRNA processing", qsub, c(runner, resolved_engine, manifest_path, out_dir, params_path), "scrna_pipeline", paste(resolved_engine, normalization, integration), target = file.path(out_dir, "_COMPLETE"), reference = resolved_engine)
+  if (!file.exists(qsub) || !file.exists(runner)) return(record_preflight_failure(project, step_label, "CodeSpringLab single-cell runner scripts were not found. Update CodeSpringLab, then try again.", "scrna"))
+  prior <- c(qc = "inspect", preprocess = "qc", cluster = "preprocess", annotate = "cluster")[[stage]] %||% ""
+  prior_marker <- if (nzchar(prior)) file.path(out_dir, paste0("_STAGE_", toupper(prior), "_COMPLETE")) else ""
+  if (nzchar(prior_marker) && !file.exists(prior_marker)) return(record_preflight_failure(project, step_label, paste0("Complete ", scrna_stage_step(prior), " before submitting this stage."), "scrna"))
+  submit_sbatch(project, step_label, qsub, c(runner, resolved_engine, manifest_path, out_dir, params_path, stage), "scrna_pipeline", paste(stage, resolved_engine, normalization, integration), target = file.path(out_dir, paste0("_STAGE_", toupper(stage), "_COMPLETE")), reference = resolved_engine)
 }
 
 submit_star_jobs <- function(project, trimmed = FALSE, samples = NULL) {
@@ -9366,8 +9389,11 @@ run_step_meta <- function(project = NULL) {
   steps <- pipeline_order(project)
   descriptions <- if (!is.null(project) && is_scrna_project(project)) {
     c(
-      "Review the saved single-cell input manifest and optional sample metadata.",
-      "Run QC, doublet handling, feature selection, normalization, integration when applicable, clustering, annotation, and marker discovery."
+      "Inspect the supplied object or matrix and record detected counts, reductions, clusters, and annotations.",
+      "Filter cells and genes, calculate QC metrics, and detect/remove doublets while preserving raw counts.",
+      "Normalize, select highly variable genes, scale, and calculate PCA from the QC-passed checkpoint.",
+      "Apply optional technical-batch integration, then calculate neighbours, UMAP, and clusters.",
+      "Apply supplied or existing annotations, calculate cluster markers, and write the final portable object and tables."
     )
   } else if (!is.null(project) && isTRUE(project$counts_only)) {
     c(
@@ -12241,7 +12267,7 @@ server <- function(input, output, session) {
     p <- current_project()
     if (is_scrna_project(p)) {
       return(div(class = "resource-strip",
-        div(class = "resource-card", tags$strong("Single-cell workflow"), tags$p(class = "muted", "Raw counts are preserved; QC, normalization, integration, clustering, annotation, and markers run together.")),
+        div(class = "resource-card", tags$strong("Single-cell workflow"), tags$p(class = "muted", "Each stage runs as its own SLURM job and saves a checkpoint. Existing object state is detected during Input inspection.")),
         div(class = "resource-card", tags$strong("Input"), tags$p(class = "muted status-path", p$scrna_input_manifest %||% p$design_matrix_path))
       ))
     }
@@ -12279,11 +12305,10 @@ server <- function(input, output, session) {
     r2_choices <- adapter_choices_r2()
     adapter_defaults <- default_adapter_pair(p)
     if (is_scrna_project(p)) {
-      return(div(class = "run-grid",
-        tool_panel(
-          "scRNA processing", status,
-          "Run QC, filtering, normalization, integration when multiple samples are present, PCA/neighbors/UMAP/clustering, annotation, and cluster markers as one reproducible SLURM job.",
-          tagList(
+      settings <- div(class = "tool-panel",
+        tags$h4("Single-cell settings"),
+        tags$p(class = "muted", "Choose settings once, then run one stage at a time. Each completed stage saves a checkpoint for the next."),
+        tagList(
             selectInput("scrna_run_engine", "Processing engine", choices = c("Automatic (Seurat for .rds/10x; Scanpy for .h5ad)" = "auto", "Seurat" = "seurat", "Scanpy" = "scanpy"), selected = selected_choice(input$scrna_run_engine, c("auto", "seurat", "scanpy"), p$scrna_engine %||% "auto"), selectize = FALSE),
             uiOutput("scrna_engine_settings_ui"),
             uiOutput("scrna_batch_column_ui"),
@@ -12296,10 +12321,15 @@ server <- function(input, output, session) {
             numericInput("scrna_cluster_resolution", "Clustering resolution", value = input$scrna_cluster_resolution %||% 0.6, min = 0.05, max = 5, step = 0.05),
             uiOutput("scrna_advanced_settings_ui"),
             tags$p(class = "muted small-note", "Doublet calls are recorded before removal. Seurat doublet removal uses scDblFinder; Scanpy uses Scrublet. Automatic integration runs only when the selected batch metadata column has multiple values, so condition-only sample sets are not automatically batch-corrected. Seurat objects use Seurat; AnnData .h5ad objects use Scanpy.")
-          ),
-          "run_scrna_pipeline", "Submit complete scRNA workflow", show_sample_progress = FALSE
-        )
-      ))
+          )
+      )
+      return(tagList(settings, div(class = "run-grid",
+        tool_panel("Input inspection", status, "Read the source object on the compute node and detect raw counts, prior normalization, PCA/UMAP, clusters, and existing annotations.", tags$p(class = "muted small-note", "This does not change your input object."), "run_scrna_inspect", "Inspect input", show_sample_progress = FALSE),
+        tool_panel("QC & doublets", status, "Apply the selected QC thresholds and doublet handling to the raw-count checkpoint.", tags$p(class = "muted small-note", "Requires Input inspection."), "run_scrna_qc", "Run QC & doublets", show_sample_progress = FALSE),
+        tool_panel("Normalize & PCA", status, "Normalize retained cells, identify variable genes, scale, and calculate PCA.", tags$p(class = "muted small-note", "Requires QC & doublets."), "run_scrna_preprocess", "Run normalization & PCA", show_sample_progress = FALSE),
+        tool_panel("Integrate & cluster", status, "Use the selected technical-batch method when applicable, then calculate neighbours, UMAP, and clusters.", tags$p(class = "muted small-note", "Requires Normalize & PCA."), "run_scrna_cluster", "Run integration & clustering", show_sample_progress = FALSE),
+        tool_panel("Annotate & markers", status, "Apply a supplied/existing annotation and write marker tables, final UMAPs, and the portable processed object.", tags$p(class = "muted small-note", "Requires Integrate & cluster."), "run_scrna_annotate", "Run annotation & markers", show_sample_progress = FALSE)
+      )))
     }
     if (is_chip_project(p)) {
       return(div(class = "run-grid",
@@ -13012,12 +13042,14 @@ server <- function(input, output, session) {
     })
   }
 
-  observeEvent(input$run_scrna_pipeline, {
+  submit_scrna_stage <- function(stage) {
     p <- current_project()
+    label <- scrna_stage_step(stage)
     run_submission(
-      "scRNA processing",
+      label,
       submit_scrna_pipeline_job(
         p,
+        stage = stage,
         engine = input$scrna_run_engine %||% "auto",
         normalization = input$scrna_normalization %||% "auto",
         integration = input$scrna_integration %||% "auto",
@@ -13041,9 +13073,14 @@ server <- function(input, output, session) {
         marker_source = input$scrna_marker_source %||% "server",
         celltype_source = input$scrna_celltype_source %||% "server"
       ),
-      "complete scRNA workflow"
+      paste("single-cell", tolower(label))
     )
-  })
+  }
+  observeEvent(input$run_scrna_inspect, submit_scrna_stage("inspect"), ignoreInit = TRUE)
+  observeEvent(input$run_scrna_qc, submit_scrna_stage("qc"), ignoreInit = TRUE)
+  observeEvent(input$run_scrna_preprocess, submit_scrna_stage("preprocess"), ignoreInit = TRUE)
+  observeEvent(input$run_scrna_cluster, submit_scrna_stage("cluster"), ignoreInit = TRUE)
+  observeEvent(input$run_scrna_annotate, submit_scrna_stage("annotate"), ignoreInit = TRUE)
 
   observeEvent(input$run_fastqc, {
     trimmed <- isTRUE(input$fastqc_use_trimmed)

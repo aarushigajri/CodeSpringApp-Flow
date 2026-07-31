@@ -21,8 +21,13 @@ owner_path_pattern <- "(/grid/bsr/home/rouse|/home/rouse|/Users/rouse|rouse@bamd
 assert(!any(grepl(owner_path_pattern, runtime_text, ignore.case = TRUE)), "runtime code contains no hardcoded rouse home, login, or server path")
 scrna_step_meta <- app_env$run_step_meta(list(analysis_key = "scrna", analysis = "scRNA-seq", counts_only = FALSE))
 assert(
-  identical(as.character(scrna_step_meta$step), c("Input manifest", "scRNA processing")) && NROW(scrna_step_meta) == 2L,
-  "single-cell run-step metadata has one description per single-cell pipeline step"
+  identical(as.character(scrna_step_meta$step), c("Input inspection", "QC & doublets", "Normalize & PCA", "Integrate & cluster", "Annotate & markers")) && NROW(scrna_step_meta) == 5L,
+  "single-cell run-step metadata exposes the five checkpointed pipeline stages"
+)
+assert(
+  identical(app_env$scrna_stage_step("preprocess"), "Normalize & PCA") &&
+    identical(app_env$scrna_stage_step("annotate"), "Annotate & markers"),
+  "single-cell stage identifiers map to their visible workflow steps"
 )
 assert(
   !grepl("scrna_runtime_executable", app_text, fixed = TRUE) &&
