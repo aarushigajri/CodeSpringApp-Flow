@@ -31,9 +31,9 @@ assert(
 )
 assert(
   !grepl("scrna_runtime_executable", app_text, fixed = TRUE) &&
-    grepl("Cell-type annotation (optional)", app_text, fixed = TRUE) &&
+    grepl("Cell-type annotation files are selected at the annotation step", app_text, fixed = TRUE) &&
     grepl("Upload one Seurat/Scanpy object from laptop", app_text, fixed = TRUE),
-  "single-cell setup uses cluster-managed runtimes and exposes annotation and upload controls in the appropriate workflow steps"
+  "single-cell setup exposes annotation and upload controls in the appropriate workflow steps"
 )
 assert(
   !app_env$scrna_uses_input_manifest(list(analysis_key = "scrna", scrna_input_mode = "single")) &&
@@ -116,7 +116,7 @@ assert(any(grepl("codespringIgvLoadPromise", runtime_text, fixed = TRUE)), "IGV 
 assert(grepl("comparison_default_locus", server_source, fixed = TRUE) && grepl("locus_override = top_peak", server_source, fixed = TRUE), "each differential comparison defaults IGV to its most significant ranked peak")
 assert(app_env$path_is_within(app_env$APP_HOME, app_env$CURRENT_HOME), "private app state is derived from the effective Unix user's home")
 assert(identical(app_env$DEFAULT_RESULTS_ROOT, normalizePath(file.path(app_env$CURRENT_HOME, "csl_results"), winslash = "/", mustWork = FALSE)), "default results root is derived from the effective Unix user's home")
-assert(identical(unname(app_env$analysis_choices()), c("RNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")), "all analysis selectors use one canonical order and spelling")
+assert(identical(unname(app_env$analysis_choices()), c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")), "all analysis selectors use one canonical order and spelling")
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
   assert(identical(tabs[[1]], "Overview") && identical(tail(tabs, 1), "Files") && "QC" %in% tabs, paste(key, "follows the shared Results Explorer navigation contract"))
@@ -128,6 +128,16 @@ assert(!app_env$is_codespring_process_command("Rscript -e shiny::runApp('/home/u
 root <- tempfile("codespring-app-smoke-")
 dir.create(root, recursive = TRUE)
 on.exit(unlink(root, recursive = TRUE, force = TRUE), add = TRUE)
+
+scanpy_sif <- file.path(root, "codespring-scanpy_1.0.0.sif")
+file.create(scanpy_sif)
+Sys.setenv(CSL_SCANPY_SIF = scanpy_sif)
+scanpy_container <- app_env$scanpy_container_check()
+assert(
+  isTRUE(scanpy_container$ready) && identical(scanpy_container$path, normalizePath(scanpy_sif, winslash = "/", mustWork = FALSE)),
+  "an explicit shared Scanpy SIF is detected without creating a per-user Python runtime"
+)
+Sys.unsetenv("CSL_SCANPY_SIF")
 
 design_path <- file.path(root, "design_matrix.txt")
 design <- data.frame(
@@ -1244,14 +1254,14 @@ scrna_project <- list(
   data_dir = file.path(root, "scRNA-results", "data"), results_root = file.path(root, "scRNA-results"),
   design_matrix_path = scrna_manifest_path, scrna_input_manifest = scrna_manifest_path, scrna_engine = "auto"
 )
-failed_scrna_job <- data.frame(step = "scrna_pipeline", slurm_state = "FAILED", stringsAsFactors = FALSE)
+failed_scrna_job <- data.frame(step = "Input inspection", slurm_state = "FAILED", stringsAsFactors = FALSE)
 assert(
-  identical(app_env$project_status(scrna_project, jobs = failed_scrna_job)$status[[2]], "Likely failed"),
+  identical(app_env$project_status(scrna_project, jobs = failed_scrna_job)$status[[1]], "Likely failed"),
   "scRNA terminal failures are surfaced as failed rather than not started"
 )
 assert(
-  grepl("runtime_executable", app_text, fixed = TRUE) && grepl("scrna_manifest_from_setup", app_text, fixed = TRUE),
-  "scRNA setup supports an optional manifest and explicit compute runtime"
+  grepl("scanpy_container_check", app_text, fixed = TRUE) && grepl("scrna_manifest_from_setup", app_text, fixed = TRUE),
+  "scRNA setup supports an optional manifest and a shared Scanpy container"
 )
 
 cat("CodeSpringApp fake-data helper smoke tests passed.\n")
