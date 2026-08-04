@@ -167,6 +167,32 @@ assert(identical(mouse_chip_ref$genome_version, "mouse_gencodeM39") && grepl("mo
 assert(identical(human_chip_ref$genome_version, "human_gencode50") && grepl("human_gencode50", human_chip_ref$bowtie2_index), "ChIP human reference uses GRCh38/GENCODE v50")
 assert(length(app_env$genome_reference_choices("mouse", "ChIP-seq")) == 1L, "ChIP setup offers only the current mouse reference")
 assert(length(app_env$genome_reference_choices("human", "ChIP-seq")) == 1L, "ChIP setup offers only the current human reference")
+maize_choices <- app_env$genome_reference_choices("maize", "RNA-seq")
+assert(
+  identical(unname(maize_choices), c("maize_b73_nam5", "maize_nc350_nam1", "maize_w22_nrgene2")),
+  "RNA-seq setup offers B73, NC350, and W22 maize references"
+)
+maize_rna_project <- within(chip_project, {
+  analysis_key <- "rna"; analysis <- "RNA-seq"; genome <- "maize"; genome_version <- "maize_nc350_nam1"
+})
+maize_resources <- app_env$genome_resources(maize_rna_project)
+assert(
+  identical(app_env$genome_species(maize_rna_project), "maize") &&
+    grepl("STAR_index/NC350$", maize_resources$star_index) &&
+    grepl("Zm-NC350-REFERENCE-NAM-1.0.gtf$", maize_resources$gtf),
+  "maize RNA-seq resolves the selected variety's STAR index and matching GTF"
+)
+assert(
+  !app_env$rna_optional_quantifiers_available(maize_rna_project) &&
+    !any(c("RSEM (optional)", "Kallisto (optional)") %in% app_env$sample_level_steps_for_project(maize_rna_project)),
+  "maize RNA-seq excludes RSEM and Kallisto from available pipeline steps"
+)
+maize_atac_project <- within(maize_rna_project, { analysis_key <- "atac"; analysis <- "ATAC-seq" })
+assert(
+  identical(app_env$genome_species(maize_atac_project), "mouse") &&
+    length(app_env$genome_reference_choices("maize", "ATAC-seq")) == 1L,
+  "maize is restricted to RNA-seq and cannot become an ATAC reference"
+)
 rna_adapter_project <- within(chip_project, { analysis_key <- "rna"; analysis <- "RNA-seq" })
 atac_adapter_project <- within(chip_project, { analysis_key <- "atac"; analysis <- "ATAC-seq" })
 assert(identical(unname(app_env$default_adapter_pair(rna_adapter_project)), c("AGATCGGAAGAGCACACGTCTGAACTCCAGTCA", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT")), "RNA-seq defaults to paired Illumina TruSeq adapters")

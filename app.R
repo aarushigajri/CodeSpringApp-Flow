@@ -2778,18 +2778,28 @@ tool_reference_summary <- function(project) {
     colnames(out) <- c("Type", "Name", "Version/reference", "Used for", "Input/reference", "Parameters/settings")
     return(out)
   }
+  maize_reference <- identical(genome_species(project), "maize")
   rows <- list(
-    c("Reference", "Genome annotation", gencode_label(project), paste0(genome_species(project), " / ", genome_reference_key(project)), "STAR, featureCounts, DESeq2, RSEM, Kallisto", paste("STAR index, GTF, RSEM index, Kallisto index, and strand BED from", genome_reference_key(project))),
+    c(
+      "Reference", "Genome annotation", gencode_label(project),
+      paste0(genome_species(project), " / ", genome_reference_key(project)),
+      if (maize_reference) "STAR, featureCounts, DESeq2" else "STAR, featureCounts, DESeq2, RSEM, Kallisto",
+      if (maize_reference) paste("STAR index and GTF from", genome_reference_key(project)) else paste("STAR index, GTF, RSEM index, Kallisto index, and strand BED from", genome_reference_key(project))
+    ),
     c("Tool", "FastQC", fastqc_modules, "Read quality control", "Raw or trimmed FASTQ", "Input mode selected per run; reruns skip completed samples and submit failed/deleted samples only."),
     c("Tool", "cutadapt", cutadapt_modules, "Adapter trimming", "Raw FASTQ", "Adapter presets or custom adapters from Run Pipeline; minimum length from Run Pipeline."),
     c("Tool", "STAR", star_modules, "Spliced alignment", gencode_label(project), "Uses selected genome STAR index; raw or trimmed FASTQ selected per run."),
-    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
+    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), if (maize_reference) "Uses gene_id, the attribute provided by the maize GTF; count_matrix.txt is built after sample jobs finish." else "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
     c("Tool", "DESeq2", deseq_modules, "Differential expression", "featureCounts count_matrix.txt", "Comparison column, reference, and comparison are selected per run; redundant genes are removed by CodeSpringLab."),
-    c("Tool", "GSEApy", "BSR HPC; Python/3.7.4-GCCcore-8.3.0; gseapy 1.1.4", "Pathway analysis", "Selected Enrichr/MSigDB-style gene set database", "Gene-set database selected per run; each database writes to its own GSEA output folder."),
-    c("Tool", "RSEM", rsem_modules, "Optional gene/transcript quantification", gencode_label(project), "Feature attribute selected per run; matrices are built after sample jobs finish."),
-    c("Tool", "Kallisto", kallisto_modules, "Optional transcript abundance quantification", gencode_label(project), "Uses selected transcript index; raw or trimmed FASTQ selected per run; matrices are built after sample jobs finish."),
-    c("Tool", "RSeQC", "RSeQC module listed in featureCounts/RSEM scripts; strand BED generated with reference", "Optional strand/QC support", gencode_label(project), "Uses bundled/generated annotation_forStrandDetect_geneID.bed for the selected reference.")
+    c("Tool", "GSEApy", "BSR HPC; Python/3.7.4-GCCcore-8.3.0; gseapy 1.1.4", "Pathway analysis", "Selected Enrichr/MSigDB-style gene set database", "Gene-set database selected per run; each database writes to its own GSEA output folder.")
   )
+  if (!maize_reference) {
+    rows <- c(rows, list(
+      c("Tool", "RSEM", rsem_modules, "Optional gene/transcript quantification", gencode_label(project), "Feature attribute selected per run; matrices are built after sample jobs finish."),
+      c("Tool", "Kallisto", kallisto_modules, "Optional transcript abundance quantification", gencode_label(project), "Uses selected transcript index; raw or trimmed FASTQ selected per run; matrices are built after sample jobs finish."),
+      c("Tool", "RSeQC", "RSeQC module listed in featureCounts/RSEM scripts; strand BED generated with reference", "Optional strand/QC support", gencode_label(project), "Uses bundled/generated annotation_forStrandDetect_geneID.bed for the selected reference.")
+    ))
+  }
   out <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
   colnames(out) <- c("Type", "Name", "Version/reference", "Used for", "Input/reference", "Parameters/settings")
   out
@@ -3296,6 +3306,9 @@ project_status <- function(project, jobs = NULL, progress = NULL, active_states 
     ),
     stringsAsFactors = FALSE
   )
+  if (!rna_optional_quantifiers_available(project)) {
+    raw <- raw[!raw$step %in% c("RSEM (optional)", "Kallisto (optional)"), , drop = FALSE]
+  }
   modes <- last_job_modes_from_jobs(jobs)
   raw$input <- unname(modes[raw$step])
   raw$input[is.na(raw$input)] <- ""
@@ -5803,6 +5816,7 @@ sample_level_pipeline_steps <- function() {
 sample_level_steps_for_project <- function(project) {
   if (is_cutrun_project(project)) c("Cutadapt", "FastQC", "Bowtie2", "SEACR", "MACS2 (optional)")
   else if (is_atac_project(project) || is_chip_project(project)) c("Cutadapt", "FastQC", "Bowtie2", "MACS2 Peaks")
+  else if (identical(genome_species(project), "maize")) c("Cutadapt", "FastQC", "STAR", "featureCounts")
   else c("Cutadapt", "FastQC", "STAR", "featureCounts", "RSEM (optional)", "Kallisto (optional)")
 }
 
@@ -6194,12 +6208,34 @@ genome_reference_catalog <- function() {
         gtf = "/grid/bsr/data/data/utama/genome/GRCm39_M29_gencode/gencode.vM29.annotation.gtf",
         strand_bed = "/grid/bsr/data/data/utama/genome/GRCm39_M29_gencode/gencode.vM29.annotation_forStrandDetect_geneID.bed"
       )
+    ),
+    maize = list(
+      maize_b73_nam5 = list(
+        label = "Maize B73 / NAM 5.0",
+        variety = "B73",
+        star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/B73",
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-B73-REFERENCE-NAM-5.0.gtf"
+      ),
+      maize_nc350_nam1 = list(
+        label = "Maize NC350 / NAM 1.0",
+        variety = "NC350",
+        star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/NC350",
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-NC350-REFERENCE-NAM-1.0.gtf"
+      ),
+      maize_w22_nrgene2 = list(
+        label = "Maize W22 / NRGENE 2.0",
+        variety = "W22",
+        star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/W22",
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-W22-REFERENCE-NRGENE-2.0.clean.gtf"
+      )
     )
   )
 }
 
 genome_species <- function(project) {
   genome <- tolower(project$genome %||% "mouse")
+  project_analysis <- analysis_key(project$analysis_key %||% project$analysis %||% "rna")
+  if (identical(genome, "maize") && identical(project_analysis, "rna")) return("maize")
   if (genome %in% c("human", "mouse")) return(genome)
   if (grepl("^human", genome)) return("human")
   if (grepl("^mouse", genome)) return("mouse")
@@ -6218,12 +6254,14 @@ genome_reference_key <- function(project) {
   if (nzchar(ref) && ref %in% names(catalog[[species]])) return(ref)
   if (nzchar(genome) && genome %in% names(catalog[[species]])) return(genome)
   if (identical(species, "human")) return("human_gencode42")
+  if (identical(species, "maize")) return("maize_b73_nam5")
   "mouse_gencodeM29"
 }
 
 genome_reference_choices <- function(species, analysis = NULL) {
   catalog <- genome_reference_catalog()
   species <- tolower(species %||% "mouse")
+  if (!identical(analysis_key(analysis %||% "rna"), "rna") && identical(species, "maize")) species <- "mouse"
   if (!species %in% names(catalog)) species <- "mouse"
   refs <- catalog[[species]]
   if (analysis_key(analysis %||% "rna") %in% c("atac", "cutrun", "chip")) {
@@ -6231,6 +6269,10 @@ genome_reference_choices <- function(species, analysis = NULL) {
     refs <- refs[current]
   }
   stats::setNames(names(refs), vapply(refs, `[[`, character(1), "label"))
+}
+
+rna_optional_quantifiers_available <- function(project) {
+  !identical(genome_species(project), "maize")
 }
 
 genome_resources <- function(project) {
@@ -8863,6 +8905,9 @@ submit_star_jobs <- function(project, trimmed = FALSE, samples = NULL) {
 }
 
 submit_kallisto_jobs <- function(project, trimmed = FALSE, samples = NULL) {
+  if (!rna_optional_quantifiers_available(project)) {
+    return(record_preflight_failure(project, "Kallisto (optional)", "Kallisto is not available for maize RNA-seq references.", "kallisto"))
+  }
   res <- genome_resources(project)
   outdir <- file.path(project$data_dir, "kallisto")
   counts_dir <- file.path(project$data_dir, "counts")
@@ -8920,6 +8965,9 @@ submit_kallisto_jobs <- function(project, trimmed = FALSE, samples = NULL) {
 }
 
 submit_rsem_jobs <- function(project, feature = "gene_id", samples = NULL) {
+  if (!rna_optional_quantifiers_available(project)) {
+    return(record_preflight_failure(project, "RSEM (optional)", "RSEM is not available for maize RNA-seq references.", "rsem"))
+  }
   res <- genome_resources(project)
   design <- included_design_table(project)
   if (!NROW(design) || !"sample" %in% names(design)) return(record_preflight_failure(project, "RSEM (optional)", "No samples found in design_matrix.txt. Create or fix the design matrix before running RSEM.", "rsem"))
@@ -11494,7 +11542,7 @@ server <- function(input, output, session) {
       textInput("new_project_name", "Project name", value = "", placeholder = "e.g. my_project"),
       selectInput("new_project_analysis", "Analysis type", choices = analysis_choices(), selected = input$analysis, selectize = FALSE),
       tags$p(class = "muted small-note", analysis_description(new_analysis_key)),
-      selectInput("new_species", "Species", choices = c("Mouse" = "mouse", "Human" = "human"), selected = "mouse", selectize = FALSE),
+      uiOutput("new_species_ui"),
       uiOutput("new_genome_version_ui"),
       radioButtons("new_paired_end", "Reads", choices = c("Paired-end" = "paired", "Single-end" = "single"), selected = "paired"),
       radioButtons(
@@ -11624,12 +11672,22 @@ server <- function(input, output, session) {
     )
   })
 
+  output$new_species_ui <- renderUI({
+    key <- analysis_key(input$new_project_analysis %||% input$analysis %||% "RNA-seq")
+    choices <- c("Mouse" = "mouse", "Human" = "human")
+    if (identical(key, "rna")) choices <- c(choices, "Maize" = "maize")
+    selected <- isolate(input$new_species) %||% "mouse"
+    if (!selected %in% unname(choices)) selected <- "mouse"
+    selectInput("new_species", "Species", choices = choices, selected = selected, selectize = FALSE)
+  })
+
   output$new_genome_version_ui <- renderUI({
     species <- tolower(input$new_species %||% "mouse")
     choices <- genome_reference_choices(species, input$new_project_analysis %||% input$analysis %||% "RNA-seq")
     selected <- isolate(input$new_genome_version)
     if (is.null(selected) || !selected %in% unname(choices)) selected <- unname(choices)[[1]]
-    selectInput("new_genome_version", "Genome/reference version", choices = choices, selected = selected, selectize = FALSE)
+    label <- if (identical(species, "maize")) "Maize variety/reference" else "Genome/reference version"
+    selectInput("new_genome_version", label, choices = choices, selected = selected, selectize = FALSE)
   })
 
   observeEvent(input$use_example_dataset, {
@@ -12586,7 +12644,13 @@ server <- function(input, output, session) {
         tagList(uiOutput("rna_star_samples_ui"), checkboxInput("star_use_trimmed", "Use trimmed reads", value = trimmed_checkbox_default(p, isolate(input$star_use_trimmed)))),
         "run_star", "Submit STAR"),
       tool_panel("featureCounts", status, "Quantify STAR BAM files with the selected GTF attribute.",
-        tagList(uiOutput("rna_featurecounts_samples_ui"), selectInput("feature_attr", "featureCounts attribute", choices = c("gene_name", "gene_id"), selected = selected_choice(input$feature_attr, c("gene_name", "gene_id"), "gene_name"), selectize = FALSE)),
+        tagList(
+          uiOutput("rna_featurecounts_samples_ui"),
+          if (identical(genome_species(p), "maize"))
+            selectInput("feature_attr", "featureCounts attribute", choices = c("Gene ID" = "gene_id"), selected = "gene_id", selectize = FALSE)
+          else
+            selectInput("feature_attr", "featureCounts attribute", choices = c("gene_name", "gene_id"), selected = selected_choice(input$feature_attr, c("gene_name", "gene_id"), "gene_name"), selectize = FALSE)
+        ),
         "run_featurecounts", "Submit featureCounts"),
       tool_panel("DESeq2", status, "Run differential expression from count_matrix.txt.",
         tagList(
@@ -12597,12 +12661,12 @@ server <- function(input, output, session) {
       tool_panel("GSEA", status, "Run pathway analysis from DESeq2 normalized counts.",
         tagList(uiOutput("gsea_run_controls_ui"), uiOutput("gsea_project_summary_ui")),
         "run_gsea", "Submit GSEA", data.frame()),
-      tool_panel("RSEM (optional)", status, "Optional quantification from STAR BAM/transcriptome outputs.",
+      if (rna_optional_quantifiers_available(p)) tool_panel("RSEM (optional)", status, "Optional quantification from STAR BAM/transcriptome outputs.",
         tagList(uiOutput("rna_rsem_samples_ui"), selectInput("rsem_feature_attr", "RSEM feature attribute", choices = c("gene_id", "gene_name"), selected = selected_choice(input$rsem_feature_attr, c("gene_id", "gene_name"), "gene_id"), selectize = FALSE)),
-        "run_rsem", "Submit RSEM"),
-      tool_panel("Kallisto (optional)", status, "Optional transcript abundance quantification from raw or trimmed reads.",
+        "run_rsem", "Submit RSEM") else NULL,
+      if (rna_optional_quantifiers_available(p)) tool_panel("Kallisto (optional)", status, "Optional transcript abundance quantification from raw or trimmed reads.",
         tagList(uiOutput("rna_kallisto_samples_ui"), checkboxInput("kallisto_use_trimmed", "Use trimmed reads", value = trimmed_checkbox_default(p, isolate(input$kallisto_use_trimmed)))),
-        "run_kallisto", "Submit Kallisto")
+        "run_kallisto", "Submit Kallisto") else NULL
     )
     })
   })
