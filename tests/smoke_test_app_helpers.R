@@ -167,6 +167,18 @@ assert(identical(mouse_chip_ref$genome_version, "mouse_gencodeM39") && grepl("mo
 assert(identical(human_chip_ref$genome_version, "human_gencode50") && grepl("human_gencode50", human_chip_ref$bowtie2_index), "ChIP human reference uses GRCh38/GENCODE v50")
 assert(length(app_env$genome_reference_choices("mouse", "ChIP-seq")) == 1L, "ChIP setup offers only the current mouse reference")
 assert(length(app_env$genome_reference_choices("human", "ChIP-seq")) == 1L, "ChIP setup offers only the current human reference")
+chip_example <- app_env$example_dataset_paths("chip")
+assert(identical(chip_example$species, "human") && identical(chip_example$paired_end, "single"), "bundled human ChIP example selects GRCh38 and single-end reads")
+
+dir.create(file.path(root, "fastqc"), recursive = TRUE, showWarnings = FALSE)
+screen_path <- file.path(root, "fastqc", "A1_screen.txt")
+write.table(
+  data.frame(Genome = c("Human", "Mouse"), `%Unmapped` = c(2, 98), check.names = FALSE),
+  screen_path, sep = "\t", row.names = FALSE, quote = FALSE
+)
+screen_pairs <- data.frame(sample = "A1", r1 = file.path(root, "A1.fastq.gz"), r2 = file.path(root, "A1.fastq.gz"), stringsAsFactors = FALSE)
+assert(nzchar(app_env$fastq_screen_species_mismatch(chip_project, screen_pairs)), "ChIP preflight blocks a strong human-versus-mouse FastQ Screen mismatch")
+assert(!nzchar(app_env$fastq_screen_species_mismatch(human_chip_project, screen_pairs)), "ChIP preflight accepts the matching human reference")
 maize_choices <- app_env$genome_reference_choices("maize", "RNA-seq")
 assert(
   identical(unname(maize_choices), c("maize_b73_nam5", "maize_nc350_nam1", "maize_w22_nrgene2")),

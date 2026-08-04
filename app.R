@@ -678,7 +678,7 @@ example_dataset_paths <- function(key) {
     rna = list(name = "example_dataset", fastq_dir = RNA_EXAMPLE_FASTQ_DIR, design_dir = RNA_EXAMPLE_DESIGN_DIR),
     cutrun = list(name = "example_cutrun", fastq_dir = CUTRUN_EXAMPLE_FASTQ_DIR, design_dir = CUTRUN_EXAMPLE_DESIGN_DIR),
     atac = list(name = "example_atac", fastq_dir = ATAC_EXAMPLE_FASTQ_DIR, design_dir = ATAC_EXAMPLE_DESIGN_DIR),
-    chip = list(name = "example_chip", fastq_dir = CHIP_EXAMPLE_FASTQ_DIR, design_dir = CHIP_EXAMPLE_DESIGN_DIR),
+    chip = list(name = "example_chip", fastq_dir = CHIP_EXAMPLE_FASTQ_DIR, design_dir = CHIP_EXAMPLE_DESIGN_DIR, species = "human", paired_end = "single"),
     NULL
   )
 }
@@ -7653,6 +7653,52 @@ chip_control_sample_for <- function(project, sample) {
   control
 }
 
+fastq_screen_species_mismatch <- function(project, pairs) {
+  if (!NROW(pairs) || !"sample" %in% names(pairs)) return("")
+  expected <- if (identical(genome_species(project), "human")) "Human" else if (identical(genome_species(project), "mouse")) "Mouse" else ""
+  alternative <- if (identical(expected, "Human")) "Mouse" else if (identical(expected, "Mouse")) "Human" else ""
+  if (!nzchar(expected) || !nzchar(alternative)) return("")
+
+  report_for <- function(row) {
+    read_path <- as.character(row[["r1"]] %||% "")
+    read_name <- basename(read_path)
+    stems <- unique(c(
+      sub("\\.fastq\\.gz$", "", read_name, ignore.case = TRUE),
+      sub("\\.fq\\.gz$", "", read_name, ignore.case = TRUE),
+      sub("\\.fastq$", "", read_name, ignore.case = TRUE),
+      sub("\\.fq$", "", read_name, ignore.case = TRUE)
+    ))
+    directories <- c(file.path(project$data_dir, "fastqc_cutadapt"), file.path(project$data_dir, "fastqc"))
+    candidates <- unlist(lapply(directories, function(directory) unlist(lapply(stems, function(stem) c(
+      file.path(directory, paste0(stem, "_screen.txt")),
+      file.path(directory, paste0(stem, ".screen.txt"))
+    )), use.names = FALSE)), use.names = FALSE)
+    existing <- candidates[file.exists(candidates)]
+    if (length(existing)) existing[[1L]] else ""
+  }
+
+  mismatches <- character(0)
+  for (i in seq_len(NROW(pairs))) {
+    report <- report_for(pairs[i, , drop = FALSE])
+    if (!nzchar(report)) next
+    screen <- tryCatch(utils::read.delim(report, check.names = FALSE, stringsAsFactors = FALSE), error = function(e) data.frame())
+    if (!NROW(screen) || !all(c("Genome", "%Unmapped") %in% names(screen))) next
+    genomes <- tolower(trimws(as.character(screen$Genome)))
+    unmapped <- suppressWarnings(as.numeric(screen[["%Unmapped"]]))
+    expected_hit <- 100 - unmapped[match(tolower(expected), genomes)]
+    alternative_hit <- 100 - unmapped[match(tolower(alternative), genomes)]
+    if (length(expected_hit) && length(alternative_hit) && is.finite(expected_hit) && is.finite(alternative_hit) && expected_hit < 10 && alternative_hit > 80) {
+      mismatches <- c(mismatches, sprintf("%s: %.1f%% %s vs %.1f%% %s", pairs$sample[[i]], expected_hit, expected, alternative_hit, alternative))
+    }
+  }
+  if (!length(mismatches)) return("")
+  paste0(
+    "FastQ Screen strongly disagrees with the selected ", expected, " reference. ",
+    paste(mismatches, collapse = "; "),
+    ". Change the project species/reference before alignment. No Bowtie2 jobs were submitted."
+  )
+}
+
 submit_chip_bowtie2_jobs <- function(project, trimmed = TRUE, samples = NULL) {
   res <- chip_reference_resources(project)
   index_exists <- file.exists(paste0(res$bowtie2_index, ".1.bt2")) || file.exists(paste0(res$bowtie2_index, ".1.bt2l"))
@@ -7664,6 +7710,8 @@ submit_chip_bowtie2_jobs <- function(project, trimmed = TRUE, samples = NULL) {
   pairs <- pairs[pairs$sample %in% selected, , drop = FALSE]
   msg <- missing_read_message(project, pairs, trimmed)
   if (nzchar(msg)) return(record_preflight_failure(project, "Bowtie2", msg, "bowtie2_chip"))
+  species_msg <- fastq_screen_species_mismatch(project, pairs)
+  if (nzchar(species_msg)) return(record_preflight_failure(project, "Bowtie2", species_msg, "bowtie2_chip"))
   outdir <- file.path(project$data_dir, "bowtie2")
   dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
   targets <- stats::setNames(lapply(unique(pairs$sample), function(sample) file.path(outdir, sample, paste0(sample, "_alignment_summary.txt"))), unique(pairs$sample))
@@ -11702,8 +11750,8 @@ server <- function(input, output, session) {
     updateRadioButtons(session, "new_fastq_location_mode", selected = "one")
     updateTextInput(session, "new_fastq_dir", value = example$fastq_dir)
     updateTextInput(session, "new_design_matrix_path", value = example$design_dir)
-    updateSelectInput(session, "new_species", selected = "mouse")
-    updateRadioButtons(session, "new_paired_end", selected = if (identical(key, "chip")) "single" else "paired")
+    updateSelectInput(session, "new_species", selected = example$species %||% "mouse")
+    updateRadioButtons(session, "new_paired_end", selected = example$paired_end %||% "paired")
     output$create_project_status <- renderText(paste("Loaded the bundled", analysis_label(key), "example paths. Choose a project name and click Create project."))
   })
 
