@@ -683,6 +683,31 @@ feature_submission <- captured_submissions[[length(captured_submissions)]]
 expected_feature_runner <- file.path(app_env$SCRIPTS_DIR, "featureCounts", "featurecounts_PE.sh")
 assert(identical(tail(feature_submission$args, 1), expected_feature_runner), "featureCounts submission passes an absolute runner path to SLURM")
 
+app_env$genome_resources <- function(project) list(
+  star_index = file.path(runner_test_root, "maize-star-index"), label = "maize-test-reference",
+  gtf = fake_gtf
+)
+runner_project$genome <- "maize"
+runner_project$genome_version <- "maize_b73_nam5"
+invisible(app_env$submit_featurecounts_jobs(runner_project, feature = "gene_name", samples = "rna1"))
+maize_feature_submission <- captured_submissions[[length(captured_submissions)]]
+assert(
+  length(maize_feature_submission$args) == 7L &&
+    identical(maize_feature_submission$args[[3]], "gene_id") &&
+    identical(maize_feature_submission$args[[5]], "none") &&
+    identical(maize_feature_submission$args[[6]], runner_project$name) &&
+    identical(maize_feature_submission$args[[7]], expected_feature_runner),
+  "maize featureCounts preserves every SLURM argument, forces gene_id, and explicitly requests unstranded fallback without a strand BED"
+)
+runner_project$genome <- "human"
+runner_project$genome_version <- "human_gencode50"
+app_env$genome_resources <- function(project) list(
+  star_index = file.path(runner_test_root, "star-index"), label = "test-reference",
+  gtf = fake_gtf, strand_bed = fake_strand_bed,
+  kallisto_index = file.path(runner_test_root, "transcripts.idx"),
+  rsem_index = file.path(runner_test_root, "rsem")
+)
+
 invisible(app_env$submit_kallisto_jobs(runner_project, trimmed = FALSE, samples = "rna1"))
 kallisto_submission <- captured_submissions[[length(captured_submissions)]]
 expected_kallisto_runner <- file.path(app_env$SCRIPTS_DIR, "Kallisto", "kallisto_PE.sh")

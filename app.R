@@ -2789,7 +2789,7 @@ tool_reference_summary <- function(project) {
     c("Tool", "FastQC", fastqc_modules, "Read quality control", "Raw or trimmed FASTQ", "Input mode selected per run; reruns skip completed samples and submit failed/deleted samples only."),
     c("Tool", "cutadapt", cutadapt_modules, "Adapter trimming", "Raw FASTQ", "Adapter presets or custom adapters from Run Pipeline; minimum length from Run Pipeline."),
     c("Tool", "STAR", star_modules, "Spliced alignment", gencode_label(project), "Uses selected genome STAR index; raw or trimmed FASTQ selected per run."),
-    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), if (maize_reference) "Uses gene_id, the attribute provided by the maize GTF; count_matrix.txt is built after sample jobs finish." else "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
+    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), if (maize_reference) "Uses gene_id, the attribute provided by the maize GTF. The maize references do not include an RSeQC strand BED, so counting is explicitly unstranded (-s 0) and recorded in each sample strand report; count_matrix.txt is built after sample jobs finish." else "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
     c("Tool", "DESeq2", deseq_modules, "Differential expression", "featureCounts count_matrix.txt", "Comparison column, reference, and comparison are selected per run; redundant genes are removed by CodeSpringLab."),
     c("Tool", "GSEApy", "BSR HPC; Python/3.7.4-GCCcore-8.3.0; gseapy 1.1.4", "Pathway analysis", "Selected Enrichr/MSigDB-style gene set database", "Gene-set database selected per run; each database writes to its own GSEA output folder.")
   )
@@ -9073,6 +9073,10 @@ submit_rsem_jobs <- function(project, feature = "gene_id", samples = NULL) {
 
 submit_featurecounts_jobs <- function(project, feature = "gene_name", samples = NULL) {
   res <- genome_resources(project)
+  allowed_features <- if (identical(genome_species(project), "maize")) "gene_id" else c("gene_name", "gene_id")
+  feature <- selected_choice(feature, allowed_features, allowed_features[[1]])
+  strand_bed <- trimws(as.character(res$strand_bed %||% ""))
+  if (!nzchar(strand_bed)) strand_bed <- "none"
   design <- included_design_table(project)
   if (!NROW(design) || !"sample" %in% names(design)) return(record_preflight_failure(project, "featureCounts", "No samples found in design_matrix.txt. Create or fix the design matrix before running featureCounts.", "featurecounts"))
   selected <- tryCatch(requested_sample_subset(project, design$sample, samples, "featureCounts"), error = function(e) e)
@@ -9111,7 +9115,7 @@ submit_featurecounts_jobs <- function(project, feature = "gene_name", samples = 
     bam <- file.path(project$data_dir, "star", sample, paste0(sample, "Aligned.sortedByCoord.out.bam"))
     count_prefix <- file.path(sample_dir, sample)
     target <- paste0(count_prefix, "_counts.txt")
-    submit_sbatch(project, "featureCounts", script, c(bam, res$gtf, feature, count_prefix, res$strand_bed, project$name, runner), "featurecounts", paste("STAR BAM; feature", feature), sample = sample, target = target, reference = res$gtf)
+    submit_sbatch(project, "featureCounts", script, c(bam, res$gtf, feature, count_prefix, strand_bed, project$name, runner), "featurecounts", paste("STAR BAM; feature", feature), sample = sample, target = target, reference = res$gtf)
   }, character(1))
   ids <- vapply(messages, parse_sbatch_job_id, character(1))
   if (target_outputs_ready_or_planned(all_targets, plan$samples, minimum_expected_bytes("featureCounts"))) {
@@ -12695,7 +12699,10 @@ server <- function(input, output, session) {
         tagList(
           uiOutput("rna_featurecounts_samples_ui"),
           if (identical(genome_species(p), "maize"))
-            selectInput("feature_attr", "featureCounts attribute", choices = c("Gene ID" = "gene_id"), selected = "gene_id", selectize = FALSE)
+            tagList(
+              selectInput("feature_attr", "featureCounts attribute", choices = c("Gene ID" = "gene_id"), selected = "gene_id", selectize = FALSE),
+              tags$p(class = "muted small-note", "The maize references have no strand-detection BED, so featureCounts runs unstranded (-s 0) and records that choice in each sample's strand report.")
+            )
           else
             selectInput("feature_attr", "featureCounts attribute", choices = c("gene_name", "gene_id"), selected = selected_choice(input$feature_attr, c("gene_name", "gene_id"), "gene_name"), selectize = FALSE)
         ),
@@ -13533,7 +13540,10 @@ server <- function(input, output, session) {
   })
   observeEvent(input$run_featurecounts, {
     featurecounts_matrix_autosubmitted(setdiff(featurecounts_matrix_autosubmitted(), current_project()$id))
-    samples <- input$rna_featurecounts_samples %||% character(0)
+    # NULL means the dynamic selector has not reached the browser yet, so use
+    # every eligible design sample. An explicit character(0) still means the
+    # user deliberately cleared the selection and remains a validation error.
+    samples <- input$rna_featurecounts_samples
     run_submission("featureCounts", submit_featurecounts_jobs(current_project(), input$feature_attr, samples), paste("STAR BAM; feature", input$feature_attr), samples = samples)
   })
   observeEvent(input$run_deseq2, {
