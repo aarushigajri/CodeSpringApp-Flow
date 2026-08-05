@@ -191,9 +191,37 @@ maize_resources <- app_env$genome_resources(maize_rna_project)
 assert(
   identical(app_env$genome_species(maize_rna_project), "maize") &&
     grepl("STAR_index/NC350$", maize_resources$star_index) &&
-    grepl("Zm-NC350-REFERENCE-NAM-1.0.gtf$", maize_resources$gtf),
-  "maize RNA-seq resolves the selected variety's STAR index and matching GTF"
+    grepl("Zm-NC350-REFERENCE-NAM-1.0.gtf$", maize_resources$gtf) &&
+    grepl("Zm-NC350-REFERENCE-NAM-1.0.annotation_forStrandDetect_geneID.bed$", maize_resources$strand_bed),
+  "maize RNA-seq resolves the selected variety's matching STAR index, GTF, and strand BED"
 )
+maize_reference_files <- list(
+  maize_b73_nam5 = c(
+    variety = "B73", star = "B73", gtf = "Zm-B73-REFERENCE-NAM-5.0.gtf",
+    bed = "Zm-B73-REFERENCE-NAM-5.0.annotation_forStrandDetect_geneID.bed"
+  ),
+  maize_nc350_nam1 = c(
+    variety = "NC350", star = "NC350", gtf = "Zm-NC350-REFERENCE-NAM-1.0.gtf",
+    bed = "Zm-NC350-REFERENCE-NAM-1.0.annotation_forStrandDetect_geneID.bed"
+  ),
+  maize_w22_nrgene2 = c(
+    variety = "W22", star = "W22", gtf = "Zm-W22-REFERENCE-NRGENE-2.0.clean.gtf",
+    bed = "Zm-W22-REFERENCE-NRGENE-2.0.annotation_forStrandDetect_geneID.bed"
+  )
+)
+for (reference_key in names(maize_reference_files)) {
+  expected <- maize_reference_files[[reference_key]]
+  selected_project <- maize_rna_project
+  selected_project$genome_version <- reference_key
+  resources <- app_env$genome_resources(selected_project)
+  assert(
+    identical(resources$variety, unname(expected[["variety"]])) &&
+      identical(basename(resources$star_index), unname(expected[["star"]])) &&
+      identical(basename(resources$gtf), unname(expected[["gtf"]])) &&
+      identical(basename(resources$strand_bed), unname(expected[["bed"]])),
+    paste(reference_key, "uses only its own variety-matched STAR index, GTF, and strand BED")
+  )
+}
 assert(
   !app_env$rna_optional_quantifiers_available(maize_rna_project) &&
     !any(c("RSEM (optional)", "Kallisto (optional)") %in% app_env$sample_level_steps_for_project(maize_rna_project)),

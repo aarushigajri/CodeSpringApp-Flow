@@ -2784,12 +2784,12 @@ tool_reference_summary <- function(project) {
       "Reference", "Genome annotation", gencode_label(project),
       paste0(genome_species(project), " / ", genome_reference_key(project)),
       if (maize_reference) "STAR, featureCounts, DESeq2" else "STAR, featureCounts, DESeq2, RSEM, Kallisto",
-      if (maize_reference) paste("STAR index and GTF from", genome_reference_key(project)) else paste("STAR index, GTF, RSEM index, Kallisto index, and strand BED from", genome_reference_key(project))
+      if (maize_reference) paste("Matched STAR index, GTF, and strand BED from", genome_reference_key(project)) else paste("STAR index, GTF, RSEM index, Kallisto index, and strand BED from", genome_reference_key(project))
     ),
     c("Tool", "FastQC", fastqc_modules, "Read quality control", "Raw or trimmed FASTQ", "Input mode selected per run; reruns skip completed samples and submit failed/deleted samples only."),
     c("Tool", "cutadapt", cutadapt_modules, "Adapter trimming", "Raw FASTQ", "Adapter presets or custom adapters from Run Pipeline; minimum length from Run Pipeline."),
     c("Tool", "STAR", star_modules, "Spliced alignment", gencode_label(project), "Uses selected genome STAR index; raw or trimmed FASTQ selected per run."),
-    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), if (maize_reference) "Uses gene_id, the attribute provided by the maize GTF. The maize references do not include an RSeQC strand BED, so counting is explicitly unstranded (-s 0) and recorded in each sample strand report; count_matrix.txt is built after sample jobs finish." else "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
+    c("Tool", "featureCounts / Subread", featurecounts_modules, "Gene-level counting", gencode_label(project), if (maize_reference) "Uses gene_id from the selected variety's matching GTF and determines strandedness with that variety's matching RSeQC BED12 model; count_matrix.txt is built after sample jobs finish." else "Feature attribute defaults to gene_name; count_matrix.txt is built after sample jobs finish."),
     c("Tool", "DESeq2", deseq_modules, "Differential expression", "featureCounts count_matrix.txt", "Comparison column, reference, and comparison are selected per run; redundant genes are removed by CodeSpringLab."),
     c("Tool", "GSEApy", "BSR HPC; Python/3.7.4-GCCcore-8.3.0; gseapy 1.1.4", "Pathway analysis", "Selected Enrichr/MSigDB-style gene set database", "Gene-set database selected per run; each database writes to its own GSEA output folder.")
   )
@@ -6214,19 +6214,22 @@ genome_reference_catalog <- function() {
         label = "Maize B73 / NAM 5.0",
         variety = "B73",
         star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/B73",
-        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-B73-REFERENCE-NAM-5.0.gtf"
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-B73-REFERENCE-NAM-5.0.gtf",
+        strand_bed = "/grid/bsr/data/data/utama/genome/maize/Zm-B73-REFERENCE-NAM-5.0.annotation_forStrandDetect_geneID.bed"
       ),
       maize_nc350_nam1 = list(
         label = "Maize NC350 / NAM 1.0",
         variety = "NC350",
         star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/NC350",
-        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-NC350-REFERENCE-NAM-1.0.gtf"
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-NC350-REFERENCE-NAM-1.0.gtf",
+        strand_bed = "/grid/bsr/data/data/utama/genome/maize/Zm-NC350-REFERENCE-NAM-1.0.annotation_forStrandDetect_geneID.bed"
       ),
       maize_w22_nrgene2 = list(
         label = "Maize W22 / NRGENE 2.0",
         variety = "W22",
         star_index = "/grid/bsr/data/data/utama/genome/maize/STAR_index/W22",
-        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-W22-REFERENCE-NRGENE-2.0.clean.gtf"
+        gtf = "/grid/bsr/data/data/utama/genome/maize/Zm-W22-REFERENCE-NRGENE-2.0.clean.gtf",
+        strand_bed = "/grid/bsr/data/data/utama/genome/maize/Zm-W22-REFERENCE-NRGENE-2.0.annotation_forStrandDetect_geneID.bed"
       )
     )
   )
@@ -9077,6 +9080,12 @@ submit_featurecounts_jobs <- function(project, feature = "gene_name", samples = 
   feature <- selected_choice(feature, allowed_features, allowed_features[[1]])
   strand_bed <- trimws(as.character(res$strand_bed %||% ""))
   if (!nzchar(strand_bed)) strand_bed <- "none"
+  if (!identical(strand_bed, "none") && (!file.exists(strand_bed) || file_size_for(strand_bed) <= 0)) {
+    return(record_preflight_failure(project, "featureCounts", paste0(
+      "The strand-detection BED12 file for ", res$label %||% genome_reference_key(project),
+      " is missing or empty: ", strand_bed
+    ), "featurecounts"))
+  }
   design <- included_design_table(project)
   if (!NROW(design) || !"sample" %in% names(design)) return(record_preflight_failure(project, "featureCounts", "No samples found in design_matrix.txt. Create or fix the design matrix before running featureCounts.", "featurecounts"))
   selected <- tryCatch(requested_sample_subset(project, design$sample, samples, "featureCounts"), error = function(e) e)
@@ -12701,7 +12710,10 @@ server <- function(input, output, session) {
           if (identical(genome_species(p), "maize"))
             tagList(
               selectInput("feature_attr", "featureCounts attribute", choices = c("Gene ID" = "gene_id"), selected = "gene_id", selectize = FALSE),
-              tags$p(class = "muted small-note", "The maize references have no strand-detection BED, so featureCounts runs unstranded (-s 0) and records that choice in each sample's strand report.")
+              tags$p(class = "muted small-note", paste(
+                "Selected reference bundle:", genome_resources(p)$variety,
+                "STAR index, GTF, and RSeQC strand BED12."
+              ))
             )
           else
             selectInput("feature_attr", "featureCounts attribute", choices = c("gene_name", "gene_id"), selected = selected_choice(input$feature_attr, c("gene_name", "gene_id"), "gene_name"), selectize = FALSE)
