@@ -100,7 +100,11 @@ the appropriate saved state rather than repeating earlier work.
 
 The selected engine is explicit: Seurat for RDS/10x and Scanpy for H5AD/10x.
 The job wrapper loads and checks the relevant cluster runtime only on the
-compute node.
+compute node. On the BSR cluster, Scanpy automatically uses the shared,
+read-only image at
+`/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif`.
+Maintainers can override that location by setting `CSL_SCANPY_SIF` before
+starting CodeSpringApp.
 
 - Creates or resumes CodeSpringLab projects from saved project configs.
 - Builds and edits design matrices from FASTQ folders.

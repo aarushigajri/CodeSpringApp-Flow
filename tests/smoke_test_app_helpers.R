@@ -129,6 +129,12 @@ root <- tempfile("codespring-app-smoke-")
 dir.create(root, recursive = TRUE)
 on.exit(unlink(root, recursive = TRUE, force = TRUE), add = TRUE)
 
+shared_scanpy_sif <- "/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif"
+assert(
+  shared_scanpy_sif %in% app_env$scanpy_container_candidates(),
+  "the shared BSR Scanpy image is a built-in runtime candidate for every user"
+)
+
 scanpy_sif <- file.path(root, "codespring-scanpy_1.0.0.sif")
 file.create(scanpy_sif)
 Sys.setenv(CSL_SCANPY_SIF = scanpy_sif)

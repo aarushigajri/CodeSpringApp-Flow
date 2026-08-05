@@ -8801,8 +8801,10 @@ scrna_engine_for_manifest <- function(project, requested = "auto") {
 
 scanpy_container_candidates <- function() {
   configured <- trimws(Sys.getenv("CSL_SCANPY_SIF", unset = ""))
+  shared_bsr <- "/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif"
   unique(c(
     if (nzchar(configured)) configured else character(0),
+    shared_bsr,
     file.path(SCRIPTS_DIR, "singleCellRNAseq", "containers", "codespring-scanpy_1.0.0.sif")
   ))
 }
