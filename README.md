@@ -62,7 +62,7 @@ DNS under the cluster's Singularity 3.6.3 installation. Aspera is not exposed
 because it has not yet been validated on this cluster.
 
 Each Unix user gets a private FetchNGS results folder inside the same
-`~/csl_results` area used by other CodeSpringApp projects:
+`~/csl_results` area used by other CodeSpringApp projects by default:
 
 ```text
 ~/csl_results/
@@ -81,6 +81,18 @@ Each Unix user gets a private FetchNGS results folder inside the same
     └── run_manifest.tsv
 ```
 
+The FetchNGS page also offers **Custom server folder**. The selected path is
+used as the exact runs root, so `/project/public_fetchngs` produces
+`/project/public_fetchngs/<run-name>/results`. Choosing a custom location changes
+run creation, listing, logs, resume, deletion, and output viewing together. The
+folder must be an absolute writable server path. Leaving **Default user folder**
+selected preserves `~/csl_results/fetchngs`.
+
+Custom results roots receive separate private Nextflow work namespaces beneath
+`~/.codespringflow/work/fetchngs/`. This prevents runs with the same name in two
+different results roots from sharing resume state or deleting each other's work
+files. The namespace and exact work directory are recorded in each run manifest.
+
 Nextflow's non-result runtime files are kept separately:
 
 ```text
@@ -96,10 +108,16 @@ or interrupted run can be selected and resumed with Nextflow's `-resume`
 behavior. **Create bundle only** writes and validates the input, parameter,
 manifest, and Slurm files without submitting a job.
 
-**Delete selected run** asks for confirmation and removes only that run's
-`~/csl_results/fetchngs/<run-name>` folder and matching private Nextflow work
-directory. It refuses to delete a run whose recorded SLURM job is still active,
-and it never removes the shared Singularity cache.
+The **FetchNGS Outputs** tab lists files beneath the selected run's `results/`
+folder. CSV, TSV, and TXT files are shown as capped interactive tables; JSON,
+YAML, Markdown, and log files receive a capped text preview. Large or binary
+files such as compressed FASTQs are listed with their path, type, size, and
+modification time without being loaded into the browser.
+
+**Delete selected run** asks for confirmation and removes only that run's folder
+beneath the currently selected results root and its matching private Nextflow
+work directory. It refuses to delete a run whose recorded SLURM job is still
+active, and it never removes the shared Singularity cache.
 
 FetchNGS only retrieves data. It does not automatically launch CUT&RUN, Sarek,
 or another analysis workflow. A downloaded FASTQ folder can later be selected
@@ -273,6 +291,7 @@ For new projects, it creates project-local outputs under:
 - The `Analysis type` dropdown treats `FetchNGS` as a separate data-retrieval workflow. Selecting it hides biological-project controls and analysis tabs; selecting RNA-seq, scRNA-seq, ATAC-seq, CUT&RUN, or ChIP-seq restores the normal project workspace.
 - `Setup`: choose analysis/project, create projects, browse server folders, select genome references, and delete configs/results.
 - `FetchNGS`: shown only when FetchNGS is selected; paste or select public accessions, submit or resume downloads, inspect run status, and read controller logs.
+- `FetchNGS Outputs`: shown only when FetchNGS is selected; inventory the selected run's result files and safely preview supported tables and text outputs.
 - `Design Matrix`: scan FASTQ folders, include/exclude samples, edit metadata, and save a project-local `design_matrix.txt`.
 - `Run Pipeline`: submit SLURM jobs with step-specific settings and safeguards.
 - `Progress`: monitor step and sample progress, including active, cancelled, deleted, and likely failed states.

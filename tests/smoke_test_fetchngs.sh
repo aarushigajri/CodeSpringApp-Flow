@@ -44,6 +44,23 @@ metadata_run="$test_home/csl_results/fetchngs/smoke_metadata"
 grep -Fq "skip_fastq_download: true" "$metadata_run/params.yml"
 grep -Fq $'metadata_only\ttrue' "$metadata_run/run_manifest.tsv"
 
+custom_results_root="$test_root/custom-fetchngs-results"
+CODESPRINGFLOW_RESULTS_ROOT="$custom_results_root" HOME="$test_home" \
+  "$repo_root/bin/codespringflow" fetchngs \
+  --input "$input_file" \
+  --name smoke_custom_root \
+  --dry-run
+custom_run="$custom_results_root/smoke_custom_root"
+test -f "$custom_run/input/accessions.csv"
+grep -Fq "outdir: '$custom_run/results'" "$custom_run/params.yml"
+test "$(CODESPRINGFLOW_RESULTS_ROOT="$custom_results_root" HOME="$test_home" "$repo_root/bin/codespringflow" root)" = "$custom_results_root"
+custom_work_dir="$(awk -F $'\t' '$1 == "work_directory" { print $2 }' "$custom_run/run_manifest.tsv")"
+custom_work_namespace="$(awk -F $'\t' '$1 == "work_namespace" { print $2 }' "$custom_run/run_manifest.tsv")"
+[[ "$custom_work_namespace" == root_* ]]
+[[ "$custom_work_dir" == "$test_home/.codespringflow/work/fetchngs/$custom_work_namespace/smoke_custom_root" ]]
+test -d "$custom_work_dir"
+test "$custom_work_dir" != "$test_home/.codespringflow/work/fetchngs/smoke_custom_root"
+
 if HOME="$test_home" "$repo_root/bin/codespringflow" fetchngs --input "$input_file" --name smoke_fastq --dry-run >/dev/null 2>&1; then
   echo "Duplicate FetchNGS run names were not rejected." >&2
   exit 1

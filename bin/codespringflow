@@ -6,9 +6,21 @@ umask 0002
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RESULTS_ROOT="${CODESPRINGFLOW_RESULTS_ROOT:-$HOME/csl_results/fetchngs}"
+DEFAULT_RESULTS_ROOT="$HOME/csl_results/fetchngs"
+RESULTS_ROOT="${CODESPRINGFLOW_RESULTS_ROOT:-$DEFAULT_RESULTS_ROOT}"
 RUNTIME_ROOT="${CODESPRINGFLOW_RUNTIME_ROOT:-$HOME/.codespringflow}"
 RUNS_ROOT="$RESULTS_ROOT"
+WORK_NAMESPACE="${CODESPRINGFLOW_WORK_NAMESPACE:-}"
+if [[ -z "$WORK_NAMESPACE" && "$RESULTS_ROOT" != "$DEFAULT_RESULTS_ROOT" ]]; then
+    read -r results_root_checksum _ < <(printf '%s' "$RESULTS_ROOT" | cksum)
+    WORK_NAMESPACE="root_${results_root_checksum}"
+fi
+[[ -z "$WORK_NAMESPACE" || "$WORK_NAMESPACE" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    printf 'Error: CODESPRINGFLOW_WORK_NAMESPACE contains unsupported characters.\n' >&2
+    exit 1
+}
+WORK_RUNS_ROOT="$RUNTIME_ROOT/work/fetchngs"
+[[ -z "$WORK_NAMESPACE" ]] || WORK_RUNS_ROOT="$WORK_RUNS_ROOT/$WORK_NAMESPACE"
 CONFIG_FILE="${CODESPRINGFLOW_CONFIG:-$APP_ROOT/conf/fetchngs_cshl_slurm.config}"
 
 DEFAULT_NXF_VERSION="24.04.4"
@@ -45,6 +57,7 @@ FetchNGS options:
 Environment:
   CODESPRINGFLOW_RESULTS_ROOT  User-facing FetchNGS results root
   CODESPRINGFLOW_RUNTIME_ROOT  Nextflow cache, temporary, and work root
+  CODESPRINGFLOW_WORK_NAMESPACE Optional private work namespace; custom results roots receive one automatically
   CODESPRINGFLOW_CONFIG     Nextflow configuration file
   NEXTFLOW_BIN              Nextflow executable (default: ~/bin/nextflow)
   NXF_VER                   Nextflow version (default: 24.04.4)
@@ -80,7 +93,7 @@ prepare_storage() {
         "$RUNS_ROOT" \
         "$RUNTIME_ROOT/cache/singularity" \
         "$RUNTIME_ROOT/tmp" \
-        "$RUNTIME_ROOT/work/fetchngs"
+        "$WORK_RUNS_ROOT"
     [[ -w "$RESULTS_ROOT" ]] || die "FetchNGS results root is not writable: $RESULTS_ROOT"
     [[ -w "$RUNTIME_ROOT" ]] || die "FetchNGS runtime root is not writable: $RUNTIME_ROOT"
 }
@@ -106,7 +119,7 @@ write_run_bundle() {
     nf_run_name="${run_name//[^A-Za-z0-9_]/_}"
 
     mkdir -p "$run_dir/input" "$run_dir/results" "$run_dir/logs"
-    mkdir -p "$RUNTIME_ROOT/work/fetchngs/$run_name"
+    mkdir -p "$WORK_RUNS_ROOT/$run_name"
     cp "$input_file" "$copied_input"
 
     cat > "$run_dir/params.yml" <<EOF
@@ -139,7 +152,7 @@ export NXF_TEMP="$RUNTIME_ROOT/tmp"
 export TMPDIR="$RUNTIME_ROOT/tmp"
 
 RUN_DIR="$run_dir"
-WORK_DIR="$RUNTIME_ROOT/work/fetchngs/$run_name"
+WORK_DIR="$WORK_RUNS_ROOT/$run_name"
 NEXTFLOW_BIN="$nextflow_bin"
 
 if [[ ! -x "\$NEXTFLOW_BIN" ]]; then
@@ -182,7 +195,8 @@ EOF
         printf 'infrastructure_config\t%s\n' "$CONFIG_FILE"
         printf 'results_root\t%s\n' "$RESULTS_ROOT"
         printf 'runtime_root\t%s\n' "$RUNTIME_ROOT"
-        printf 'work_directory\t%s\n' "$RUNTIME_ROOT/work/fetchngs/$run_name"
+        printf 'work_namespace\t%s\n' "$WORK_NAMESPACE"
+        printf 'work_directory\t%s\n' "$WORK_RUNS_ROOT/$run_name"
     } > "$run_dir/run_manifest.tsv"
 
     printf '%s\n' "$run_dir"

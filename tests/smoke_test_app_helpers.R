@@ -131,10 +131,10 @@ assert(
 )
 assert(
   grepl("input.analysis == 'FetchNGS'", app_text, fixed = TRUE) &&
-    grepl('hideTab("web_main_tabs", "FetchNGS"', server_source, fixed = TRUE) &&
+    grepl('fetchngs_tabs <- c("FetchNGS", "FetchNGS Outputs")', server_source, fixed = TRUE) &&
     grepl('updateTabsetPanel(session, "web_main_tabs", selected = "FetchNGS")', server_source, fixed = TRUE) &&
     grepl('updateTabsetPanel(session, "web_main_tabs", selected = "Setup")', server_source, fixed = TRUE),
-  "FetchNGS selection isolates its workspace and returning to an analysis restores the project tabs"
+  "FetchNGS selection exposes its run and output tabs while returning to an analysis restores the project tabs"
 )
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
@@ -147,6 +147,28 @@ assert(!app_env$is_codespring_process_command("Rscript -e shiny::runApp('/home/u
 root <- tempfile("codespring-app-smoke-")
 dir.create(root, recursive = TRUE)
 on.exit(unlink(root, recursive = TRUE, force = TRUE), add = TRUE)
+
+custom_fetchngs_root <- file.path(root, "custom_fetchngs")
+assert(
+  identical(
+    app_env$resolve_fetchngs_results_root("default", "", app_env$FETCHNGS_RESULTS_ROOT),
+    normalizePath(app_env$FETCHNGS_RESULTS_ROOT, winslash = "/", mustWork = FALSE)
+  ) &&
+    identical(
+      app_env$resolve_fetchngs_results_root("custom", custom_fetchngs_root, app_env$FETCHNGS_RESULTS_ROOT),
+      normalizePath(custom_fetchngs_root, winslash = "/", mustWork = FALSE)
+    ) &&
+    identical(app_env$ensure_fetchngs_results_root(custom_fetchngs_root), normalizePath(custom_fetchngs_root, winslash = "/", mustWork = TRUE)) &&
+    dir.exists(custom_fetchngs_root),
+  "FetchNGS keeps the home-folder default and creates an explicitly selected writable custom root"
+)
+relative_root_error <- tryCatch({ app_env$resolve_fetchngs_results_root("custom", "relative/fetchngs"); "" }, error = conditionMessage)
+filesystem_root_error <- tryCatch({ app_env$resolve_fetchngs_results_root("custom", "/"); "" }, error = conditionMessage)
+assert(
+  grepl("absolute server path", relative_root_error, fixed = TRUE) &&
+    grepl("filesystem root", filesystem_root_error, fixed = TRUE),
+  "FetchNGS rejects relative custom roots and the filesystem root"
+)
 
 fetchngs_accessions <- app_env$parse_fetchngs_accessions("SRR14593545\nERR1160846, SRR14593545")
 assert(
@@ -182,6 +204,27 @@ assert(
     identical(fetchngs_summary$`Metadata only`[[1]], "Yes"),
   "Shiny FetchNGS helpers create a validator-compatible metadata-only bundle without submitting Slurm"
 )
+fetchngs_metadata_dir <- file.path(fetchngs_run, "results", "metadata")
+fetchngs_fastq_dir <- file.path(fetchngs_run, "results", "fastq")
+dir.create(fetchngs_metadata_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fetchngs_fastq_dir, recursive = TRUE, showWarnings = FALSE)
+fetchngs_metadata_file <- file.path(fetchngs_metadata_dir, "runinfo.tsv")
+fetchngs_yaml_file <- file.path(fetchngs_run, "results", "software_versions.yml")
+fetchngs_fastq_file <- file.path(fetchngs_fastq_dir, "sample.fastq.gz")
+writeLines(c("run\tlibrary_layout", "SRR14593545\tPAIRED"), fetchngs_metadata_file)
+writeLines(c("fetchngs: 1.12.0", "nextflow: 24.04.4"), fetchngs_yaml_file)
+writeLines("compressed-placeholder", fetchngs_fastq_file)
+fetchngs_catalog <- app_env$fetchngs_output_file_catalog("app_helper_smoke", fetchngs_root)
+assert(
+  NROW(fetchngs_catalog) == 3L &&
+    all(c("File", "Folder", "Type", "Size", "Modified", "path") %in% names(fetchngs_catalog)) &&
+    identical(app_env$validated_fetchngs_output_path("app_helper_smoke", fetchngs_metadata_file, fetchngs_root), normalizePath(fetchngs_metadata_file)) &&
+    identical(app_env$validated_fetchngs_output_path("app_helper_smoke", fetchngs_input, fetchngs_root), "") &&
+    identical(app_env$fetchngs_output_preview_kind(fetchngs_metadata_file), "table") &&
+    identical(app_env$fetchngs_output_preview_kind(fetchngs_yaml_file), "text") &&
+    identical(app_env$fetchngs_output_preview_kind(fetchngs_fastq_file), "binary"),
+  "FetchNGS output viewing catalogs only selected-run result files and chooses safe preview modes"
+)
 assert(
   app_env$fetchngs_job_is_active("RUNNING") &&
     app_env$fetchngs_job_is_active("PENDING") &&
@@ -208,12 +251,15 @@ assert(
   "FetchNGS deletion removes only the selected result and work folders while keeping the results root"
 )
 assert(
-  grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
+    grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
+    grepl('tabPanel("FetchNGS Outputs"', app_text, fixed = TRUE) &&
+    grepl('"fetchngs_results_mode", "FetchNGS results folder"', app_text, fixed = TRUE) &&
+    grepl('actionButton("browse_fetchngs_results_root"', app_text, fixed = TRUE) &&
     grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
     grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE) &&
     grepl('actionButton("delete_fetchngs"', app_text, fixed = TRUE) &&
     grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE),
-  "the app exposes FetchNGS creation, status, resume, and confirmed deletion controls"
+  "the app exposes FetchNGS location, creation, status, output viewing, resume, and confirmed deletion controls"
 )
 
 shared_scanpy_sif <- "/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif"
