@@ -11770,7 +11770,7 @@ ui <- fluidPage(
                               tags$p(tags$strong("Studies/submissions/projects: "), "SRP, ERP, DRP, SRA, ERA, DRA, PRJNA, PRJEB, PRJDB; ",
                                      tags$strong("GEO: "), "GSM, GSE."),
                               tags$p(class = "muted small-note", "Use the full accession including its numeric suffix. Study, project, and GEO identifiers may resolve to many sequencing runs.")),
-                          div(class = "run-message-alert",
+                          div(class = "run-message-alert fetchngs-safeguards",
                               tags$strong("Download safeguards"),
                               tags$ul(
                                 tags$li("Unrecognized accession formats are rejected."),
