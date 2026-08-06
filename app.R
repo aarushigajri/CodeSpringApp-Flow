@@ -350,6 +350,20 @@ JOBS_PATH <- file.path(APP_HOME, "jobs.tsv")
 LAST_PROJECT_PATH <- file.path(APP_HOME, "last_project_id.txt")
 PROJECT_CONFIG_ROOT <- file.path(APP_HOME, "project_configs")
 DEFAULT_RESULTS_ROOT <- normalizePath(file.path(CURRENT_HOME, "csl_results"), winslash = "/", mustWork = FALSE)
+APP_ROOT <- normalizePath(Sys.getenv("CSL_WEB_APP_ROOT", unset = getwd()), winslash = "/", mustWork = FALSE)
+FETCHNGS_RESULTS_ROOT <- normalizePath(
+  Sys.getenv("CSL_FETCHNGS_RESULTS_ROOT", unset = file.path(DEFAULT_RESULTS_ROOT, "fetchngs")),
+  winslash = "/",
+  mustWork = FALSE
+)
+FETCHNGS_RUNTIME_ROOT <- normalizePath(
+  Sys.getenv("CSL_FETCHNGS_RUNTIME_ROOT", unset = file.path(CURRENT_HOME, ".codespringflow")),
+  winslash = "/",
+  mustWork = FALSE
+)
+FETCHNGS_CLI <- file.path(APP_ROOT, "bin", "codespringflow")
+FETCHNGS_DEFAULT_VERSION <- "1.12.0"
+FETCHNGS_DEFAULT_NEXTFLOW_VERSION <- "24.04.4"
 RNA_EXAMPLE_FASTQ_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "fastq"), winslash = "/", mustWork = FALSE)
 RNA_EXAMPLE_DESIGN_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "manifest"), winslash = "/", mustWork = FALSE)
 CUTRUN_EXAMPLE_FASTQ_DIR <- RNA_EXAMPLE_FASTQ_DIR
@@ -389,6 +403,177 @@ GSEAPY_GENESET_OPTIONS <- c(
   "GTEx_Aging_Signatures_2021",
   "Proteomics_Drug_Atlas_2023"
 )
+
+validate_fetchngs_run_name <- function(run_name) {
+  run_name <- trimws(as.character(run_name %||% ""))
+  if (!grepl("^[A-Za-z0-9][A-Za-z0-9._-]*$", run_name)) {
+    stop("Run names may contain only letters, numbers, periods, underscores, and hyphens.")
+  }
+  run_name
+}
+
+parse_fetchngs_accessions <- function(value) {
+  accessions <- trimws(unlist(strsplit(as.character(value %||% ""), "[,;[:space:]]+", perl = TRUE)))
+  accessions <- unique(accessions[nzchar(accessions)])
+  if (!length(accessions)) stop("Paste at least one public accession, or select an accession file on the server.")
+  invalid <- accessions[!grepl("^[A-Za-z][A-Za-z0-9_.-]*$", accessions)]
+  if (length(invalid)) {
+    stop("Unsupported accession value(s): ", paste(utils::head(invalid, 5), collapse = ", "))
+  }
+  accessions
+}
+
+fetchngs_runs_root <- function(root = FETCHNGS_RESULTS_ROOT) root
+
+fetchngs_run_dir <- function(run_name, root = FETCHNGS_RESULTS_ROOT) {
+  file.path(fetchngs_runs_root(root), validate_fetchngs_run_name(run_name))
+}
+
+fetchngs_run_names <- function(root = FETCHNGS_RESULTS_ROOT) {
+  runs_root <- fetchngs_runs_root(root)
+  if (!dir.exists(runs_root)) return(character(0))
+  paths <- list.dirs(runs_root, recursive = FALSE, full.names = TRUE)
+  sort(basename(paths[nzchar(basename(paths))]))
+}
+
+fetchngs_read_manifest <- function(run_dir) {
+  path <- file.path(run_dir, "run_manifest.tsv")
+  if (!file.exists(path)) return(setNames(character(0), character(0)))
+  manifest <- tryCatch(
+    utils::read.delim(path, stringsAsFactors = FALSE, check.names = FALSE),
+    error = function(e) data.frame()
+  )
+  if (!NROW(manifest) || !all(c("field", "value") %in% names(manifest))) {
+    return(setNames(character(0), character(0)))
+  }
+  stats::setNames(as.character(manifest$value), as.character(manifest$field))
+}
+
+fetchngs_latest_job_id <- function(run_dir) {
+  path <- file.path(run_dir, "job_id.txt")
+  if (!file.exists(path)) return("")
+  value <- trimws(readLines(path, warn = FALSE, n = 1))
+  if (length(value) && grepl("^[0-9]+$", value[[1]])) value[[1]] else ""
+}
+
+fetchngs_scheduler_state <- function(job_id) {
+  if (!nzchar(job_id %||% "")) return("")
+  if (nzchar(Sys.which("squeue"))) {
+    queued <- suppressWarnings(tryCatch(
+      system2("squeue", c("-h", "-j", shQuote(job_id), "-o", shQuote("%T")), stdout = TRUE, stderr = FALSE),
+      error = function(e) character(0)
+    ))
+    queued <- trimws(queued[nzchar(trimws(queued))])
+    if (length(queued)) return(toupper(queued[[1]]))
+  }
+  if (nzchar(Sys.which("sacct"))) {
+    accounted <- suppressWarnings(tryCatch(
+      system2("sacct", c("-n", "-X", "-j", shQuote(job_id), "--format=State"), stdout = TRUE, stderr = FALSE),
+      error = function(e) character(0)
+    ))
+    accounted <- trimws(sub("[+ ].*$", "", trimws(accounted)))
+    accounted <- accounted[nzchar(accounted)]
+    if (length(accounted)) return(toupper(accounted[[1]]))
+  }
+  ""
+}
+
+fetchngs_human_size <- function(bytes) {
+  bytes <- suppressWarnings(as.numeric(bytes))
+  if (!is.finite(bytes) || bytes <= 0) return("0 B")
+  units <- c("B", "KB", "MB", "GB", "TB")
+  power <- min(floor(log(bytes, 1024)), length(units) - 1L)
+  paste0(format(round(bytes / (1024^power), 1), nsmall = if (power > 0) 1 else 0, trim = TRUE), " ", units[[power + 1L]])
+}
+
+fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_scheduler = TRUE) {
+  run_dir <- fetchngs_run_dir(run_name, root)
+  manifest <- fetchngs_read_manifest(run_dir)
+  job_id <- fetchngs_latest_job_id(run_dir)
+  scheduler_state <- if (isTRUE(query_scheduler)) fetchngs_scheduler_state(job_id) else ""
+  fastqs <- if (dir.exists(file.path(run_dir, "results"))) {
+    list.files(file.path(run_dir, "results"), pattern = "\\.fastq\\.gz$", recursive = TRUE, full.names = TRUE)
+  } else character(0)
+  metadata <- if (dir.exists(file.path(run_dir, "results", "metadata"))) {
+    list.files(file.path(run_dir, "results", "metadata"), recursive = TRUE, full.names = TRUE)
+  } else character(0)
+  metadata <- metadata[file.exists(metadata) & !dir.exists(metadata)]
+  output_files <- c(fastqs, metadata)
+  output_bytes <- if (length(output_files)) sum(file.info(output_files)$size, na.rm = TRUE) else 0
+  status <- if (scheduler_state %in% c("RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "SUSPENDED")) {
+    tools::toTitleCase(tolower(scheduler_state))
+  } else if (scheduler_state %in% c("COMPLETED")) {
+    "Completed"
+  } else if (nzchar(scheduler_state)) {
+    paste("Failed/stopped:", scheduler_state)
+  } else if (!nzchar(job_id)) {
+    "Bundle only"
+  } else if (length(fastqs) || length(metadata)) {
+    "Outputs present"
+  } else {
+    "Submitted"
+  }
+  data.frame(
+    Run = run_name,
+    Status = status,
+    `Job ID` = job_id,
+    `FASTQ files` = length(fastqs),
+    `Metadata files` = length(metadata),
+    `Output size` = fetchngs_human_size(output_bytes),
+    `Metadata only` = if (identical(tolower(manifest[["metadata_only"]] %||% "false"), "true")) "Yes" else "No",
+    `FetchNGS version` = manifest[["fetchngs_version"]] %||% FETCHNGS_DEFAULT_VERSION,
+    `Run directory` = run_dir,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+fetchngs_runs_table <- function(root = FETCHNGS_RESULTS_ROOT, query_scheduler = TRUE) {
+  runs <- rev(fetchngs_run_names(root))
+  if (!length(runs)) return(data.frame())
+  do.call(rbind, lapply(runs, fetchngs_run_summary, root = root, query_scheduler = query_scheduler))
+}
+
+fetchngs_latest_log <- function(run_name, root = FETCHNGS_RESULTS_ROOT, lines = 160L) {
+  log_dir <- file.path(fetchngs_run_dir(run_name, root), "logs")
+  if (!dir.exists(log_dir)) return("No controller log directory exists yet.")
+  files <- list.files(log_dir, pattern = "^controller-.*\\.(out|err)$", full.names = TRUE)
+  if (!length(files)) return("No controller log exists yet. A bundle-only run has not been submitted.")
+  info <- file.info(files)
+  newest <- files[[which.max(info$mtime)]]
+  content <- readLines(newest, warn = FALSE)
+  content <- utils::tail(content, max(1L, as.integer(lines)))
+  paste(c(paste("Log:", newest), "", content), collapse = "\n")
+}
+
+run_fetchngs_cli <- function(args, results_root = FETCHNGS_RESULTS_ROOT, runtime_root = FETCHNGS_RUNTIME_ROOT) {
+  if (!file.exists(FETCHNGS_CLI)) stop("FetchNGS launcher is missing: ", FETCHNGS_CLI)
+  if (file.access(FETCHNGS_CLI, mode = 1) != 0) stop("FetchNGS launcher is not executable: ", FETCHNGS_CLI)
+  results_root <- normalizePath(results_root, winslash = "/", mustWork = FALSE)
+  runtime_root <- normalizePath(runtime_root, winslash = "/", mustWork = FALSE)
+  env <- c(
+    paste0("CODESPRINGFLOW_RESULTS_ROOT=", results_root),
+    paste0("CODESPRINGFLOW_RUNTIME_ROOT=", runtime_root)
+  )
+  output <- tryCatch(
+    system2(FETCHNGS_CLI, vapply(as.character(args), shQuote, character(1)), stdout = TRUE, stderr = TRUE, env = env),
+    error = function(e) structure(conditionMessage(e), status = 1L)
+  )
+  status <- attr(output, "status") %||% 0L
+  text <- paste(output, collapse = "\n")
+  if (!identical(as.integer(status), 0L)) stop(if (nzchar(text)) text else "FetchNGS launcher failed.")
+  text
+}
+
+write_fetchngs_accession_input <- function(run_name, value, app_home = APP_HOME) {
+  accessions <- parse_fetchngs_accessions(value)
+  input_dir <- file.path(app_home, "fetchngs_inputs")
+  dir.create(input_dir, recursive = TRUE, showWarnings = FALSE)
+  path <- file.path(input_dir, paste0(validate_fetchngs_run_name(run_name), "_accessions.txt"))
+  writeLines(accessions, path, useBytes = TRUE)
+  path
+}
+
 LOGO_CSL_PATH <- file.path(SCRIPTS_DIR, "Logo_CSL.png")
 LOGO_PATH <- file.path(SCRIPTS_DIR, "Logo.png")
 FLOWCHART_PATH <- file.path(SCRIPTS_DIR, "flowchart.png")
@@ -11044,6 +11229,68 @@ ui <- fluidPage(
                                  if (file.exists(LOGO_PATH)) tags$img(src = file.path("codespring_logo", basename(LOGO_PATH))) else NULL,
                                  if (file.exists(LOGO_CSL_PATH)) tags$img(src = file.path("csl_logo", basename(LOGO_CSL_PATH))) else NULL))
                  )),
+        tabPanel("FetchNGS", br(),
+                 div(class = "progress-header-row",
+                     div(
+                       h3("Fetch public sequencing data"),
+                       tags$p(class = "muted", "Run nf-core/fetchngs through SLURM. FetchNGS is a standalone data-download tool; it does not automatically start CUT&RUN, Sarek, or another analysis pipeline.")
+                     ),
+                     actionButton("refresh_fetchngs", "Refresh runs", class = "btn-primary")
+                 ),
+                 fluidRow(
+                   column(5,
+                          div(class = "read-source-note",
+                              tags$strong("Validated cluster settings"),
+                              tags$p("Nextflow 24.04.4, nf-core/fetchngs 1.12.0, Singularity 3.6.3, Slurm cpuq, and the sratools download method.")),
+                          radioButtons(
+                            "fetchngs_input_mode", "Accession source",
+                            choices = c("Paste accessions" = "paste", "Use a server file" = "server"),
+                            selected = "paste", inline = TRUE
+                          ),
+                          conditionalPanel(
+                            "input.fetchngs_input_mode == 'paste'",
+                            textAreaInput(
+                              "fetchngs_accessions", "Public accessions",
+                              value = "", rows = 7,
+                              placeholder = "One or more IDs, for example:\nSRR14593545\nERR1160846"
+                            )
+                          ),
+                          conditionalPanel(
+                            "input.fetchngs_input_mode == 'server'",
+                            div(class = "new-project-path-control",
+                                textInput("fetchngs_accession_file", "Accession file", value = "", placeholder = "/path/to/accessions.txt"),
+                                actionButton("browse_fetchngs_accession_file", "Browse server", class = "btn-default"),
+                                tags$p(class = "muted small-note", "Use a non-empty .txt, .csv, or .tsv file readable by the app user.")
+                            )
+                          ),
+                          textInput("fetchngs_run_name", "Run name", value = "", placeholder = "e.g. wgs_pilot_01"),
+                          checkboxInput("fetchngs_metadata_only", "Retrieve metadata only; do not download FASTQs", value = FALSE),
+                          tags$details(
+                            tags$summary("Advanced / testing"),
+                            br(),
+                            textInput("fetchngs_pipeline_version", "nf-core/fetchngs version", value = FETCHNGS_DEFAULT_VERSION),
+                            checkboxInput("fetchngs_bundle_only", "Create and validate the run bundle without submitting it", value = FALSE)
+                          ),
+                          br(),
+                          actionButton("submit_fetchngs", "Create and run FetchNGS", class = "btn-primary"),
+                          br(), br(),
+                          verbatimTextOutput("fetchngs_message")
+                   ),
+                   column(7,
+                          h4("Output location"),
+                          div(class = "path-browser-current", textOutput("fetchngs_root_text")),
+                          tags$p(class = "muted small-note", "FetchNGS results use the same csl_results area as other CodeSpringApp projects. Nextflow cache and work files are kept separately."),
+                          h4("Existing FetchNGS runs"),
+                          uiOutput("fetchngs_run_select_ui"),
+                          div(class = "button-row",
+                              actionButton("resume_fetchngs", "Resume selected run")),
+                          br(),
+                          table_output("fetchngs_runs_table"),
+                          br(),
+                          h4("Newest controller log"),
+                          tags$pre(class = "log-viewer", textOutput("fetchngs_log_text"))
+                   )
+                 )),
         tabPanel("Design Matrix", br(), uiOutput("design_editor_heading"),
                  uiOutput("design_matrix_help_ui"),
                  fluidRow(
@@ -11114,6 +11361,8 @@ server <- function(input, output, session) {
   # available without mutating the source manifest selected at project setup.
   scrna_manifest_state <- reactiveVal(data.frame())
   run_message <- reactiveVal("")
+  fetchngs_refresh <- reactiveVal(0L)
+  fetchngs_message_state <- reactiveVal("")
   tool_messages <- reactiveVal(list())
   progress_refresh <- reactiveVal(Sys.time())
   run_cards_refresh <- reactiveVal(Sys.time())
@@ -11478,6 +11727,9 @@ server <- function(input, output, session) {
   observeEvent(input$browse_new_counts_design_server_file, {
     open_server_browser("new_counts_design_server_file", "file", input$new_counts_design_server_file %||% "")
   })
+  observeEvent(input$browse_fetchngs_accession_file, {
+    open_server_browser("fetchngs_accession_file", "file", input$fetchngs_accession_file %||% "")
+  })
   observeEvent(input$browse_new_scrna_manifest_path, {
     open_server_browser("new_scrna_manifest_path", "file", input$new_scrna_manifest_path %||% "")
   })
@@ -11558,6 +11810,96 @@ server <- function(input, output, session) {
     }
     updateTextInput(session, path_browser$target, value = value)
     removeModal()
+  })
+
+  output$fetchngs_root_text <- renderText({
+    paste0(
+      "FetchNGS runs: ", FETCHNGS_RESULTS_ROOT,
+      "\nRun outputs: ", file.path(FETCHNGS_RESULTS_ROOT, "<run-name>", "results"),
+      "\nRuntime/cache: ", FETCHNGS_RUNTIME_ROOT
+    )
+  })
+
+  output$fetchngs_message <- renderText(fetchngs_message_state())
+
+  output$fetchngs_run_select_ui <- renderUI({
+    fetchngs_refresh()
+    runs <- rev(fetchngs_run_names())
+    if (!length(runs)) return(div(class = "empty-box", "No FetchNGS runs have been created for this user yet."))
+    selected <- isolate(input$fetchngs_selected_run %||% "")
+    if (!selected %in% runs) selected <- runs[[1]]
+    selectInput(
+      "fetchngs_selected_run", "Selected run",
+      choices = stats::setNames(runs, runs), selected = selected, selectize = FALSE
+    )
+  })
+
+  output$fetchngs_runs_table <- render_csl_table({
+    fetchngs_refresh()
+    fetchngs_runs_table(query_scheduler = TRUE)
+  }, page_length = 10, scroll_y = "360px")
+
+  output$fetchngs_log_text <- renderText({
+    fetchngs_refresh()
+    run_name <- input$fetchngs_selected_run %||% ""
+    if (!nzchar(run_name)) return("Select a FetchNGS run to view its newest controller log.")
+    tryCatch(fetchngs_latest_log(run_name), error = function(e) paste("Could not read the selected log:", conditionMessage(e)))
+  })
+
+  observeEvent(input$refresh_fetchngs, {
+    fetchngs_refresh(fetchngs_refresh() + 1L)
+    fetchngs_message_state(paste("FetchNGS run status refreshed at", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
+  })
+
+  observeEvent(input$submit_fetchngs, {
+    fetchngs_message_state("Validating FetchNGS input and creating the run bundle...")
+    result <- tryCatch({
+      run_name <- validate_fetchngs_run_name(input$fetchngs_run_name)
+      existing_dir <- fetchngs_run_dir(run_name)
+      if (dir.exists(existing_dir)) {
+        stop("A FetchNGS run named '", run_name, "' already exists. Select it and use Resume, or choose a new run name.")
+      }
+      input_mode <- input$fetchngs_input_mode %||% "paste"
+      input_path <- if (identical(input_mode, "server")) {
+        candidate <- path.expand(trimws(input$fetchngs_accession_file %||% ""))
+        if (!file.exists(candidate) || dir.exists(candidate)) stop("Choose an existing accession file on the server.")
+        if (file.access(candidate, mode = 4) != 0) stop("The app cannot read the selected accession file: ", candidate)
+        if (!tolower(tools::file_ext(candidate)) %in% c("txt", "csv", "tsv")) stop("The accession file must end in .txt, .csv, or .tsv.")
+        if (!is.finite(file.info(candidate)$size) || file.info(candidate)$size <= 0) stop("The selected accession file is empty.")
+        normalizePath(candidate, winslash = "/", mustWork = TRUE)
+      } else {
+        write_fetchngs_accession_input(run_name, input$fetchngs_accessions)
+      }
+      version <- trimws(input$fetchngs_pipeline_version %||% FETCHNGS_DEFAULT_VERSION)
+      args <- c("fetchngs", "--input", input_path, "--name", run_name, "--pipeline-version", version)
+      if (isTRUE(input$fetchngs_metadata_only)) args <- c(args, "--metadata-only")
+      if (isTRUE(input$fetchngs_bundle_only)) args <- c(args, "--dry-run")
+      output <- run_fetchngs_cli(args)
+      updateSelectInput(session, "fetchngs_selected_run", selected = run_name)
+      paste(
+        output,
+        "",
+        paste("FASTQ output folder:", file.path(fetchngs_run_dir(run_name), "results", "fastq")),
+        sep = "\n"
+      )
+    }, error = function(e) paste("ERROR:", conditionMessage(e)))
+    fetchngs_message_state(result)
+    fetchngs_refresh(fetchngs_refresh() + 1L)
+  })
+
+  observeEvent(input$resume_fetchngs, {
+    run_name <- input$fetchngs_selected_run %||% ""
+    if (!nzchar(run_name)) {
+      fetchngs_message_state("ERROR: Select an existing FetchNGS run to resume.")
+      return()
+    }
+    fetchngs_message_state(paste("Submitting a Nextflow resume for", run_name, "..."))
+    result <- tryCatch(
+      run_fetchngs_cli(c("resume", validate_fetchngs_run_name(run_name))),
+      error = function(e) paste("ERROR:", conditionMessage(e))
+    )
+    fetchngs_message_state(result)
+    fetchngs_refresh(fetchngs_refresh() + 1L)
   })
 
   filtered_projects <- reactive({

@@ -1,6 +1,6 @@
 # CodeSpringApp
 
-CodeSpringApp is a Shiny-based control center for running, monitoring, and reviewing CodeSpringLab RNA-seq, ATAC-seq, CUT&RUN, and ChIP-seq projects from one server port. It replaces notebook prompts with a button-driven interface for project setup, design-matrix editing, SLURM submission, progress tracking, logs, methods, and assay-specific Results Explorers.
+CodeSpringApp is a Shiny-based control center for fetching public sequencing data and for running, monitoring, and reviewing CodeSpringLab RNA-seq, ATAC-seq, CUT&RUN, and ChIP-seq projects from one server port. It replaces notebook prompts with a button-driven interface for FetchNGS, project setup, design-matrix editing, SLURM submission, progress tracking, logs, methods, and assay-specific Results Explorers.
 
 It is designed for shared HPC environments where analyses should continue running after the browser or app is closed.
 
@@ -40,6 +40,72 @@ Example FASTQs remain read-only inputs. When the project is created, CodeSpringA
 
 The server folder browser starts from the current user's home directory and hides dotfiles by default. Folders are selectable for navigation, while visible files are listed separately for confirmation. Typed paths are validated before navigation, and empty, hidden-only, missing, and unreadable folders receive distinct messages.
 
+## FetchNGS
+
+The **FetchNGS** tab runs `nf-core/fetchngs` as a standalone SLURM job. Users can
+paste public accessions directly or select a `.txt`, `.csv`, or `.tsv` accession
+file already on the server. The app supports full FASTQ retrieval and a
+metadata-only mode.
+
+The validated cluster defaults are:
+
+- Nextflow `24.04.4`
+- nf-core/fetchngs `1.12.0`
+- Singularity `3.6.3`
+- Slurm partition `cpuq`
+- FetchNGS download method `sratools`
+
+FTP is not exposed because the tested FetchNGS wget container could not resolve
+DNS under the cluster's Singularity 3.6.3 installation. Aspera is not exposed
+because it has not yet been validated on this cluster.
+
+Each Unix user gets a private FetchNGS results folder inside the same
+`~/csl_results` area used by other CodeSpringApp projects:
+
+```text
+~/csl_results/
+└── fetchngs/
+  └── <run-name>/
+    ├── input/
+    ├── logs/
+    ├── results/
+    │   ├── fastq/
+    │   ├── metadata/
+    │   └── samplesheet/
+    ├── job_history.txt
+    ├── job_id.txt
+    ├── params.yml
+    ├── run.sbatch
+    └── run_manifest.tsv
+```
+
+Nextflow's non-result runtime files are kept separately:
+
+```text
+~/.codespringflow/
+├── cache/singularity/
+├── tmp/
+└── work/fetchngs/<run-name>/
+```
+
+The FetchNGS tab shows the resolved output root, discovered runs, Slurm state,
+FASTQ and metadata counts, output size, and the newest controller log. A failed
+or interrupted run can be selected and resumed with Nextflow's `-resume`
+behavior. **Create bundle only** writes and validates the input, parameter,
+manifest, and Slurm files without submitting a job.
+
+FetchNGS only retrieves data. It does not automatically launch CUT&RUN, Sarek,
+or another analysis workflow. A downloaded FASTQ folder can later be selected
+through the normal CodeSpringApp project setup controls.
+
+To override either location, set the applicable root before starting the app:
+
+```bash
+export CSL_FETCHNGS_RESULTS_ROOT=/path/to/csl_results/fetchngs
+export CSL_FETCHNGS_RUNTIME_ROOT=/path/to/private/fetchngs_runtime
+./run_codespringweb.sh
+```
+
 ## Run On The Server
 
 Use the launcher script. It checks required packages, finds an open server port, starts Shiny, and prints the exact SSH tunnel command to run from your laptop.
@@ -78,6 +144,8 @@ Example launcher output. The port in your terminal may differ if the default por
 ![CodeSpringApp launcher output](docs/assets/launcher_output.png)
 
 ## What It Does
+
+- Retrieves public sequencing data through a standalone nf-core/fetchngs SLURM workflow.
 
 ### Single-cell RNA-seq
 
@@ -196,6 +264,7 @@ For new projects, it creates project-local outputs under:
 ## Tabs
 
 - `Setup`: choose analysis/project, create projects, browse server folders, select genome references, and delete configs/results.
+- `FetchNGS`: paste or select public accessions, submit or resume downloads, inspect run status, and read controller logs.
 - `Design Matrix`: scan FASTQ folders, include/exclude samples, edit metadata, and save a project-local `design_matrix.txt`.
 - `Run Pipeline`: submit SLURM jobs with step-specific settings and safeguards.
 - `Progress`: monitor step and sample progress, including active, cancelled, deleted, and likely failed states.
@@ -219,6 +288,9 @@ Project logs are written under:
 <results_root>/<project_name>/log/
 ```
 
+FetchNGS controller logs and nf-core execution reports are stored under
+`~/csl_results/fetchngs/<run-name>/logs/` by default.
+
 ## Tests
 
 With CodeSpringLab checked out beside this repository, run:
@@ -227,4 +299,8 @@ With CodeSpringLab checked out beside this repository, run:
 bash tests/run_all.sh ../CodeSpringLab
 ```
 
-This validates project setup, example datasets, pipeline step selection, output detection, retry behavior, paired- and single-end STAR/Kallisto/RSEM/featureCounts SLURM arguments, Results Explorer helpers, and launcher path isolation without submitting cluster jobs.
+This first performs a FetchNGS bundle smoke test without Slurm or network
+access. It then validates project setup, example datasets, pipeline step
+selection, output detection, retry behavior, paired- and single-end
+STAR/Kallisto/RSEM/featureCounts SLURM arguments, Results Explorer helpers, and
+launcher path isolation without submitting cluster jobs.

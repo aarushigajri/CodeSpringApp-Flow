@@ -116,6 +116,12 @@ assert(any(grepl("codespringIgvLoadPromise", runtime_text, fixed = TRUE)), "IGV 
 assert(grepl("comparison_default_locus", server_source, fixed = TRUE) && grepl("locus_override = top_peak", server_source, fixed = TRUE), "each differential comparison defaults IGV to its most significant ranked peak")
 assert(app_env$path_is_within(app_env$APP_HOME, app_env$CURRENT_HOME), "private app state is derived from the effective Unix user's home")
 assert(identical(app_env$DEFAULT_RESULTS_ROOT, normalizePath(file.path(app_env$CURRENT_HOME, "csl_results"), winslash = "/", mustWork = FALSE)), "default results root is derived from the effective Unix user's home")
+assert(
+  grepl('unset = file.path(DEFAULT_RESULTS_ROOT, "fetchngs")', app_text, fixed = TRUE) &&
+    grepl('unset = file.path(CURRENT_HOME, ".codespringflow")', app_text, fixed = TRUE) &&
+    !identical(app_env$FETCHNGS_RESULTS_ROOT, app_env$FETCHNGS_RUNTIME_ROOT),
+  "FetchNGS results use the user's csl_results folder while cache and work data use a separate private runtime folder"
+)
 assert(identical(unname(app_env$analysis_choices()), c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")), "all analysis selectors use one canonical order and spelling")
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
@@ -128,6 +134,36 @@ assert(!app_env$is_codespring_process_command("Rscript -e shiny::runApp('/home/u
 root <- tempfile("codespring-app-smoke-")
 dir.create(root, recursive = TRUE)
 on.exit(unlink(root, recursive = TRUE, force = TRUE), add = TRUE)
+
+fetchngs_accessions <- app_env$parse_fetchngs_accessions("SRR14593545\nERR1160846, SRR14593545")
+assert(
+  identical(fetchngs_accessions, c("SRR14593545", "ERR1160846")),
+  "FetchNGS pasted accessions are split and deduplicated"
+)
+fetchngs_input <- file.path(root, "fetchngs_accessions.txt")
+writeLines(fetchngs_accessions, fetchngs_input)
+fetchngs_root <- file.path(root, "csl_results", "fetchngs")
+fetchngs_runtime_root <- file.path(root, ".codespringflow")
+fetchngs_output <- app_env$run_fetchngs_cli(
+  c("fetchngs", "--input", fetchngs_input, "--name", "app_helper_smoke", "--metadata-only", "--dry-run"),
+  results_root = fetchngs_root,
+  runtime_root = fetchngs_runtime_root
+)
+fetchngs_run <- app_env$fetchngs_run_dir("app_helper_smoke", fetchngs_root)
+fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_root, query_scheduler = FALSE)
+assert(
+  grepl("Dry run only", fetchngs_output, fixed = TRUE) &&
+    file.exists(file.path(fetchngs_run, "run.sbatch")) &&
+    identical(fetchngs_summary$Status[[1]], "Bundle only") &&
+    identical(fetchngs_summary$`Metadata only`[[1]], "Yes"),
+  "Shiny FetchNGS helpers create and discover a metadata-only bundle without submitting Slurm"
+)
+assert(
+  grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
+    grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
+    grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE),
+  "the app exposes FetchNGS creation, status, and resume controls"
+)
 
 shared_scanpy_sif <- "/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif"
 assert(
