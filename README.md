@@ -112,7 +112,16 @@ The **FetchNGS Outputs** tab lists files beneath the selected run's `results/`
 folder. CSV, TSV, and TXT files are shown as capped interactive tables; JSON,
 YAML, Markdown, and log files receive a capped text preview. Large or binary
 files such as compressed FASTQs are listed with their path, type, size, and
-modification time without being loaded into the browser.
+modification time without being loaded into the browser. The inventory is
+limited to the first 2,000 files and six folder levels so opening a large run
+cannot indefinitely block the Shiny session.
+
+The output viewer has its own **Results location to view** selector. It always
+includes the default `~/csl_results/fetchngs` location and remembers readable
+custom locations for the current Unix user. Use **Add an older results folder**
+to select the folder that directly contains older `<run-name>/results/`
+directories. This viewer choice does not change the destination used for new
+FetchNGS runs.
 
 **Delete selected run** asks for confirmation and removes only that run's folder
 beneath the currently selected results root and its matching private Nextflow
@@ -291,7 +300,7 @@ For new projects, it creates project-local outputs under:
 - The `Analysis type` dropdown treats `FetchNGS` as a separate data-retrieval workflow. Selecting it hides biological-project controls and analysis tabs; selecting RNA-seq, scRNA-seq, ATAC-seq, CUT&RUN, or ChIP-seq restores the normal project workspace.
 - `Setup`: choose analysis/project, create projects, browse server folders, select genome references, and delete configs/results.
 - `FetchNGS`: shown only when FetchNGS is selected; paste or select public accessions, submit or resume downloads, inspect run status, and read controller logs.
-- `FetchNGS Outputs`: shown only when FetchNGS is selected; inventory the selected run's result files and safely preview supported tables and text outputs.
+- `FetchNGS Outputs`: shown only when FetchNGS is selected; choose current or remembered results locations, inventory a selected run's result files, and safely preview supported tables and text outputs.
 - `Design Matrix`: scan FASTQ folders, include/exclude samples, edit metadata, and save a project-local `design_matrix.txt`.
 - `Run Pipeline`: submit SLURM jobs with step-specific settings and safeguards.
 - `Progress`: monitor step and sample progress, including active, cancelled, deleted, and likely failed states.

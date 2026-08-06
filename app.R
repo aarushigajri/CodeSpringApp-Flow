@@ -361,6 +361,7 @@ FETCHNGS_RUNTIME_ROOT <- normalizePath(
   winslash = "/",
   mustWork = FALSE
 )
+FETCHNGS_ROOT_HISTORY_PATH <- file.path(APP_HOME, "fetchngs_results_roots.tsv")
 FETCHNGS_CLI <- file.path(APP_ROOT, "bin", "codespringflow")
 FETCHNGS_DEFAULT_VERSION <- "1.12.0"
 FETCHNGS_DEFAULT_NEXTFLOW_VERSION <- "24.04.4"
@@ -453,6 +454,38 @@ ensure_fetchngs_results_root <- function(root) {
   }
   if (file.access(root, mode = 7) != 0) stop("The app cannot read and write inside the FetchNGS output folder: ", root)
   normalizePath(root, winslash = "/", mustWork = TRUE)
+}
+
+fetchngs_known_results_roots <- function(
+    default_root = FETCHNGS_RESULTS_ROOT,
+    history_path = FETCHNGS_ROOT_HISTORY_PATH) {
+  roots <- normalizePath(default_root, winslash = "/", mustWork = FALSE)
+  if (file.exists(history_path)) {
+    history <- tryCatch(
+      utils::read.delim(history_path, stringsAsFactors = FALSE, check.names = FALSE),
+      error = function(e) data.frame()
+    )
+    if (NROW(history) && "root" %in% names(history)) roots <- c(roots, as.character(history$root))
+  }
+  roots <- trimws(roots)
+  roots <- roots[nzchar(roots) & startsWith(roots, "/")]
+  roots <- unique(vapply(roots, normalizePath, character(1), winslash = "/", mustWork = FALSE))
+  roots[dir.exists(roots) & vapply(roots, file.access, integer(1), mode = 5) == 0]
+}
+
+remember_fetchngs_results_root <- function(root, history_path = FETCHNGS_ROOT_HISTORY_PATH) {
+  root <- resolve_fetchngs_results_root("custom", root)
+  if (!dir.exists(root) || file.access(root, mode = 5) != 0) return(invisible(FALSE))
+  root <- normalizePath(root, winslash = "/", mustWork = TRUE)
+  prior <- fetchngs_known_results_roots(default_root = root, history_path = history_path)
+  prior <- prior[prior != root]
+  history <- data.frame(
+    root = utils::head(c(root, prior), 20L),
+    stringsAsFactors = FALSE
+  )
+  dir.create(dirname(history_path), recursive = TRUE, showWarnings = FALSE)
+  utils::write.table(history, history_path, sep = "\t", row.names = FALSE, quote = FALSE, na = "")
+  invisible(TRUE)
 }
 
 fetchngs_runtime_work_dir <- function(run_name, runtime_root = FETCHNGS_RUNTIME_ROOT) {
@@ -596,20 +629,57 @@ fetchngs_runs_table <- function(root = FETCHNGS_RESULTS_ROOT, query_scheduler = 
   do.call(rbind, lapply(runs, fetchngs_run_summary, root = root, query_scheduler = query_scheduler))
 }
 
-fetchngs_output_files <- function(run_name, root = FETCHNGS_RESULTS_ROOT) {
+fetchngs_output_files <- function(run_name, root = FETCHNGS_RESULTS_ROOT, max_files = 2000L, max_depth = 6L) {
   output_root <- file.path(fetchngs_run_dir(run_name, root), "results")
   if (!dir.exists(output_root)) return(character(0))
   output_root <- normalizePath(output_root, winslash = "/", mustWork = TRUE)
-  files <- list.files(output_root, recursive = TRUE, full.names = TRUE, all.files = FALSE)
+  max_files <- max(1L, as.integer(max_files))
+  max_depth <- max(0L, as.integer(max_depth))
+  queue <- data.frame(path = output_root, depth = 0L, stringsAsFactors = FALSE)
+  files <- character(0)
+  truncated <- FALSE
+  while (NROW(queue) && length(files) < max_files) {
+    current <- queue[1L, , drop = FALSE]
+    queue <- queue[-1L, , drop = FALSE]
+    entries <- tryCatch(
+      list.files(current$path[[1]], full.names = TRUE, all.files = FALSE, no.. = TRUE),
+      error = function(e) character(0)
+    )
+    if (!length(entries)) next
+    info <- suppressWarnings(file.info(entries))
+    directories <- entries[!is.na(info$isdir) & info$isdir]
+    regular_files <- entries[!is.na(info$isdir) & !info$isdir]
+    if (length(regular_files)) {
+      remaining <- max_files - length(files)
+      files <- c(files, utils::head(regular_files, remaining))
+      if (length(regular_files) > remaining) truncated <- TRUE
+    }
+    if (current$depth[[1]] < max_depth && length(directories) && length(files) < max_files) {
+      directories <- normalizePath(directories, winslash = "/", mustWork = FALSE)
+      directories <- directories[vapply(directories, path_is_within, logical(1), root = output_root)]
+      if (length(directories)) {
+        queue <- rbind(
+          queue,
+          data.frame(path = directories, depth = current$depth[[1]] + 1L, stringsAsFactors = FALSE)
+        )
+      }
+    } else if (length(directories)) {
+      truncated <- TRUE
+    }
+  }
+  if (NROW(queue)) truncated <- TRUE
   files <- files[file.exists(files) & !dir.exists(files)]
   files <- normalizePath(files, winslash = "/", mustWork = TRUE)
   files <- files[vapply(files, path_is_within, logical(1), root = output_root)]
-  sort(unique(files))
+  files <- sort(unique(files))
+  attr(files, "truncated") <- truncated
+  files
 }
 
 fetchngs_output_file_catalog <- function(run_name, root = FETCHNGS_RESULTS_ROOT) {
   files <- fetchngs_output_files(run_name, root)
   if (!length(files)) return(data.frame())
+  truncated <- isTRUE(attr(files, "truncated"))
   output_root <- normalizePath(file.path(fetchngs_run_dir(run_name, root), "results"), winslash = "/", mustWork = TRUE)
   relative <- substring(files, nchar(output_root) + 2L)
   info <- file.info(files)
@@ -617,7 +687,7 @@ fetchngs_output_file_catalog <- function(run_name, root = FETCHNGS_RESULTS_ROOT)
   ext[!nzchar(ext)] <- "FILE"
   folders <- dirname(relative)
   folders[folders == "."] <- "results"
-  data.frame(
+  catalog <- data.frame(
     File = basename(files),
     Folder = folders,
     Type = ext,
@@ -627,6 +697,8 @@ fetchngs_output_file_catalog <- function(run_name, root = FETCHNGS_RESULTS_ROOT)
     stringsAsFactors = FALSE,
     check.names = FALSE
   )
+  attr(catalog, "truncated") <- truncated
+  catalog
 }
 
 validated_fetchngs_output_path <- function(run_name, path, root = FETCHNGS_RESULTS_ROOT) {
@@ -11484,9 +11556,18 @@ ui <- fluidPage(
                  div(class = "progress-header-row",
                      div(
                        h3("FetchNGS output viewer"),
-                       tags$p(class = "muted", "Browse files produced for a FetchNGS run in the currently selected default or custom results folder.")
+                       tags$p(class = "muted", "Browse files produced for current or older FetchNGS runs without changing where the next run will be written.")
                      ),
                      actionButton("refresh_fetchngs_outputs", "Refresh outputs", class = "btn-primary")
+                 ),
+                 uiOutput("fetchngs_output_root_ui"),
+                 tags$details(
+                   tags$summary("Add an older results folder"),
+                   br(),
+                   div(class = "new-project-path-control",
+                       textInput("fetchngs_older_results_root", "Existing FetchNGS runs folder", value = "", placeholder = "/absolute/server/path/fetchngs"),
+                       actionButton("browse_fetchngs_older_results_root", "Browse server", class = "btn-default"),
+                       tags$p(class = "muted small-note", "Choose the folder that directly contains the older run-name folders. This does not change where new FetchNGS runs are written."))
                  ),
                  div(class = "path-browser-current", textOutput("fetchngs_outputs_root_text")),
                  br(),
@@ -11497,6 +11578,7 @@ ui <- fluidPage(
                           uiOutput("fetchngs_output_file_metadata_ui")),
                    column(8,
                           h4("Files in this run"),
+                          uiOutput("fetchngs_output_scan_note"),
                           table_output("fetchngs_output_files_table"),
                           br(),
                           h4("Selected file preview"),
@@ -11573,6 +11655,8 @@ server <- function(input, output, session) {
   scrna_manifest_state <- reactiveVal(data.frame())
   run_message <- reactiveVal("")
   fetchngs_refresh <- reactiveVal(0L)
+  fetchngs_known_roots_refresh <- reactiveVal(0L)
+  fetchngs_output_root_preference <- reactiveVal("")
   fetchngs_message_state <- reactiveVal("")
   fetchngs_delete_target <- reactiveVal(list())
   tool_messages <- reactiveVal(list())
@@ -11593,6 +11677,32 @@ server <- function(input, output, session) {
   safe_active_fetchngs_results_root <- reactive({
     tryCatch(active_fetchngs_results_root(), error = function(e) "")
   })
+
+  observeEvent(
+    list(input$fetchngs_results_mode, input$fetchngs_custom_results_root),
+    {
+      if (!identical(input$fetchngs_results_mode %||% "default", "custom")) return(invisible(NULL))
+      root <- tryCatch(active_fetchngs_results_root(), error = function(e) "")
+      if (!nzchar(root) || !dir.exists(root) || file.access(root, mode = 5) != 0) return(invisible(NULL))
+      if (isTRUE(remember_fetchngs_results_root(root))) {
+        fetchngs_known_roots_refresh(fetchngs_known_roots_refresh() + 1L)
+      }
+    },
+    ignoreInit = TRUE
+  )
+
+  observeEvent(input$fetchngs_older_results_root, {
+    root <- tryCatch(
+      resolve_fetchngs_results_root("custom", input$fetchngs_older_results_root %||% ""),
+      error = function(e) ""
+    )
+    if (!nzchar(root) || !dir.exists(root) || file.access(root, mode = 5) != 0) return(invisible(NULL))
+    if (isTRUE(remember_fetchngs_results_root(root))) {
+      fetchngs_output_root_preference(root)
+      fetchngs_known_roots_refresh(fetchngs_known_roots_refresh() + 1L)
+      updateSelectInput(session, "fetchngs_output_root", selected = root)
+    }
+  }, ignoreInit = TRUE)
   job_history_state <- reactiveVal(data.frame())
   project_status_state <- reactiveVal(data.frame())
   # A scheduler can take a few seconds to expose a newly accepted job. Keep
@@ -11957,6 +12067,9 @@ server <- function(input, output, session) {
   observeEvent(input$browse_fetchngs_results_root, {
     open_server_browser("fetchngs_custom_results_root", "dir", input$fetchngs_custom_results_root %||% "")
   })
+  observeEvent(input$browse_fetchngs_older_results_root, {
+    open_server_browser("fetchngs_older_results_root", "dir", input$fetchngs_older_results_root %||% "")
+  })
   observeEvent(input$browse_new_scrna_manifest_path, {
     open_server_browser("new_scrna_manifest_path", "file", input$new_scrna_manifest_path %||% "")
   })
@@ -12050,10 +12163,6 @@ server <- function(input, output, session) {
     }, error = function(e) paste("Output location needs attention:", conditionMessage(e)))
   })
 
-  output$fetchngs_outputs_root_text <- renderText({
-    tryCatch(paste("Viewing FetchNGS outputs under:", active_fetchngs_results_root()), error = function(e) paste("Output location needs attention:", conditionMessage(e)))
-  })
-
   output$fetchngs_message <- renderText(fetchngs_message_state())
 
   output$fetchngs_run_select_ui <- renderUI({
@@ -12095,6 +12204,8 @@ server <- function(input, output, session) {
     fetchngs_message_state("Validating FetchNGS input and creating the run bundle...")
     result <- tryCatch({
       results_root <- ensure_fetchngs_results_root(active_fetchngs_results_root())
+      remember_fetchngs_results_root(results_root)
+      fetchngs_known_roots_refresh(fetchngs_known_roots_refresh() + 1L)
       run_name <- validate_fetchngs_run_name(input$fetchngs_run_name)
       existing_dir <- fetchngs_run_dir(run_name, results_root)
       if (dir.exists(existing_dir)) {
@@ -12200,12 +12311,57 @@ server <- function(input, output, session) {
 
   observeEvent(input$refresh_fetchngs_outputs, {
     fetchngs_refresh(fetchngs_refresh() + 1L)
+    fetchngs_known_roots_refresh(fetchngs_known_roots_refresh() + 1L)
+  })
+
+  output$fetchngs_output_root_ui <- renderUI({
+    fetchngs_known_roots_refresh()
+    roots <- fetchngs_known_results_roots()
+    active_root <- safe_active_fetchngs_results_root()
+    if (nzchar(active_root) && dir.exists(active_root) && file.access(active_root, mode = 5) == 0) {
+      roots <- unique(c(active_root, roots))
+    }
+    if (!length(roots)) {
+      return(div(class = "empty-box", "No readable FetchNGS results folders are available yet."))
+    }
+    labels <- ifelse(
+      roots == normalizePath(FETCHNGS_RESULTS_ROOT, winslash = "/", mustWork = FALSE),
+      paste("Default user folder —", roots),
+      ifelse(roots == active_root, paste("Current custom folder —", roots), paste("Previously used folder —", roots))
+    )
+    selected <- isolate(fetchngs_output_root_preference())
+    if (!selected %in% roots) selected <- isolate(input$fetchngs_output_root %||% "")
+    if (!selected %in% roots) selected <- if (active_root %in% roots) active_root else roots[[1L]]
+    selectInput(
+      "fetchngs_output_root", "Results location to view",
+      choices = stats::setNames(roots, labels), selected = selected, selectize = FALSE
+    )
+  })
+
+  observeEvent(input$fetchngs_output_root, {
+    root <- trimws(input$fetchngs_output_root %||% "")
+    if (nzchar(root)) fetchngs_output_root_preference(root)
+  }, ignoreInit = TRUE)
+
+  selected_fetchngs_output_root <- reactive({
+    fetchngs_known_roots_refresh()
+    root <- trimws(input$fetchngs_output_root %||% "")
+    req(nzchar(root), startsWith(root, "/"))
+    root <- normalizePath(root, winslash = "/", mustWork = FALSE)
+    req(dir.exists(root), file.access(root, mode = 5) == 0)
+    root
+  })
+
+  output$fetchngs_outputs_root_text <- renderText({
+    root <- tryCatch(selected_fetchngs_output_root(), error = function(e) "")
+    if (!nzchar(root)) return("Choose a readable FetchNGS results location above.")
+    paste("Viewing FetchNGS outputs under:", root)
   })
 
   output$fetchngs_output_run_ui <- renderUI({
     fetchngs_refresh()
-    root <- safe_active_fetchngs_results_root()
-    if (!nzchar(root)) return(div(class = "empty-box", "Choose a valid default or custom FetchNGS results folder."))
+    root <- tryCatch(selected_fetchngs_output_root(), error = function(e) "")
+    if (!nzchar(root)) return(div(class = "empty-box", "Choose a readable FetchNGS results location."))
     runs <- rev(fetchngs_run_names(root))
     if (!length(runs)) return(div(class = "empty-box", "No FetchNGS runs exist in the selected results folder yet."))
     selected <- isolate(input$fetchngs_output_run %||% input$fetchngs_selected_run %||% "")
@@ -12215,7 +12371,7 @@ server <- function(input, output, session) {
 
   selected_fetchngs_output_context <- reactive({
     fetchngs_refresh()
-    root <- safe_active_fetchngs_results_root()
+    root <- selected_fetchngs_output_root()
     run_name <- input$fetchngs_output_run %||% ""
     req(nzchar(root), nzchar(run_name), run_name %in% fetchngs_run_names(root))
     list(root = root, run_name = validate_fetchngs_run_name(run_name))
@@ -12231,6 +12387,15 @@ server <- function(input, output, session) {
     if (!NROW(catalog)) return(data.frame())
     catalog[, c("File", "Folder", "Type", "Size", "Modified"), drop = FALSE]
   }, page_length = 25, scroll_y = "400px")
+
+  output$fetchngs_output_scan_note <- renderUI({
+    catalog <- fetchngs_selected_output_catalog()
+    if (!isTRUE(attr(catalog, "truncated"))) return(NULL)
+    div(
+      class = "read-source-note",
+      "Showing the first 2,000 files from folders up to six levels deep. This limit keeps the app responsive for large sequencing runs."
+    )
+  })
 
   output$fetchngs_output_file_ui <- renderUI({
     catalog <- fetchngs_selected_output_catalog()
@@ -12541,28 +12706,29 @@ server <- function(input, output, session) {
     fetchngs_mode <- is_fetchngs_analysis(input$analysis %||% "RNA-seq")
     fetchngs_tabs <- c("FetchNGS", "FetchNGS Outputs")
     analysis_tabs <- c("Setup", "Design Matrix", "Run Pipeline", "Progress", "Results Explorer", "Logs", "Methods")
+    current_tab <- input$web_main_tabs %||% ""
     if (fetchngs_mode) {
-      lapply(analysis_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
       lapply(fetchngs_tabs, function(tab) showTab("web_main_tabs", tab, session = session))
-      if (!input$web_main_tabs %in% fetchngs_tabs) {
+      if (!current_tab %in% fetchngs_tabs) {
         updateTabsetPanel(session, "web_main_tabs", selected = "FetchNGS")
       }
+      lapply(analysis_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
       return(invisible(NULL))
     }
-    lapply(fetchngs_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
     viewer_only <- isTRUE(current_project()$external_results)
     non_viewer_tabs <- c("Setup", "Design Matrix", "Run Pipeline", "Progress", "Logs", "Methods")
     if (viewer_only) {
-      lapply(non_viewer_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
       showTab("web_main_tabs", "Results Explorer", session = session)
       updateTabsetPanel(session, "web_main_tabs", selected = "Results Explorer")
+      lapply(non_viewer_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
     } else {
       lapply(non_viewer_tabs, function(tab) showTab("web_main_tabs", tab, session = session))
       showTab("web_main_tabs", "Results Explorer", session = session)
-      if (input$web_main_tabs %in% fetchngs_tabs) {
+      if (current_tab %in% fetchngs_tabs || !nzchar(current_tab)) {
         updateTabsetPanel(session, "web_main_tabs", selected = "Setup")
       }
     }
+    lapply(fetchngs_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
   })
 
   observeEvent(input$project_id, {

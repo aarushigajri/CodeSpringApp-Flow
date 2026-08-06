@@ -136,6 +136,16 @@ assert(
     grepl('updateTabsetPanel(session, "web_main_tabs", selected = "Setup")', server_source, fixed = TRUE),
   "FetchNGS selection exposes its run and output tabs while returning to an analysis restores the project tabs"
 )
+show_fetch_tabs_pos <- regexpr('lapply(fetchngs_tabs, function(tab) showTab("web_main_tabs", tab, session = session))', server_source, fixed = TRUE)[[1]]
+hide_analysis_tabs_pos <- regexpr('lapply(analysis_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))', server_source, fixed = TRUE)[[1]]
+show_analysis_tabs_pos <- regexpr('lapply(non_viewer_tabs, function(tab) showTab("web_main_tabs", tab, session = session))', server_source, fixed = TRUE)[[1]]
+hide_fetch_tabs_pos <- regexpr('lapply(fetchngs_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))', server_source, fixed = TRUE)[[1]]
+assert(
+  all(c(show_fetch_tabs_pos, hide_analysis_tabs_pos, show_analysis_tabs_pos, hide_fetch_tabs_pos) > 0L) &&
+    show_fetch_tabs_pos < hide_analysis_tabs_pos &&
+    show_analysis_tabs_pos < hide_fetch_tabs_pos,
+  "analysis switching reveals and selects a destination before hiding the active source tab"
+)
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
   assert(identical(tabs[[1]], "Overview") && identical(tail(tabs, 1), "Files") && "QC" %in% tabs, paste(key, "follows the shared Results Explorer navigation contract"))
@@ -196,6 +206,9 @@ fetchngs_output <- app_env$run_fetchngs_cli(
 )
 fetchngs_run <- app_env$fetchngs_run_dir("app_helper_smoke", fetchngs_root)
 fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_root, query_scheduler = FALSE)
+fetchngs_history_path <- file.path(root, "fetchngs_results_roots.tsv")
+app_env$remember_fetchngs_results_root(fetchngs_root, fetchngs_history_path)
+known_fetchngs_roots <- app_env$fetchngs_known_results_roots(custom_fetchngs_root, fetchngs_history_path)
 assert(
   grepl("Dry run only", fetchngs_output, fixed = TRUE) &&
     file.exists(file.path(fetchngs_run, "run.sbatch")) &&
@@ -203,6 +216,10 @@ assert(
     identical(fetchngs_summary$Status[[1]], "Bundle only") &&
     identical(fetchngs_summary$`Metadata only`[[1]], "Yes"),
   "Shiny FetchNGS helpers create a validator-compatible metadata-only bundle without submitting Slurm"
+)
+assert(
+  all(normalizePath(c(custom_fetchngs_root, fetchngs_root), winslash = "/", mustWork = TRUE) %in% known_fetchngs_roots),
+  "FetchNGS remembers prior readable output roots so older runs remain selectable"
 )
 fetchngs_metadata_dir <- file.path(fetchngs_run, "results", "metadata")
 fetchngs_fastq_dir <- file.path(fetchngs_run, "results", "fastq")
@@ -215,6 +232,7 @@ writeLines(c("run\tlibrary_layout", "SRR14593545\tPAIRED"), fetchngs_metadata_fi
 writeLines(c("fetchngs: 1.12.0", "nextflow: 24.04.4"), fetchngs_yaml_file)
 writeLines("compressed-placeholder", fetchngs_fastq_file)
 fetchngs_catalog <- app_env$fetchngs_output_file_catalog("app_helper_smoke", fetchngs_root)
+limited_fetchngs_files <- app_env$fetchngs_output_files("app_helper_smoke", fetchngs_root, max_files = 2L)
 assert(
   NROW(fetchngs_catalog) == 3L &&
     all(c("File", "Folder", "Type", "Size", "Modified", "path") %in% names(fetchngs_catalog)) &&
@@ -224,6 +242,10 @@ assert(
     identical(app_env$fetchngs_output_preview_kind(fetchngs_yaml_file), "text") &&
     identical(app_env$fetchngs_output_preview_kind(fetchngs_fastq_file), "binary"),
   "FetchNGS output viewing catalogs only selected-run result files and chooses safe preview modes"
+)
+assert(
+  length(limited_fetchngs_files) == 2L && isTRUE(attr(limited_fetchngs_files, "truncated")),
+  "FetchNGS output scanning is bounded so large result trees cannot block the app indefinitely"
 )
 assert(
   app_env$fetchngs_job_is_active("RUNNING") &&
@@ -253,6 +275,8 @@ assert(
 assert(
     grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
     grepl('tabPanel("FetchNGS Outputs"', app_text, fixed = TRUE) &&
+    grepl('textInput("fetchngs_older_results_root"', app_text, fixed = TRUE) &&
+    grepl('uiOutput("fetchngs_output_root_ui")', app_text, fixed = TRUE) &&
     grepl('"fetchngs_results_mode", "FetchNGS results folder"', app_text, fixed = TRUE) &&
     grepl('actionButton("browse_fetchngs_results_root"', app_text, fixed = TRUE) &&
     grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
