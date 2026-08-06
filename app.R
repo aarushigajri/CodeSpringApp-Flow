@@ -11461,7 +11461,7 @@ ui <- fluidPage(
         div(class = "project-card",
             div(class = "eyebrow", "Data retrieval"),
             h3("FetchNGS"),
-            tags$p(class = "muted small-note", "Fetch public sequencing data independently of an RNA-seq, CUT&RUN, Sarek, or other analysis project."))
+            tags$p(class = "muted small-note", "Fetch public sequencing data."))
       )
     ),
     mainPanel(
@@ -11480,7 +11480,7 @@ ui <- fluidPage(
                  div(class = "progress-header-row",
                      div(
                        h3("Fetch public sequencing data"),
-                       tags$p(class = "muted", "Run nf-core/fetchngs through SLURM. FetchNGS is a standalone data-download tool; it does not automatically start CUT&RUN, Sarek, or another analysis pipeline.")
+                       tags$p(class = "muted", "FetchNGS is a standalone data-download tool.FetchNGS integration accepts accessions from four related public systems: NCBI SRA, ENA, DDBJ, and GEO.")
                      ),
                      actionButton("refresh_fetchngs", "Refresh runs", class = "btn-primary")
                  ),
