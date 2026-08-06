@@ -42,7 +42,8 @@ The server folder browser starts from the current user's home directory and hide
 
 ## FetchNGS
 
-The **FetchNGS** tab runs `nf-core/fetchngs` as a standalone SLURM job. Users can
+Choose **FetchNGS** from the main **Analysis type** dropdown to open its isolated
+workspace. It runs `nf-core/fetchngs` as a standalone SLURM job. Users can
 paste public accessions directly or select a `.txt`, `.csv`, or `.tsv` accession
 file already on the server. The app supports full FASTQ retrieval and a
 metadata-only mode.
@@ -263,8 +264,9 @@ For new projects, it creates project-local outputs under:
 
 ## Tabs
 
+- The `Analysis type` dropdown treats `FetchNGS` as a separate data-retrieval workflow. Selecting it hides biological-project controls and analysis tabs; selecting RNA-seq, scRNA-seq, ATAC-seq, CUT&RUN, or ChIP-seq restores the normal project workspace.
 - `Setup`: choose analysis/project, create projects, browse server folders, select genome references, and delete configs/results.
-- `FetchNGS`: paste or select public accessions, submit or resume downloads, inspect run status, and read controller logs.
+- `FetchNGS`: shown only when FetchNGS is selected; paste or select public accessions, submit or resume downloads, inspect run status, and read controller logs.
 - `Design Matrix`: scan FASTQ folders, include/exclude samples, edit metadata, and save a project-local `design_matrix.txt`.
 - `Run Pipeline`: submit SLURM jobs with step-specific settings and safeguards.
 - `Progress`: monitor step and sample progress, including active, cancelled, deleted, and likely failed states.

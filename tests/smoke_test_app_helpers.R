@@ -122,7 +122,20 @@ assert(
     !identical(app_env$FETCHNGS_RESULTS_ROOT, app_env$FETCHNGS_RUNTIME_ROOT),
   "FetchNGS results use the user's csl_results folder while cache and work data use a separate private runtime folder"
 )
-assert(identical(unname(app_env$analysis_choices()), c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")), "all analysis selectors use one canonical order and spelling")
+assert(
+  identical(unname(app_env$analysis_choices()), c("FetchNGS", "RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")) &&
+    identical(unname(app_env$project_analysis_choices()), c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")) &&
+    identical(app_env$analysis_key("FetchNGS"), "fetchngs") &&
+    identical(app_env$analysis_label("fetchngs"), "FetchNGS"),
+  "FetchNGS is a distinct main analysis choice but is excluded from biological project creation"
+)
+assert(
+  grepl("input.analysis == 'FetchNGS'", app_text, fixed = TRUE) &&
+    grepl('hideTab("web_main_tabs", "FetchNGS"', server_source, fixed = TRUE) &&
+    grepl('updateTabsetPanel(session, "web_main_tabs", selected = "FetchNGS")', server_source, fixed = TRUE) &&
+    grepl('updateTabsetPanel(session, "web_main_tabs", selected = "Setup")', server_source, fixed = TRUE),
+  "FetchNGS selection isolates its workspace and returning to an analysis restores the project tabs"
+)
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
   assert(identical(tabs[[1]], "Overview") && identical(tail(tabs, 1), "Files") && "QC" %in% tabs, paste(key, "follows the shared Results Explorer navigation contract"))

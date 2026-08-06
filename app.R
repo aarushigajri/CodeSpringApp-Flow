@@ -640,9 +640,10 @@ cleanup_previous_shiny_processes <- function() {
 }
 
 ANALYSIS_CATALOG <- data.frame(
-  key = c("rna", "scrna", "atac", "cutrun", "chip"),
-  label = c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq"),
+  key = c("fetchngs", "rna", "scrna", "atac", "cutrun", "chip"),
+  label = c("FetchNGS", "RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq"),
   description = c(
+    "Retrieve public sequencing data and metadata through nf-core/fetchngs",
     "Gene expression, transcript quantification, differential expression, and pathway analysis",
     "Single-cell QC, normalization, integration, clustering, annotation, and result visualization",
     "Chromatin accessibility, signal tracks, peak calling, and differential accessibility",
@@ -654,8 +655,16 @@ ANALYSIS_CATALOG <- data.frame(
 
 analysis_choices <- function() stats::setNames(ANALYSIS_CATALOG$label, ANALYSIS_CATALOG$label)
 
+project_analysis_choices <- function() {
+  catalog <- ANALYSIS_CATALOG[ANALYSIS_CATALOG$key != "fetchngs", , drop = FALSE]
+  stats::setNames(catalog$label, catalog$label)
+}
+
+is_fetchngs_analysis <- function(x) identical(analysis_key(x), "fetchngs")
+
 analysis_label <- function(x) {
   x <- tolower(as.character(x %||% "rna"))
+  if (grepl("fetch.?ngs", x)) return("FetchNGS")
   if (grepl("single.?cell|scrna", x)) return("scRNA-seq")
   if (grepl("cut.?run|cutandrun", x)) return("CUT&RUN")
   if (grepl("atac", x)) return("ATAC-seq")
@@ -665,6 +674,7 @@ analysis_label <- function(x) {
 
 analysis_key <- function(x) {
   x <- tolower(as.character(x %||% "rna"))
+  if (grepl("fetch.?ngs", x)) return("fetchngs")
   if (grepl("single.?cell|scrna", x)) return("scrna")
   if (grepl("cut.?run|cutandrun", x)) return("cutrun")
   if (grepl("atac", x)) return("atac")
@@ -11210,12 +11220,23 @@ ui <- fluidPage(
       class = "web-sidebar",
       width = 2,
       selectInput("analysis", "Analysis type", choices = analysis_choices(), selected = "RNA-seq", selectize = FALSE),
-      uiOutput("project_ui"),
-      tags$p(class = "muted small-note", "Saved projects are private to the Unix account running this app."),
-      uiOutput("new_project_ui"),
-      uiOutput("project_manage_ui"),
-      tags$hr(),
-      uiOutput("project_card")
+      conditionalPanel(
+        "input.analysis != 'FetchNGS'",
+        uiOutput("project_ui"),
+        tags$p(class = "muted small-note", "Saved projects are private to the Unix account running this app."),
+        uiOutput("new_project_ui"),
+        uiOutput("project_manage_ui"),
+        tags$hr(),
+        uiOutput("project_card")
+      ),
+      conditionalPanel(
+        "input.analysis == 'FetchNGS'",
+        tags$hr(),
+        div(class = "project-card",
+            div(class = "eyebrow", "Data retrieval"),
+            h3("FetchNGS"),
+            tags$p(class = "muted small-note", "Fetch public sequencing data independently of an RNA-seq, CUT&RUN, Sarek, or other analysis project."))
+      )
     ),
     mainPanel(
       class = "web-main",
@@ -11903,6 +11924,7 @@ server <- function(input, output, session) {
   })
 
   filtered_projects <- reactive({
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(list())
     p <- projects()
     analysis <- input$analysis
     if (!length(analysis) || is.null(analysis) || !nzchar(analysis)) return(p)
@@ -11910,6 +11932,7 @@ server <- function(input, output, session) {
   })
 
   output$project_ui <- renderUI({
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(NULL)
     p <- filtered_projects()
     choices <- project_select_choices(p, input$analysis %||% "RNA-seq")
     key <- analysis_key(input$analysis %||% "RNA-seq")
@@ -11923,6 +11946,7 @@ server <- function(input, output, session) {
   })
 
   output$new_project_ui <- renderUI({
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(NULL)
     if (!identical(input$project_id, "__new__")) return(NULL)
     new_analysis_key <- analysis_key(input$new_project_analysis %||% input$analysis %||% "RNA-seq")
     example <- example_dataset_paths(new_analysis_key)
@@ -11945,7 +11969,7 @@ server <- function(input, output, session) {
         actionButton("use_example_dataset", "Use Example Dataset", class = "btn-default")
       ) else NULL,
       textInput("new_project_name", "Project name", value = "", placeholder = "e.g. my_project"),
-      selectInput("new_project_analysis", "Analysis type", choices = analysis_choices(), selected = input$analysis, selectize = FALSE),
+      selectInput("new_project_analysis", "Analysis type", choices = project_analysis_choices(), selected = input$analysis, selectize = FALSE),
       tags$p(class = "muted small-note", analysis_description(new_analysis_key)),
       uiOutput("new_species_ui"),
       uiOutput("new_genome_version_ui"),
@@ -12130,6 +12154,7 @@ server <- function(input, output, session) {
   })
 
   current_project <- reactive({
+    req(!is_fetchngs_analysis(input$analysis %||% "RNA-seq"))
     selected <- input$project_id
     if (is.null(selected) || !length(selected) || !nzchar(selected) || identical(selected, "__new__")) {
       return(new_project_from_inputs(new_project_input_values()))
@@ -12142,11 +12167,23 @@ server <- function(input, output, session) {
   })
 
   existing_project_selected <- reactive({
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(FALSE)
     selected <- input$project_id
     !is.null(selected) && length(selected) && nzchar(selected) && !identical(selected, "__new__")
   })
 
   observe({
+    fetchngs_mode <- is_fetchngs_analysis(input$analysis %||% "RNA-seq")
+    analysis_tabs <- c("Setup", "Design Matrix", "Run Pipeline", "Progress", "Results Explorer", "Logs", "Methods")
+    if (fetchngs_mode) {
+      lapply(analysis_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
+      showTab("web_main_tabs", "FetchNGS", session = session)
+      if (!identical(input$web_main_tabs %||% "", "FetchNGS")) {
+        updateTabsetPanel(session, "web_main_tabs", selected = "FetchNGS")
+      }
+      return(invisible(NULL))
+    }
+    hideTab("web_main_tabs", "FetchNGS", session = session)
     viewer_only <- isTRUE(current_project()$external_results)
     non_viewer_tabs <- c("Setup", "Design Matrix", "Run Pipeline", "Progress", "Logs", "Methods")
     if (viewer_only) {
@@ -12155,10 +12192,15 @@ server <- function(input, output, session) {
       updateTabsetPanel(session, "web_main_tabs", selected = "Results Explorer")
     } else {
       lapply(non_viewer_tabs, function(tab) showTab("web_main_tabs", tab, session = session))
+      showTab("web_main_tabs", "Results Explorer", session = session)
+      if (identical(input$web_main_tabs %||% "", "FetchNGS")) {
+        updateTabsetPanel(session, "web_main_tabs", selected = "Setup")
+      }
     }
   })
 
   observeEvent(input$project_id, {
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(invisible(NULL))
     selected <- input$project_id %||% "__new__"
     if (!identical(selected, "__new__")) {
       project_selection[[analysis_key(input$analysis %||% "RNA-seq")]] <- selected
@@ -12186,6 +12228,7 @@ server <- function(input, output, session) {
   }, ignoreInit = FALSE)
 
   output$project_card <- renderUI({
+    if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(NULL)
     p <- current_project()
     if (!isTRUE(existing_project_selected())) {
       return(div(class = "project-card",
