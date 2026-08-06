@@ -185,6 +185,30 @@ assert(
   identical(fetchngs_accessions, c("SRR14593545", "ERR1160846")),
   "FetchNGS pasted accessions are split and deduplicated"
 )
+accepted_fetchngs_accessions <- c(
+  "SRR11605097", "ERR4007730", "DRR171822",
+  "SRX8171613", "ERX4009132", "DRX162434",
+  "SRS6531847", "ERS4399630", "DRS090921",
+  "SAMN14689442", "SAMEA6638373", "SAMD00114846",
+  "SRP256957", "ERP120836", "DRP004793",
+  "SRA1068758", "ERA2420837", "DRA008156",
+  "PRJNA625551", "PRJEB37513", "PRJDB4176",
+  "GSM4432381", "GSE147507"
+)
+accepted_fetchngs_types <- vapply(accepted_fetchngs_accessions, app_env$fetchngs_accession_type, character(1))
+invalid_fetchngs_accession_error <- tryCatch({ app_env$parse_fetchngs_accessions("NOT_AN_ACCESSION"); "" }, error = conditionMessage)
+assert(
+  all(nzchar(accepted_fetchngs_types)) &&
+    identical(app_env$parse_fetchngs_accessions("srr14593545"), "SRR14593545") &&
+    grepl("Unrecognized accession format", invalid_fetchngs_accession_error, fixed = TRUE),
+  "FetchNGS recognizes only documented accession families and normalizes them to uppercase"
+)
+too_many_run_accessions <- paste0("SRR", seq_len(app_env$FETCHNGS_MAX_RUNS + 1L))
+too_many_run_error <- tryCatch({ app_env$fetchngs_validate_run_accession_limit(too_many_run_accessions); "" }, error = conditionMessage)
+assert(
+  grepl(paste0("limit is ", app_env$FETCHNGS_MAX_RUNS), too_many_run_error, fixed = TRUE),
+  "FetchNGS rejects more direct run accessions than the administrator limit"
+)
 fetchngs_pasted_input <- app_env$write_fetchngs_accession_input(
   "pasted_app_helper",
   paste(fetchngs_accessions, collapse = "\n"),
@@ -220,6 +244,74 @@ assert(
 assert(
   all(normalizePath(c(custom_fetchngs_root, fetchngs_root), winslash = "/", mustWork = TRUE) %in% known_fetchngs_roots),
   "FetchNGS remembers prior readable output roots so older runs remain selectable"
+)
+fake_ena_reports <- list(
+  SRR14593545 = data.frame(run_accession = "SRR14593545", fastq_bytes = "1000;2000", stringsAsFactors = FALSE),
+  ERR1160846 = data.frame(run_accession = "ERR1160846", fastq_bytes = "4000", stringsAsFactors = FALSE)
+)
+fake_ena_report_fetcher <- function(accession, max_rows) fake_ena_reports[[accession]]
+fake_shared_space <- function(path) list(filesystem = "testfs", available_bytes = 1000000, checked_path = path, mount = "/test")
+fetchngs_preflight <- app_env$fetchngs_download_preflight(
+  fetchngs_accessions,
+  results_root = fetchngs_root,
+  runtime_root = fetchngs_runtime_root,
+  max_runs = 20L,
+  max_download_bytes = 10000,
+  storage_multiplier = 4,
+  report_fetcher = fake_ena_report_fetcher,
+  space_fetcher = fake_shared_space
+)
+assert(
+  identical(fetchngs_preflight$run_count, 2L) &&
+    identical(fetchngs_preflight$estimated_bytes, 7000) &&
+    identical(fetchngs_preflight$required_storage_bytes, 28000),
+  "FetchNGS preflight deduplicates ENA runs, sums paired FASTQ bytes, and applies the storage multiplier"
+)
+oversize_preflight_error <- tryCatch({
+  app_env$fetchngs_download_preflight(
+    fetchngs_accessions, fetchngs_root, fetchngs_runtime_root,
+    max_runs = 20L, max_download_bytes = 6000, storage_multiplier = 4,
+    report_fetcher = fake_ena_report_fetcher, space_fetcher = fake_shared_space
+  )
+  ""
+}, error = conditionMessage)
+missing_size_fetcher <- function(accession, max_rows) data.frame(run_accession = accession, fastq_bytes = "", stringsAsFactors = FALSE)
+missing_size_preflight_error <- tryCatch({
+  app_env$fetchngs_download_preflight(
+    "SRR14593545", fetchngs_root, fetchngs_runtime_root,
+    report_fetcher = missing_size_fetcher, space_fetcher = fake_shared_space
+  )
+  ""
+}, error = conditionMessage)
+too_many_resolved_fetcher <- function(accession, max_rows) {
+  data.frame(
+    run_accession = paste0("SRR", seq_len(max_rows)),
+    fastq_bytes = rep("100", max_rows),
+    stringsAsFactors = FALSE
+  )
+}
+too_many_resolved_error <- tryCatch({
+  app_env$fetchngs_download_preflight(
+    "SRP256957", fetchngs_root, fetchngs_runtime_root,
+    max_runs = 20L, report_fetcher = too_many_resolved_fetcher, space_fetcher = fake_shared_space
+  )
+  ""
+}, error = conditionMessage)
+fake_low_space <- function(path) list(filesystem = "testfs", available_bytes = 20000, checked_path = path, mount = "/test")
+low_space_preflight_error <- tryCatch({
+  app_env$fetchngs_download_preflight(
+    fetchngs_accessions, fetchngs_root, fetchngs_runtime_root,
+    max_runs = 20L, max_download_bytes = 10000, storage_multiplier = 4,
+    report_fetcher = fake_ena_report_fetcher, space_fetcher = fake_low_space
+  )
+  ""
+}, error = conditionMessage)
+assert(
+  grepl("above the administrator limit", oversize_preflight_error, fixed = TRUE) &&
+    grepl("could not determine FASTQ size", missing_size_preflight_error, fixed = TRUE) &&
+    grepl("more than the administrator limit", too_many_resolved_error, fixed = TRUE) &&
+    grepl("Insufficient free storage", low_space_preflight_error, fixed = TRUE),
+  "FetchNGS blocks oversized, unknown-size, over-20-run, and insufficient-storage downloads before submission"
 )
 fetchngs_metadata_dir <- file.path(fetchngs_run, "results", "metadata")
 fetchngs_fastq_dir <- file.path(fetchngs_run, "results", "fastq")
@@ -282,7 +374,12 @@ assert(
     grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
     grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE) &&
     grepl('actionButton("delete_fetchngs"', app_text, fixed = TRUE) &&
-    grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE),
+    grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE) &&
+    grepl('tags$strong("Accepted accessions")', app_text, fixed = TRUE) &&
+    grepl('tags$strong("Download safeguards")', app_text, fixed = TRUE) &&
+    grepl("fetchngs_download_preflight(accessions, results_root = results_root)", server_source, fixed = TRUE) &&
+    grepl("Rechecking accession and download safety before resuming", server_source, fixed = TRUE) &&
+    grepl("manifest <- fetchngs_read_manifest(run_dir)", server_source, fixed = TRUE),
   "the app exposes FetchNGS location, creation, status, output viewing, resume, and confirmed deletion controls"
 )
 

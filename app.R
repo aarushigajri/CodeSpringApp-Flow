@@ -365,6 +365,37 @@ FETCHNGS_ROOT_HISTORY_PATH <- file.path(APP_HOME, "fetchngs_results_roots.tsv")
 FETCHNGS_CLI <- file.path(APP_ROOT, "bin", "codespringflow")
 FETCHNGS_DEFAULT_VERSION <- "1.12.0"
 FETCHNGS_DEFAULT_NEXTFLOW_VERSION <- "24.04.4"
+fetchngs_positive_env_number <- function(name, default) {
+  value <- trimws(Sys.getenv(name, unset = ""))
+  if (!nzchar(value)) return(default)
+  parsed <- suppressWarnings(as.numeric(value))
+  if (!is.finite(parsed) || parsed <= 0) {
+    stop(name, " must be a positive number. Received: ", value)
+  }
+  parsed
+}
+fetchngs_positive_env_integer <- function(name, default) {
+  parsed <- fetchngs_positive_env_number(name, default)
+  if (!identical(parsed, floor(parsed))) stop(name, " must be a whole number. Received: ", parsed)
+  as.integer(parsed)
+}
+FETCHNGS_MAX_RUNS <- fetchngs_positive_env_integer("CSL_FETCHNGS_MAX_RUNS", 20)
+FETCHNGS_MAX_DOWNLOAD_GB <- fetchngs_positive_env_number("CSL_FETCHNGS_MAX_DOWNLOAD_GB", 50)
+FETCHNGS_MAX_DOWNLOAD_BYTES <- FETCHNGS_MAX_DOWNLOAD_GB * 1024^3
+FETCHNGS_STORAGE_MULTIPLIER <- fetchngs_positive_env_number("CSL_FETCHNGS_STORAGE_MULTIPLIER", 4)
+FETCHNGS_ENA_TIMEOUT_SECONDS <- fetchngs_positive_env_integer("CSL_FETCHNGS_ENA_TIMEOUT_SECONDS", 30)
+if (FETCHNGS_STORAGE_MULTIPLIER < 1) stop("CSL_FETCHNGS_STORAGE_MULTIPLIER must be at least 1.")
+FETCHNGS_ENA_REPORT_MAX_BYTES <- 5 * 1024^2
+FETCHNGS_ACCESSION_PATTERNS <- c(
+  run = "^(SRR|ERR|DRR)[0-9]+$",
+  experiment = "^(SRX|ERX|DRX)[0-9]+$",
+  sample = "^(SRS|ERS|DRS)[0-9]+$",
+  biosample = "^(SAMN|SAMEA|SAMD)[0-9]+$",
+  study = "^(SRP|ERP|DRP)[0-9]+$",
+  submission = "^(SRA|ERA|DRA)[0-9]+$",
+  bioproject = "^(PRJNA|PRJEB|PRJDB)[0-9]+$",
+  geo = "^(GSM|GSE)[0-9]+$"
+)
 RNA_EXAMPLE_FASTQ_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "fastq"), winslash = "/", mustWork = FALSE)
 RNA_EXAMPLE_DESIGN_DIR <- normalizePath(file.path(SCRIPTS_DIR, "test", "manifest"), winslash = "/", mustWork = FALSE)
 CUTRUN_EXAMPLE_FASTQ_DIR <- RNA_EXAMPLE_FASTQ_DIR
@@ -414,14 +445,41 @@ validate_fetchngs_run_name <- function(run_name) {
 }
 
 parse_fetchngs_accessions <- function(value) {
-  accessions <- trimws(unlist(strsplit(as.character(value %||% ""), "[,;[:space:]]+", perl = TRUE)))
+  accessions <- toupper(trimws(unlist(strsplit(as.character(value %||% ""), "[,;[:space:]]+", perl = TRUE))))
   accessions <- unique(accessions[nzchar(accessions)])
   if (!length(accessions)) stop("Paste at least one public accession, or select an accession file on the server.")
-  invalid <- accessions[!grepl("^[A-Za-z][A-Za-z0-9_.-]*$", accessions)]
+  accession_type <- vapply(accessions, fetchngs_accession_type, character(1))
+  invalid <- accessions[!nzchar(accession_type)]
   if (length(invalid)) {
-    stop("Unsupported accession value(s): ", paste(utils::head(invalid, 5), collapse = ", "))
+    stop(
+      "Unrecognized accession format: ", paste(utils::head(invalid, 5), collapse = ", "),
+      ". Accepted prefixes are SRR/ERR/DRR, SRX/ERX/DRX, SRS/ERS/DRS, ",
+      "SAMN/SAMEA/SAMD, SRP/ERP/DRP, SRA/ERA/DRA, PRJNA/PRJEB/PRJDB, GSM/GSE."
+    )
   }
   accessions
+}
+
+fetchngs_accession_type <- function(accession) {
+  accession <- toupper(trimws(as.character(accession %||% "")))
+  hit <- names(FETCHNGS_ACCESSION_PATTERNS)[vapply(
+    FETCHNGS_ACCESSION_PATTERNS,
+    function(pattern) grepl(pattern, accession, perl = TRUE),
+    logical(1)
+  )]
+  if (length(hit)) hit[[1L]] else ""
+}
+
+read_fetchngs_accession_file <- function(path, max_bytes = 1024^2) {
+  path <- normalizePath(path.expand(path), winslash = "/", mustWork = TRUE)
+  info <- file.info(path)
+  if (dir.exists(path) || !is.finite(info$size[[1]]) || info$size[[1]] <= 0) {
+    stop("Choose a non-empty accession file.")
+  }
+  if (info$size[[1]] > max_bytes) {
+    stop("The accession file is unexpectedly large. Use a one-accession-per-line file smaller than 1 MB.")
+  }
+  parse_fetchngs_accessions(readLines(path, warn = FALSE, encoding = "UTF-8"))
 }
 
 fetchngs_runs_root <- function(root = FETCHNGS_RESULTS_ROOT) root
@@ -579,6 +637,221 @@ fetchngs_human_size <- function(bytes) {
   units <- c("B", "KB", "MB", "GB", "TB")
   power <- min(floor(log(bytes, 1024)), length(units) - 1L)
   paste0(format(round(bytes / (1024^power), 1), nsmall = if (power > 0) 1 else 0, trim = TRUE), " ", units[[power + 1L]])
+}
+
+fetchngs_validate_run_accession_limit <- function(accessions, max_runs = FETCHNGS_MAX_RUNS) {
+  types <- vapply(accessions, fetchngs_accession_type, character(1))
+  run_count <- sum(types == "run")
+  if (run_count > max_runs) {
+    stop(
+      "This submission contains ", run_count, " run accessions. The administrator limit is ",
+      max_runs, " SRR/ERR/DRR accessions per submission."
+    )
+  }
+  invisible(run_count)
+}
+
+fetchngs_ena_file_report <- function(
+    accession,
+    max_rows = FETCHNGS_MAX_RUNS + 1L,
+    timeout_seconds = FETCHNGS_ENA_TIMEOUT_SECONDS,
+    max_report_bytes = FETCHNGS_ENA_REPORT_MAX_BYTES,
+    curl_bin = Sys.which("curl")) {
+  accession <- toupper(trimws(as.character(accession %||% "")))
+  if (!nzchar(fetchngs_accession_type(accession))) stop("Cannot query an unrecognized accession: ", accession)
+  if (!nzchar(curl_bin)) stop("The server curl command is unavailable, so ENA download size cannot be checked.")
+  url <- paste0(
+    "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=", accession,
+    "&result=read_run&fields=run_accession,fastq_bytes&format=tsv"
+  )
+  report_path <- tempfile("fetchngs-ena-", fileext = ".tsv")
+  on.exit(unlink(report_path, force = TRUE), add = TRUE)
+  output <- suppressWarnings(tryCatch(
+    system2(
+      curl_bin,
+      c(
+        "-fsS", "--max-time", as.character(as.integer(timeout_seconds)),
+        "--max-filesize", as.character(as.integer(max_report_bytes)),
+        "-o", shQuote(report_path), shQuote(url)
+      ),
+      stdout = TRUE,
+      stderr = TRUE
+    ),
+    error = function(e) structure(conditionMessage(e), status = 1L)
+  ))
+  status <- attr(output, "status") %||% 0L
+  if (!identical(as.integer(status), 0L) || !file.exists(report_path) || file.info(report_path)$size <= 0) {
+    detail <- paste(trimws(output), collapse = " ")
+    if (!nzchar(detail)) detail <- "ENA returned no readable report."
+    stop("Could not determine download size for ", accession, ": ", detail)
+  }
+  report <- tryCatch(
+    utils::read.delim(
+      report_path,
+      stringsAsFactors = FALSE,
+      check.names = FALSE,
+      quote = "",
+      comment.char = "",
+      nrows = max(1L, as.integer(max_rows))
+    ),
+    error = function(e) stop("Could not read ENA's size report for ", accession, ": ", conditionMessage(e))
+  )
+  if (!NROW(report) || !all(c("run_accession", "fastq_bytes") %in% names(report))) {
+    stop("ENA did not return run-level FASTQ sizes for ", accession, ". Use metadata-only mode for this accession.")
+  }
+  report[, c("run_accession", "fastq_bytes"), drop = FALSE]
+}
+
+fetchngs_fastq_bytes_value <- function(value) {
+  value <- trimws(as.character(value %||% ""))
+  if (is.na(value) || !nzchar(value)) return(NA_real_)
+  parts <- trimws(unlist(strsplit(value, ";", fixed = TRUE)))
+  bytes <- suppressWarnings(as.numeric(parts))
+  if (!length(bytes) || any(!is.finite(bytes)) || any(bytes < 0) || sum(bytes) <= 0) return(NA_real_)
+  sum(bytes)
+}
+
+fetchngs_existing_ancestor <- function(path) {
+  path <- normalizePath(path.expand(path), winslash = "/", mustWork = FALSE)
+  while (!dir.exists(path)) {
+    parent <- dirname(path)
+    if (identical(parent, path)) stop("Could not find an existing filesystem path for: ", path)
+    path <- parent
+  }
+  normalizePath(path, winslash = "/", mustWork = TRUE)
+}
+
+fetchngs_filesystem_space <- function(path, df_bin = Sys.which("df")) {
+  if (!nzchar(df_bin)) stop("The server df command is unavailable, so free storage cannot be checked.")
+  checked_path <- fetchngs_existing_ancestor(path)
+  output <- suppressWarnings(tryCatch(
+    system2(df_bin, c("-Pk", shQuote(checked_path)), stdout = TRUE, stderr = TRUE),
+    error = function(e) structure(conditionMessage(e), status = 1L)
+  ))
+  status <- attr(output, "status") %||% 0L
+  if (!identical(as.integer(status), 0L) || length(output) < 2L) {
+    stop("Could not determine free storage for ", checked_path, ".")
+  }
+  fields <- strsplit(trimws(utils::tail(output, 1L)), "[[:space:]]+", perl = TRUE)[[1L]]
+  if (length(fields) < 6L) stop("Unexpected df output while checking free storage for ", checked_path, ".")
+  available_kb <- suppressWarnings(as.numeric(fields[[4L]]))
+  if (!is.finite(available_kb) || available_kb < 0) stop("Invalid free-storage value for ", checked_path, ".")
+  list(
+    filesystem = fields[[1L]],
+    available_bytes = available_kb * 1024,
+    checked_path = checked_path,
+    mount = fields[[length(fields)]]
+  )
+}
+
+fetchngs_check_storage_capacity <- function(
+    estimated_bytes,
+    results_root,
+    runtime_root = FETCHNGS_RUNTIME_ROOT,
+    multiplier = FETCHNGS_STORAGE_MULTIPLIER,
+    space_fetcher = fetchngs_filesystem_space) {
+  estimated_bytes <- as.numeric(estimated_bytes)
+  multiplier <- as.numeric(multiplier)
+  if (!is.finite(estimated_bytes) || estimated_bytes <= 0) stop("A positive download-size estimate is required.")
+  if (!is.finite(multiplier) || multiplier < 1) stop("The FetchNGS storage multiplier must be at least 1.")
+  results_space <- space_fetcher(results_root)
+  runtime_space <- space_fetcher(runtime_root)
+  if (identical(results_space$filesystem, runtime_space$filesystem)) {
+    required <- estimated_bytes * multiplier
+    if (results_space$available_bytes < required) {
+      stop(
+        "Insufficient free storage on ", results_space$mount, ". Estimated FASTQs are ",
+        fetchngs_human_size(estimated_bytes), ", and the ", multiplier,
+        "x sra-tools safety allowance requires ", fetchngs_human_size(required),
+        ", but only ", fetchngs_human_size(results_space$available_bytes), " is available."
+      )
+    }
+    return(list(required_bytes = required, results_space = results_space, runtime_space = runtime_space))
+  }
+  results_required <- estimated_bytes
+  runtime_required <- estimated_bytes * max(1, multiplier - 1)
+  if (results_space$available_bytes < results_required) {
+    stop("Insufficient final-output storage: ", fetchngs_human_size(results_required), " required, ", fetchngs_human_size(results_space$available_bytes), " available.")
+  }
+  if (runtime_space$available_bytes < runtime_required) {
+    stop("Insufficient temporary/work storage: ", fetchngs_human_size(runtime_required), " required, ", fetchngs_human_size(runtime_space$available_bytes), " available.")
+  }
+  list(
+    required_bytes = results_required + runtime_required,
+    results_space = results_space,
+    runtime_space = runtime_space
+  )
+}
+
+fetchngs_download_preflight <- function(
+    accessions,
+    results_root,
+    runtime_root = FETCHNGS_RUNTIME_ROOT,
+    max_runs = FETCHNGS_MAX_RUNS,
+    max_download_bytes = FETCHNGS_MAX_DOWNLOAD_BYTES,
+    storage_multiplier = FETCHNGS_STORAGE_MULTIPLIER,
+    report_fetcher = fetchngs_ena_file_report,
+    space_fetcher = fetchngs_filesystem_space) {
+  accessions <- parse_fetchngs_accessions(accessions)
+  fetchngs_validate_run_accession_limit(accessions, max_runs)
+  if (length(accessions) > max_runs) {
+    stop("A download submission may contain at most ", max_runs, " accession identifiers before ENA resolution.")
+  }
+  reports <- lapply(accessions, function(accession) {
+    report <- report_fetcher(accession, max_rows = max_runs + 1L)
+    if (NROW(report) > max_runs) {
+      stop(accession, " resolves to more than the administrator limit of ", max_runs, " sequencing runs.")
+    }
+    report$source_accession <- accession
+    report
+  })
+  report <- do.call(rbind, reports)
+  report$run_accession <- toupper(trimws(as.character(report$run_accession)))
+  report$bytes <- vapply(report$fastq_bytes, fetchngs_fastq_bytes_value, numeric(1))
+  if (any(!grepl(FETCHNGS_ACCESSION_PATTERNS[["run"]], report$run_accession))) {
+    stop("ENA returned an invalid run accession while checking download size.")
+  }
+  missing_size <- unique(report$run_accession[!is.finite(report$bytes) | report$bytes <= 0])
+  if (length(missing_size)) {
+    stop(
+      "ENA could not determine FASTQ size for ", paste(utils::head(missing_size, 5L), collapse = ", "),
+      ". Use metadata-only mode; the FASTQ download was not submitted."
+    )
+  }
+  bytes_by_run <- tapply(report$bytes, report$run_accession, max)
+  resolved_runs <- names(bytes_by_run)
+  if (length(resolved_runs) > max_runs) {
+    stop(
+      "These accessions resolve to ", length(resolved_runs), " unique sequencing runs. The administrator limit is ",
+      max_runs, " runs per submission."
+    )
+  }
+  estimated_bytes <- sum(as.numeric(bytes_by_run))
+  if (!is.finite(estimated_bytes) || estimated_bytes <= 0) {
+    stop("ENA did not provide a usable compressed FASTQ size. Use metadata-only mode; the download was not submitted.")
+  }
+  if (estimated_bytes > max_download_bytes) {
+    stop(
+      "Estimated compressed FASTQ download is ", fetchngs_human_size(estimated_bytes),
+      ", above the administrator limit of ", fetchngs_human_size(max_download_bytes),
+      ". Use metadata-only mode or ask an administrator about an approved large download."
+    )
+  }
+  storage <- fetchngs_check_storage_capacity(
+    estimated_bytes,
+    results_root,
+    runtime_root,
+    storage_multiplier,
+    space_fetcher
+  )
+  list(
+    accessions = accessions,
+    resolved_runs = resolved_runs,
+    run_count = length(resolved_runs),
+    estimated_bytes = estimated_bytes,
+    required_storage_bytes = storage$required_bytes,
+    storage = storage
+  )
 }
 
 fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_scheduler = TRUE) {
@@ -11489,6 +11762,23 @@ ui <- fluidPage(
                           div(class = "read-source-note",
                               tags$strong("Validated cluster settings"),
                               tags$p("Nextflow 24.04.4, nf-core/fetchngs 1.12.0, Singularity 3.6.3, Slurm cpuq, and the sratools download method.")),
+                          div(class = "read-source-note",
+                              tags$strong("Accepted accessions"),
+                              tags$p(tags$strong("Runs: "), "SRR, ERR, DRR; ",
+                                     tags$strong("experiments: "), "SRX, ERX, DRX; ",
+                                     tags$strong("samples: "), "SRS, ERS, DRS, SAMN, SAMEA, SAMD."),
+                              tags$p(tags$strong("Studies/submissions/projects: "), "SRP, ERP, DRP, SRA, ERA, DRA, PRJNA, PRJEB, PRJDB; ",
+                                     tags$strong("GEO: "), "GSM, GSE."),
+                              tags$p(class = "muted small-note", "Use the full accession including its numeric suffix. Study, project, and GEO identifiers may resolve to many sequencing runs.")),
+                          div(class = "run-message-alert",
+                              tags$strong("Download safeguards"),
+                              tags$ul(
+                                tags$li("Unrecognized accession formats are rejected."),
+                                tags$li(paste0("At most ", FETCHNGS_MAX_RUNS, " resolved sequencing runs per download.")),
+                                tags$li(paste0("Estimated compressed FASTQs must not exceed ", format(FETCHNGS_MAX_DOWNLOAD_GB, trim = TRUE), " GB.")),
+                                tags$li(paste0("Available server storage must satisfy a ", format(FETCHNGS_STORAGE_MULTIPLIER, trim = TRUE), "x sra-tools working-space allowance.")),
+                                tags$li("If ENA cannot determine the size, FASTQ download is blocked; metadata-only mode remains available.")
+                              )),
                           radioButtons(
                             "fetchngs_input_mode", "Accession source",
                             choices = c("Paste accessions" = "paste", "Use a server file" = "server"),
@@ -11499,7 +11789,7 @@ ui <- fluidPage(
                             textAreaInput(
                               "fetchngs_accessions", "Public accessions",
                               value = "", rows = 7,
-                              placeholder = "One or more IDs, for example:\nSRR14593545\nERR1160846"
+                              placeholder = "One or more IDs, for example:\nSRR14593545\nERR1160846\nDRR026872"
                             )
                           ),
                           conditionalPanel(
@@ -11511,7 +11801,7 @@ ui <- fluidPage(
                             )
                           ),
                           textInput("fetchngs_run_name", "Run name", value = "", placeholder = "e.g. wgs_pilot_01"),
-                          checkboxInput("fetchngs_metadata_only", "Retrieve metadata only; do not download FASTQs", value = FALSE),
+                          checkboxInput("fetchngs_metadata_only", "Retrieve metadata only; do not download FASTQs or require a size estimate", value = FALSE),
                           tags$details(
                             tags$summary("Advanced / testing"),
                             br(),
@@ -12201,7 +12491,7 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$submit_fetchngs, {
-    fetchngs_message_state("Validating FetchNGS input and creating the run bundle...")
+    fetchngs_message_state("Validating accession formats and download safety before creating the run bundle...")
     result <- tryCatch({
       results_root <- ensure_fetchngs_results_root(active_fetchngs_results_root())
       remember_fetchngs_results_root(results_root)
@@ -12212,25 +12502,45 @@ server <- function(input, output, session) {
         stop("A FetchNGS run named '", run_name, "' already exists. Select it and use Resume, or choose a new run name.")
       }
       input_mode <- input$fetchngs_input_mode %||% "paste"
-      input_path <- if (identical(input_mode, "server")) {
+      accessions <- if (identical(input_mode, "server")) {
         candidate <- path.expand(trimws(input$fetchngs_accession_file %||% ""))
         if (!file.exists(candidate) || dir.exists(candidate)) stop("Choose an existing accession file on the server.")
         if (file.access(candidate, mode = 4) != 0) stop("The app cannot read the selected accession file: ", candidate)
         if (!tolower(tools::file_ext(candidate)) %in% c("txt", "csv", "tsv")) stop("The accession file must end in .txt, .csv, or .tsv.")
-        if (!is.finite(file.info(candidate)$size) || file.info(candidate)$size <= 0) stop("The selected accession file is empty.")
-        normalizePath(candidate, winslash = "/", mustWork = TRUE)
+        read_fetchngs_accession_file(candidate)
       } else {
-        write_fetchngs_accession_input(run_name, input$fetchngs_accessions)
+        parse_fetchngs_accessions(input$fetchngs_accessions)
       }
+      fetchngs_validate_run_accession_limit(accessions)
+      metadata_only <- isTRUE(input$fetchngs_metadata_only)
+      bundle_only <- isTRUE(input$fetchngs_bundle_only)
+      preflight <- if (!metadata_only && !bundle_only) {
+        fetchngs_message_state("Checking ENA run count, estimated FASTQ size, and available server storage...")
+        fetchngs_download_preflight(accessions, results_root = results_root)
+      } else NULL
+      input_path <- write_fetchngs_accession_input(run_name, accessions)
       version <- trimws(input$fetchngs_pipeline_version %||% FETCHNGS_DEFAULT_VERSION)
       args <- c("fetchngs", "--input", input_path, "--name", run_name, "--pipeline-version", version)
-      if (isTRUE(input$fetchngs_metadata_only)) args <- c(args, "--metadata-only")
-      if (isTRUE(input$fetchngs_bundle_only)) args <- c(args, "--dry-run")
+      if (metadata_only) args <- c(args, "--metadata-only")
+      if (bundle_only) args <- c(args, "--dry-run")
       output <- run_fetchngs_cli(args, results_root = results_root)
       updateSelectInput(session, "fetchngs_selected_run", selected = run_name)
+      safety_message <- if (!is.null(preflight)) {
+        paste0(
+          "Safety check passed: ", preflight$run_count, " unique run(s), ",
+          fetchngs_human_size(preflight$estimated_bytes), " estimated compressed FASTQs, ",
+          fetchngs_human_size(preflight$required_storage_bytes), " required by the ",
+          FETCHNGS_STORAGE_MULTIPLIER, "x storage allowance."
+        )
+      } else if (metadata_only) {
+        "Metadata-only mode: no FASTQ size or storage check was required."
+      } else {
+        "Bundle-only mode: no job was submitted and no FASTQs will be downloaded."
+      }
       paste(
         output,
         "",
+        safety_message,
         paste("FASTQ output folder:", file.path(fetchngs_run_dir(run_name, results_root), "results", "fastq")),
         sep = "\n"
       )
@@ -12245,10 +12555,33 @@ server <- function(input, output, session) {
       fetchngs_message_state("ERROR: Select an existing FetchNGS run to resume.")
       return()
     }
-    fetchngs_message_state(paste("Submitting a Nextflow resume for", run_name, "..."))
+    fetchngs_message_state(paste("Rechecking accession and download safety before resuming", run_name, "..."))
     result <- tryCatch({
       results_root <- active_fetchngs_results_root()
-      run_fetchngs_cli(c("resume", validate_fetchngs_run_name(run_name)), results_root = results_root)
+      run_name <- validate_fetchngs_run_name(run_name)
+      run_dir <- fetchngs_run_dir(run_name, results_root)
+      if (!dir.exists(run_dir)) stop("The selected FetchNGS run folder no longer exists: ", run_dir)
+      manifest <- fetchngs_read_manifest(run_dir)
+      input_path <- trimws(as.character(manifest[["copied_input"]] %||% ""))
+      if (!nzchar(input_path) || !file.exists(input_path)) input_path <- file.path(run_dir, "input", "accessions.csv")
+      if (!file.exists(input_path)) stop("The normalized accession file is missing from this run: ", input_path)
+      accessions <- read_fetchngs_accession_file(input_path)
+      fetchngs_validate_run_accession_limit(accessions)
+      metadata_only <- identical(tolower(manifest[["metadata_only"]] %||% "false"), "true")
+      preflight <- if (!metadata_only) {
+        fetchngs_download_preflight(accessions, results_root = results_root)
+      } else NULL
+      output <- run_fetchngs_cli(c("resume", run_name), results_root = results_root)
+      safety_message <- if (!is.null(preflight)) {
+        paste0(
+          "Resume safety check passed: ", preflight$run_count, " unique run(s), ",
+          fetchngs_human_size(preflight$estimated_bytes), " estimated compressed FASTQs, and ",
+          fetchngs_human_size(preflight$required_storage_bytes), " required storage."
+        )
+      } else {
+        "Metadata-only run: no FASTQ size or storage check was required."
+      }
+      paste(output, "", safety_message, sep = "\n")
     },
       error = function(e) paste("ERROR:", conditionMessage(e))
     )

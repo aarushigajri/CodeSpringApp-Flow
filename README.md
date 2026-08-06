@@ -108,6 +108,53 @@ or interrupted run can be selected and resumed with Nextflow's `-resume`
 behavior. **Create bundle only** writes and validates the input, parameter,
 manifest, and Slurm files without submitting a job.
 
+### FetchNGS accession and download safeguards
+
+CodeSpringApp strictly accepts the accession families documented by
+nf-core/fetchngs 1.12.0:
+
+- runs: `SRR`, `ERR`, `DRR`
+- experiments: `SRX`, `ERX`, `DRX`
+- samples: `SRS`, `ERS`, `DRS`, `SAMN`, `SAMEA`, `SAMD`
+- studies: `SRP`, `ERP`, `DRP`
+- submissions: `SRA`, `ERA`, `DRA`
+- BioProjects: `PRJNA`, `PRJEB`, `PRJDB`
+- GEO: `GSM`, `GSE`
+
+Values are converted to uppercase and deduplicated. Any unrecognized format is
+rejected before a run folder or Slurm job is created. Server-side accession
+files receive the same validation as IDs pasted into the app.
+
+Before a real FASTQ submission, the app requests an ENA run-level file report,
+deduplicates overlapping resolved runs, and sums the reported compressed
+`fastq_bytes`. By default, a submission is blocked when it resolves to more
+than 20 unique runs, exceeds 50 GB of compressed FASTQs, or has no usable size
+estimate. Metadata-only mode remains available when the size cannot be
+determined.
+
+The app also checks free space before submission. When results and private
+Nextflow work use the same filesystem, free space must be at least four times
+the estimated compressed FASTQ size. When they use different filesystems, one
+copy is reserved for final results and the remaining allowance is required on
+the runtime/work filesystem. This accounts approximately for the larger
+temporary files created by `sra-tools`; it is a pre-submission safety check,
+not a storage reservation.
+
+The same checks run again before **Resume selected run** submits a non-metadata
+workflow. Therefore, creating a bundle with **Create bundle only** cannot be
+used to bypass the run-count, size, or free-space limits.
+
+Administrators can change these server-side limits before launching the app:
+
+```bash
+export CSL_FETCHNGS_MAX_RUNS=20
+export CSL_FETCHNGS_MAX_DOWNLOAD_GB=50
+export CSL_FETCHNGS_STORAGE_MULTIPLIER=4
+export CSL_FETCHNGS_ENA_TIMEOUT_SECONDS=30
+```
+
+These limits are displayed to users but have no normal user-interface override.
+
 The **FetchNGS Outputs** tab lists files beneath the selected run's `results/`
 folder. CSV, TSV, and TXT files are shown as capped interactive tables; JSON,
 YAML, Markdown, and log files receive a capped text preview. Large or binary
