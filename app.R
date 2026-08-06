@@ -10995,6 +10995,17 @@ body { background:#eef3f8; color:#17202f; }
 .run-message-alert.error strong { color:#8a2f24; }
 .run-message-alert.success { background:#eefaf3; border-color:#b7dfc7; color:#315f4c; }
 .run-message-alert.active { background:#fff4d6; border-color:#f0c36d; color:#7c3d00; }
+.fetchngs-safeguards {
+  white-space: normal;
+  padding: 10px 12px;}
+.fetchngs-safeguards strong {
+  margin-bottom: 2px;}
+.fetchngs-safeguards ul {
+  margin: 4px 0 0 18px;
+  padding-left: 0;}
+.fetchngs-safeguards li {
+  margin: 0 0 2px 0;
+  line-height: 1.25;}
 .tool-message-alert { margin:12px 0; }
 .tool-cancel-zone { margin-top:12px; padding-top:12px; border-top:1px dashed #d8dde8; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .tool-delete-zone { margin-top:8px; padding:10px 12px; border:1px solid #f0c1ba; border-radius:8px; background:#fff7f5; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
