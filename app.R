@@ -429,6 +429,17 @@ fetchngs_run_dir <- function(run_name, root = FETCHNGS_RESULTS_ROOT) {
   file.path(fetchngs_runs_root(root), validate_fetchngs_run_name(run_name))
 }
 
+fetchngs_runtime_work_dir <- function(run_name, runtime_root = FETCHNGS_RUNTIME_ROOT) {
+  file.path(runtime_root, "work", "fetchngs", validate_fetchngs_run_name(run_name))
+}
+
+fetchngs_run_path_is_safe <- function(path, root, run_name) {
+  run_name <- validate_fetchngs_run_name(run_name)
+  path <- normalizePath(path, winslash = "/", mustWork = FALSE)
+  root <- normalizePath(root, winslash = "/", mustWork = FALSE)
+  !identical(path, root) && path_is_within(path, root) && identical(basename(path), run_name)
+}
+
 fetchngs_run_names <- function(root = FETCHNGS_RESULTS_ROOT) {
   runs_root <- fetchngs_runs_root(root)
   if (!dir.exists(runs_root)) return(character(0))
@@ -478,6 +489,16 @@ fetchngs_scheduler_state <- function(job_id) {
   ""
 }
 
+fetchngs_job_is_active <- function(state) {
+  toupper(trimws(as.character(state %||% ""))) %in%
+    c("RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "SUSPENDED")
+}
+
+fetchngs_job_is_terminal <- function(state) {
+  toupper(trimws(as.character(state %||% ""))) %in%
+    c("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT")
+}
+
 fetchngs_human_size <- function(bytes) {
   bytes <- suppressWarnings(as.numeric(bytes))
   if (!is.finite(bytes) || bytes <= 0) return("0 B")
@@ -500,7 +521,7 @@ fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_s
   metadata <- metadata[file.exists(metadata) & !dir.exists(metadata)]
   output_files <- c(fastqs, metadata)
   output_bytes <- if (length(output_files)) sum(file.info(output_files)$size, na.rm = TRUE) else 0
-  status <- if (scheduler_state %in% c("RUNNING", "PENDING", "CONFIGURING", "COMPLETING", "RESIZING", "SUSPENDED")) {
+  status <- if (fetchngs_job_is_active(scheduler_state)) {
     tools::toTitleCase(tolower(scheduler_state))
   } else if (scheduler_state %in% c("COMPLETED")) {
     "Completed"
@@ -546,6 +567,47 @@ fetchngs_latest_log <- function(run_name, root = FETCHNGS_RESULTS_ROOT, lines = 
   paste(c(paste("Log:", newest), "", content), collapse = "\n")
 }
 
+delete_fetchngs_run <- function(
+    run_name,
+    results_root = FETCHNGS_RESULTS_ROOT,
+    runtime_root = FETCHNGS_RUNTIME_ROOT,
+    app_home = APP_HOME,
+    query_scheduler = TRUE) {
+  run_name <- validate_fetchngs_run_name(run_name)
+  results_root <- normalizePath(results_root, winslash = "/", mustWork = FALSE)
+  runtime_work_root <- normalizePath(file.path(runtime_root, "work", "fetchngs"), winslash = "/", mustWork = FALSE)
+  run_dir <- fetchngs_run_dir(run_name, results_root)
+  work_dir <- fetchngs_runtime_work_dir(run_name, runtime_root)
+
+  if (!fetchngs_run_path_is_safe(run_dir, results_root, run_name)) {
+    stop("Refusing to delete an unexpected FetchNGS result path: ", run_dir)
+  }
+  if (!fetchngs_run_path_is_safe(work_dir, runtime_work_root, run_name)) {
+    stop("Refusing to delete an unexpected FetchNGS work path: ", work_dir)
+  }
+  if (!dir.exists(run_dir)) stop("The selected FetchNGS run folder no longer exists: ", run_dir)
+
+  job_id <- fetchngs_latest_job_id(run_dir)
+  scheduler_state <- if (isTRUE(query_scheduler)) fetchngs_scheduler_state(job_id) else ""
+  if (nzchar(scheduler_state) && !fetchngs_job_is_terminal(scheduler_state)) {
+    stop("Run ", run_name, " still has active SLURM job ", job_id, " (", scheduler_state, "). Wait for it to finish or cancel the job before deleting the run.")
+  }
+
+  targets <- c(run_dir, work_dir)
+  existing_targets <- targets[dir.exists(targets)]
+  failed <- existing_targets[vapply(existing_targets, function(path) unlink(path, recursive = TRUE, force = TRUE) != 0, logical(1))]
+
+  generated_input_root <- normalizePath(file.path(app_home, "fetchngs_inputs"), winslash = "/", mustWork = FALSE)
+  generated_inputs <- file.path(generated_input_root, paste0(run_name, c("_accessions.csv", "_accessions.txt")))
+  generated_inputs <- generated_inputs[vapply(generated_inputs, path_is_within, logical(1), root = generated_input_root)]
+  invisible(vapply(generated_inputs[file.exists(generated_inputs)], unlink, integer(1), force = TRUE))
+
+  still_exists <- targets[dir.exists(targets)]
+  failed <- unique(c(failed, still_exists))
+  if (length(failed)) stop("Could not completely delete the FetchNGS run. Still present: ", paste(failed, collapse = ", "))
+  paste("Deleted FetchNGS run", run_name, "and its private Nextflow work directory.")
+}
+
 run_fetchngs_cli <- function(args, results_root = FETCHNGS_RESULTS_ROOT, runtime_root = FETCHNGS_RUNTIME_ROOT) {
   if (!file.exists(FETCHNGS_CLI)) stop("FetchNGS launcher is missing: ", FETCHNGS_CLI)
   if (file.access(FETCHNGS_CLI, mode = 1) != 0) stop("FetchNGS launcher is not executable: ", FETCHNGS_CLI)
@@ -569,7 +631,7 @@ write_fetchngs_accession_input <- function(run_name, value, app_home = APP_HOME)
   accessions <- parse_fetchngs_accessions(value)
   input_dir <- file.path(app_home, "fetchngs_inputs")
   dir.create(input_dir, recursive = TRUE, showWarnings = FALSE)
-  path <- file.path(input_dir, paste0(validate_fetchngs_run_name(run_name), "_accessions.txt"))
+  path <- file.path(input_dir, paste0(validate_fetchngs_run_name(run_name), "_accessions.csv"))
   writeLines(accessions, path, useBytes = TRUE)
   path
 }
@@ -11304,7 +11366,8 @@ ui <- fluidPage(
                           h4("Existing FetchNGS runs"),
                           uiOutput("fetchngs_run_select_ui"),
                           div(class = "button-row",
-                              actionButton("resume_fetchngs", "Resume selected run")),
+                              actionButton("resume_fetchngs", "Resume selected run"),
+                              actionButton("delete_fetchngs", "Delete selected run", class = "btn-danger")),
                           br(),
                           table_output("fetchngs_runs_table"),
                           br(),
@@ -11384,6 +11447,7 @@ server <- function(input, output, session) {
   run_message <- reactiveVal("")
   fetchngs_refresh <- reactiveVal(0L)
   fetchngs_message_state <- reactiveVal("")
+  fetchngs_delete_target <- reactiveVal("")
   tool_messages <- reactiveVal(list())
   progress_refresh <- reactiveVal(Sys.time())
   run_cards_refresh <- reactiveVal(Sys.time())
@@ -11922,6 +11986,56 @@ server <- function(input, output, session) {
     fetchngs_message_state(result)
     fetchngs_refresh(fetchngs_refresh() + 1L)
   })
+
+  observeEvent(input$delete_fetchngs, {
+    run_name <- input$fetchngs_selected_run %||% ""
+    if (!nzchar(run_name)) {
+      fetchngs_message_state("ERROR: Select an existing FetchNGS run to delete.")
+      return()
+    }
+    result <- tryCatch({
+      run_name <- validate_fetchngs_run_name(run_name)
+      run_dir <- fetchngs_run_dir(run_name)
+      work_dir <- fetchngs_runtime_work_dir(run_name)
+      if (!dir.exists(run_dir)) stop("The selected FetchNGS run folder no longer exists: ", run_dir)
+      job_id <- fetchngs_latest_job_id(run_dir)
+      scheduler_state <- fetchngs_scheduler_state(job_id)
+      if (nzchar(scheduler_state) && !fetchngs_job_is_terminal(scheduler_state)) {
+        stop("Run ", run_name, " still has active SLURM job ", job_id, " (", scheduler_state, "). Wait for it to finish or cancel the job before deleting the run.")
+      }
+      fetchngs_delete_target(run_name)
+      showModal(modalDialog(
+        title = paste("Delete FetchNGS run", run_name, "?"),
+        tags$p("This will permanently delete the selected run outputs, logs, generated bundle, and its private Nextflow work directory:"),
+        tags$ul(tags$li(code(run_dir)), tags$li(code(work_dir))),
+        tags$p("The shared Singularity cache and all other FetchNGS runs will be kept."),
+        tags$p(tags$strong("This cannot be undone.")),
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_delete_fetchngs", "Yes, delete this run", class = "btn-danger")
+        ),
+        easyClose = TRUE
+      ))
+      ""
+    }, error = function(e) paste("ERROR:", conditionMessage(e)))
+    if (nzchar(result)) fetchngs_message_state(result)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$confirm_delete_fetchngs, {
+    run_name <- isolate(fetchngs_delete_target())
+    removeModal()
+    fetchngs_delete_target("")
+    if (!nzchar(run_name)) {
+      fetchngs_message_state("ERROR: No FetchNGS run was selected for deletion.")
+      return()
+    }
+    result <- tryCatch(
+      delete_fetchngs_run(run_name),
+      error = function(e) paste("ERROR:", conditionMessage(e))
+    )
+    fetchngs_message_state(result)
+    fetchngs_refresh(fetchngs_refresh() + 1L)
+  }, ignoreInit = TRUE)
 
   filtered_projects <- reactive({
     if (is_fetchngs_analysis(input$analysis %||% "RNA-seq")) return(list())

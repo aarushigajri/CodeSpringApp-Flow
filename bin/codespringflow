@@ -97,7 +97,10 @@ write_run_bundle() {
     local nf_run_name
 
     run_dir="$(run_dir_for "$run_name")"
-    copied_input="$run_dir/input/$(basename "$input_file")"
+    # FetchNGS 1.12 validates the input filename before reading the one-ID-per-line
+    # content. Normalize every supported source extension to CSV so that pasted
+    # accessions and server-side .txt/.tsv lists follow the documented interface.
+    copied_input="$run_dir/input/accessions.csv"
     nextflow_bin="${NEXTFLOW_BIN:-$HOME/bin/nextflow}"
     nextflow_version="${NXF_VER:-$DEFAULT_NXF_VERSION}"
     nf_run_name="${run_name//[^A-Za-z0-9_]/_}"

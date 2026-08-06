@@ -46,7 +46,8 @@ Choose **FetchNGS** from the main **Analysis type** dropdown to open its isolate
 workspace. It runs `nf-core/fetchngs` as a standalone SLURM job. Users can
 paste public accessions directly or select a `.txt`, `.csv`, or `.tsv` accession
 file already on the server. The app supports full FASTQ retrieval and a
-metadata-only mode.
+metadata-only mode. Every accepted accession list is copied into the run bundle
+as `input/accessions.csv`, matching the filename validation in FetchNGS 1.12.0.
 
 The validated cluster defaults are:
 
@@ -94,6 +95,11 @@ FASTQ and metadata counts, output size, and the newest controller log. A failed
 or interrupted run can be selected and resumed with Nextflow's `-resume`
 behavior. **Create bundle only** writes and validates the input, parameter,
 manifest, and Slurm files without submitting a job.
+
+**Delete selected run** asks for confirmation and removes only that run's
+`~/csl_results/fetchngs/<run-name>` folder and matching private Nextflow work
+directory. It refuses to delete a run whose recorded SLURM job is still active,
+and it never removes the shared Singularity cache.
 
 FetchNGS only retrieves data. It does not automatically launch CUT&RUN, Sarek,
 or another analysis workflow. A downloaded FASTQ folder can later be selected

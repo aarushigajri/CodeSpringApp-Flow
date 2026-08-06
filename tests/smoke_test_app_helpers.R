@@ -153,6 +153,16 @@ assert(
   identical(fetchngs_accessions, c("SRR14593545", "ERR1160846")),
   "FetchNGS pasted accessions are split and deduplicated"
 )
+fetchngs_pasted_input <- app_env$write_fetchngs_accession_input(
+  "pasted_app_helper",
+  paste(fetchngs_accessions, collapse = "\n"),
+  app_home = root
+)
+assert(
+  identical(tolower(tools::file_ext(fetchngs_pasted_input)), "csv") &&
+    identical(readLines(fetchngs_pasted_input, warn = FALSE), fetchngs_accessions),
+  "Shiny writes pasted FetchNGS accessions one per line with a validator-compatible CSV extension"
+)
 fetchngs_input <- file.path(root, "fetchngs_accessions.txt")
 writeLines(fetchngs_accessions, fetchngs_input)
 fetchngs_root <- file.path(root, "csl_results", "fetchngs")
@@ -167,15 +177,43 @@ fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_ro
 assert(
   grepl("Dry run only", fetchngs_output, fixed = TRUE) &&
     file.exists(file.path(fetchngs_run, "run.sbatch")) &&
+    file.exists(file.path(fetchngs_run, "input", "accessions.csv")) &&
     identical(fetchngs_summary$Status[[1]], "Bundle only") &&
     identical(fetchngs_summary$`Metadata only`[[1]], "Yes"),
-  "Shiny FetchNGS helpers create and discover a metadata-only bundle without submitting Slurm"
+  "Shiny FetchNGS helpers create a validator-compatible metadata-only bundle without submitting Slurm"
+)
+assert(
+  app_env$fetchngs_job_is_active("RUNNING") &&
+    app_env$fetchngs_job_is_active("PENDING") &&
+    !app_env$fetchngs_job_is_active("FAILED") &&
+    !app_env$fetchngs_job_is_active("COMPLETED") &&
+    app_env$fetchngs_job_is_terminal("FAILED") &&
+    app_env$fetchngs_job_is_terminal("COMPLETED") &&
+    !app_env$fetchngs_job_is_terminal("RUNNING") &&
+    !app_env$fetchngs_job_is_terminal("UNKNOWN_TRANSITION"),
+  "FetchNGS deletion distinguishes active jobs from terminal jobs"
+)
+fetchngs_delete_message <- app_env$delete_fetchngs_run(
+  "app_helper_smoke",
+  results_root = fetchngs_root,
+  runtime_root = fetchngs_runtime_root,
+  app_home = root,
+  query_scheduler = FALSE
+)
+assert(
+  grepl("Deleted FetchNGS run", fetchngs_delete_message, fixed = TRUE) &&
+    !dir.exists(fetchngs_run) &&
+    !dir.exists(file.path(fetchngs_runtime_root, "work", "fetchngs", "app_helper_smoke")) &&
+    dir.exists(fetchngs_root),
+  "FetchNGS deletion removes only the selected result and work folders while keeping the results root"
 )
 assert(
   grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
     grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
-    grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE),
-  "the app exposes FetchNGS creation, status, and resume controls"
+    grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE) &&
+    grepl('actionButton("delete_fetchngs"', app_text, fixed = TRUE) &&
+    grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE),
+  "the app exposes FetchNGS creation, status, resume, and confirmed deletion controls"
 )
 
 shared_scanpy_sif <- "/grid/bsr/data/data/bsr_readable_data/containers/scanpy/codespring-scanpy_1.0.0.sif"
