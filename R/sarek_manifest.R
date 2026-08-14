@@ -5,6 +5,8 @@ SAREK_MANIFEST_SCHEMA_VERSION <- "1.0"
 SAREK_INSPECTOR_VERSION <- "0.1.0"
 SAREK_SUPPORTED_INPUT_FORMATS <- c("fastq", "ubam", "bam", "cram", "vcf", "bcf")
 SAREK_SAMPLE_ROLES <- c("germline", "tumor", "normal", "unknown")
+SAREK_ASSAY_TYPES <- c("WGS", "WES", "targeted", "annotation_only")
+SAREK_ANALYSIS_MODES <- c("germline", "tumor_only", "matched_tumor_normal", "annotation_only")
 SAREK_PROCESSING_STATES <- c(
   "unknown",
   "unmapped",
@@ -45,6 +47,35 @@ sarek_normalize_existing_path <- function(path) {
   normalizePath(path, winslash = "/", mustWork = TRUE)
 }
 
+sarek_is_absolute_path <- function(path) {
+  path <- sarek_text(path)
+  nzchar(path) && startsWith(path, "/")
+}
+
+sarek_path_is_within <- function(path, root) {
+  path <- normalizePath(path, winslash = "/", mustWork = FALSE)
+  root <- sub("/+$", "", normalizePath(root, winslash = "/", mustWork = FALSE))
+  identical(path, root) || startsWith(path, paste0(root, "/"))
+}
+
+sarek_assert_allowed_paths <- function(paths, allowed_roots = NULL, must_exist = TRUE) {
+  if (is.null(allowed_roots) || !length(allowed_roots)) return(invisible(TRUE))
+  allowed_roots <- unique(vapply(allowed_roots, sarek_normalize_existing_path, character(1)))
+  normalized <- if (isTRUE(must_exist)) {
+    unique(vapply(paths, sarek_normalize_existing_path, character(1)))
+  } else {
+    if (any(!vapply(paths, sarek_is_absolute_path, logical(1)))) stop("Authorized paths must be absolute server paths.")
+    unique(vapply(paths, normalizePath, character(1), winslash = "/", mustWork = FALSE))
+  }
+  outside <- normalized[!vapply(normalized, function(path) {
+    any(vapply(allowed_roots, function(root) sarek_path_is_within(path, root), logical(1)))
+  }, logical(1))]
+  if (length(outside)) {
+    stop("Input path is outside the authorized server roots: ", paste(outside, collapse = ", "))
+  }
+  invisible(TRUE)
+}
+
 sarek_find_index <- function(path, format = sarek_detect_input_format(path)) {
   candidates <- switch(
     format,
@@ -58,8 +89,9 @@ sarek_find_index <- function(path, format = sarek_detect_input_format(path)) {
   if (length(candidates)) normalizePath(candidates[[1]], winslash = "/", mustWork = TRUE) else ""
 }
 
-sarek_discover_input_paths <- function(paths, recursive = FALSE, max_files = 5000L) {
+sarek_discover_input_paths <- function(paths, recursive = FALSE, max_files = 5000L, allowed_roots = NULL) {
   paths <- unique(vapply(paths, sarek_normalize_existing_path, character(1)))
+  sarek_assert_allowed_paths(paths, allowed_roots)
   max_files <- suppressWarnings(as.integer(max_files))
   if (!is.finite(max_files) || max_files < 1L) stop("max_files must be a positive integer.")
 
@@ -85,7 +117,8 @@ sarek_discover_input_paths <- function(paths, recursive = FALSE, max_files = 500
   candidates <- unique(candidates[file.exists(candidates) & !dir.exists(candidates)])
   formats <- vapply(candidates, sarek_detect_input_format, character(1))
   supported <- nzchar(formats)
-  supported_paths <- candidates[supported]
+  supported_paths <- unique(vapply(candidates[supported], sarek_normalize_existing_path, character(1)))
+  sarek_assert_allowed_paths(supported_paths, allowed_roots)
 
   if (length(supported_paths) > max_files) {
     stop(
@@ -187,8 +220,13 @@ sarek_filename_tokens <- function(path, format = sarek_detect_input_format(path)
   )
 }
 
-sarek_build_discovery_table <- function(paths, recursive = FALSE, max_files = 5000L) {
-  discovery <- sarek_discover_input_paths(paths, recursive = recursive, max_files = max_files)
+sarek_build_discovery_table <- function(paths, recursive = FALSE, max_files = 5000L, allowed_roots = NULL) {
+  discovery <- sarek_discover_input_paths(
+    paths,
+    recursive = recursive,
+    max_files = max_files,
+    allowed_roots = allowed_roots
+  )
   if (!length(discovery$supported_paths)) {
     stop("No supported FASTQ, uBAM, BAM, CRAM, VCF, or BCF files were found.")
   }
@@ -202,6 +240,7 @@ sarek_build_discovery_table <- function(paths, recursive = FALSE, max_files = 50
       patient_id = tokens$patient_id,
       sample_id = tokens$sample_id,
       role = tokens$role,
+      matched_normal_id = "",
       input_format = format,
       processing_state = tokens$processing_state,
       path = normalizePath(path, winslash = "/", mustWork = TRUE),
@@ -218,6 +257,13 @@ sarek_build_discovery_table <- function(paths, recursive = FALSE, max_files = 50
 
   table <- do.call(rbind, rows)
   rownames(table) <- NULL
+  for (patient_id in unique(table$patient_id)) {
+    patient_rows <- table$patient_id == patient_id
+    normal_ids <- unique(table$sample_id[patient_rows & table$role == "normal"])
+    if (length(normal_ids) == 1L) {
+      table$matched_normal_id[patient_rows & table$role == "tumor"] <- normal_ids[[1]]
+    }
+  }
   attr(table, "source_paths") <- discovery$source_paths
   attr(table, "ignored_count") <- length(discovery$ignored_paths)
   table
@@ -245,13 +291,17 @@ sarek_validate_confirmation_table <- function(table) {
     ))
   }
 
-  selected <- table[as.logical(table$include), , drop = FALSE]
+  include <- suppressWarnings(as.logical(table$include))
+  if (anyNA(include)) errors <- c(errors, "Every include value must be explicitly TRUE or FALSE.")
+  selected <- table[which(!is.na(include) & include), , drop = FALSE]
   if (!NROW(selected)) errors <- c(errors, "At least one input file must be included.")
   if (!NROW(selected)) return(list(valid = FALSE, errors = errors, warnings = warnings))
 
   identifier_pattern <- "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
-  bad_patient <- !grepl(identifier_pattern, selected$patient_id, perl = TRUE)
-  bad_sample <- !grepl(identifier_pattern, selected$sample_id, perl = TRUE)
+  patient_ids <- trimws(as.character(selected$patient_id))
+  sample_ids <- trimws(as.character(selected$sample_id))
+  bad_patient <- is.na(patient_ids) | !nzchar(patient_ids) | !grepl(identifier_pattern, patient_ids, perl = TRUE)
+  bad_sample <- is.na(sample_ids) | !nzchar(sample_ids) | !grepl(identifier_pattern, sample_ids, perl = TRUE)
   if (any(bad_patient)) errors <- c(errors, "Patient IDs may contain only letters, numbers, periods, underscores, and hyphens.")
   if (any(bad_sample)) errors <- c(errors, "Sample IDs may contain only letters, numbers, periods, underscores, and hyphens.")
   if (any(!selected$role %in% SAREK_SAMPLE_ROLES)) errors <- c(errors, "One or more sample roles are invalid.")
@@ -263,22 +313,72 @@ sarek_validate_confirmation_table <- function(table) {
 
   sample_key <- paste(selected$patient_id, selected$sample_id, sep = "::")
   formats_by_sample <- split(selected$input_format, sample_key)
-  mixed <- names(formats_by_sample)[vapply(formats_by_sample, function(x) length(unique(x)) > 1L, logical(1))]
-  if (length(mixed)) errors <- c(errors, "A sample cannot mix different input formats.")
+  roles_by_sample <- split(selected$role, sample_key)
+  states_by_sample <- split(selected$processing_state, sample_key)
+  mixed_formats <- names(formats_by_sample)[vapply(formats_by_sample, function(x) length(unique(x)) > 1L, logical(1))]
+  mixed_roles <- names(roles_by_sample)[vapply(roles_by_sample, function(x) length(unique(x)) > 1L, logical(1))]
+  mixed_states <- names(states_by_sample)[vapply(states_by_sample, function(x) length(unique(x)) > 1L, logical(1))]
+  if (length(mixed_formats)) errors <- c(errors, "A sample cannot mix different input formats.")
+  if (length(mixed_roles)) errors <- c(errors, "All files assigned to one sample must use the same sample role.")
+  if (length(mixed_states)) errors <- c(errors, "All files assigned to one sample must use the same processing state.")
 
-  if (any(selected$role == "unknown")) warnings <- c(warnings, "Every unknown sample role must be confirmed before pipeline submission.")
+  fastq <- selected[selected$input_format == "fastq", , drop = FALSE]
+  if (NROW(fastq)) {
+    if (!all(c("lane", "read") %in% names(fastq))) {
+      errors <- c(errors, "FASTQ inputs require lane and read columns.")
+    } else {
+      lane_values <- trimws(as.character(fastq$lane))
+      lane <- ifelse(is.na(lane_values) | !nzchar(lane_values), "unlabelled", lane_values)
+      pair_key <- paste(fastq$patient_id, fastq$sample_id, lane, sep = "::")
+      reads_by_pair <- split(fastq$read, pair_key)
+      incomplete <- names(reads_by_pair)[!vapply(reads_by_pair, function(reads) {
+        reads <- sort(suppressWarnings(as.integer(reads)))
+        length(reads) == 2L && !anyNA(reads) && identical(reads, c(1L, 2L))
+      }, logical(1))]
+      if (length(incomplete)) {
+        errors <- c(errors, paste0(
+          "Each FASTQ sample lane must contain exactly one R1 and one R2: ",
+          paste(incomplete, collapse = ", ")
+        ))
+      }
+    }
+  }
+
+  if ("matched_normal_id" %in% names(selected)) {
+    matches_by_sample <- split(trimws(as.character(selected$matched_normal_id)), sample_key)
+    inconsistent_matches <- names(matches_by_sample)[vapply(matches_by_sample, function(x) {
+      x <- x[!is.na(x) & nzchar(x)]
+      length(unique(x)) > 1L
+    }, logical(1))]
+    if (length(inconsistent_matches)) {
+      errors <- c(errors, "All files assigned to one tumor sample must name the same matched normal.")
+    }
+  }
+
+  if (any(selected$role == "unknown", na.rm = TRUE)) warnings <- c(warnings, "Every unknown sample role must be confirmed before pipeline submission.")
+  index_missing <- if ("index" %in% names(selected)) {
+    is.na(selected$index) | !nzchar(trimws(as.character(selected$index)))
+  } else {
+    rep(TRUE, NROW(selected))
+  }
   missing_index <- selected$input_format %in% c("bam", "cram", "vcf", "bcf") &
-    (!"index" %in% names(selected) || !nzchar(selected$index))
+    index_missing
   if (any(missing_index)) warnings <- c(warnings, "One or more indexed formats do not currently have a detected index.")
 
   list(valid = !length(errors), errors = unique(errors), warnings = unique(warnings))
 }
 
 sarek_validate_analysis_mode <- function(table, analysis_mode) {
-  selected <- table[as.logical(table$include), , drop = FALSE]
+  include <- suppressWarnings(as.logical(table$include))
+  selected <- table[which(!is.na(include) & include), , drop = FALSE]
   errors <- character(0)
   roles <- unique(selected$role)
   formats <- unique(selected$input_format)
+
+  analysis_mode <- sarek_text(analysis_mode)
+  if (!analysis_mode %in% SAREK_ANALYSIS_MODES) {
+    return("The analysis mode is invalid.")
+  }
 
   if (identical(analysis_mode, "germline") && any(!roles %in% "germline")) {
     errors <- c(errors, "Germline mode requires every included sample to have the germline role.")
@@ -299,14 +399,46 @@ sarek_validate_analysis_mode <- function(table, analysis_mode) {
         paste(incomplete, collapse = ", ")
       ))
     }
+
+    if (!"matched_normal_id" %in% names(selected)) {
+      errors <- c(errors, "Matched tumor-normal mode requires an explicit matched_normal_id column.")
+    } else {
+      sample_columns <- c("patient_id", "sample_id", "role", "matched_normal_id")
+      sample_meta <- unique(selected[, sample_columns, drop = FALSE])
+      tumors <- sample_meta[sample_meta$role == "tumor", , drop = FALSE]
+      normals <- sample_meta[sample_meta$role == "normal", , drop = FALSE]
+      used_normals <- character(0)
+
+      for (i in seq_len(NROW(tumors))) {
+        matched_normal <- sarek_text(tumors$matched_normal_id[[i]])
+        if (!nzchar(matched_normal)) {
+          errors <- c(errors, paste0("Tumor sample ", tumors$sample_id[[i]], " requires a matched normal."))
+          next
+        }
+        valid_normal <- normals$patient_id == tumors$patient_id[[i]] & normals$sample_id == matched_normal
+        if (!any(valid_normal)) {
+          errors <- c(errors, paste0(
+            "Tumor sample ", tumors$sample_id[[i]],
+            " names a normal that is not included for the same patient: ", matched_normal
+          ))
+        } else {
+          used_normals <- c(used_normals, paste(tumors$patient_id[[i]], matched_normal, sep = "::"))
+        }
+      }
+
+      normal_keys <- paste(normals$patient_id, normals$sample_id, sep = "::")
+      unused_normals <- normals$sample_id[!normal_keys %in% used_normals]
+      if (length(unused_normals)) {
+        errors <- c(errors, paste0(
+          "Included normal samples must be explicitly paired to at least one tumor: ",
+          paste(unique(unused_normals), collapse = ", ")
+        ))
+      }
+    }
   }
   if (identical(analysis_mode, "annotation_only") && any(!formats %in% c("vcf", "bcf"))) {
     errors <- c(errors, "Annotation-only mode accepts only VCF or BCF inputs.")
   }
-  if (!analysis_mode %in% c("germline", "tumor_only", "matched_tumor_normal", "annotation_only")) {
-    errors <- c(errors, "The analysis mode is invalid.")
-  }
-
   unique(errors)
 }
 
@@ -330,19 +462,29 @@ sarek_build_manifest <- function(
   source_paths = attr(confirmation_table, "source_paths"),
   species = "human",
   assembly = "GRCh38",
-  sarek_genome = "GATK.GRCh38"
+  sarek_genome = "GATK.GRCh38",
+  allowed_results_roots = NULL,
+  allowed_work_roots = NULL
 ) {
   validation <- sarek_validate_confirmation_table(confirmation_table)
   mode_errors <- sarek_validate_analysis_mode(confirmation_table, analysis_mode)
   errors <- unique(c(validation$errors, mode_errors))
+  if (!sarek_text(assay_type) %in% SAREK_ASSAY_TYPES) errors <- c(errors, "The assay type is invalid.")
+  if (!nzchar(sarek_text(preset))) errors <- c(errors, "The analysis preset is required.")
+  if (!nzchar(sarek_text(species)) || !nzchar(sarek_text(assembly)) || !nzchar(sarek_text(sarek_genome))) {
+    errors <- c(errors, "Species, reference assembly, and Sarek genome are required.")
+  }
+  if (!sarek_is_absolute_path(results_root) || !sarek_is_absolute_path(work_root)) {
+    errors <- c(errors, "Results and work roots must be absolute server paths.")
+  }
   if (length(errors)) stop(paste(errors, collapse = "\n"))
 
-  selected <- confirmation_table[as.logical(confirmation_table$include), , drop = FALSE]
+  include <- suppressWarnings(as.logical(confirmation_table$include))
+  selected <- confirmation_table[which(!is.na(include) & include), , drop = FALSE]
   results_root <- normalizePath(results_root, winslash = "/", mustWork = FALSE)
   work_root <- normalizePath(work_root, winslash = "/", mustWork = FALSE)
-  if (!startsWith(results_root, "/") || !startsWith(work_root, "/")) {
-    stop("Results and work roots must be absolute server paths.")
-  }
+  sarek_assert_allowed_paths(results_root, allowed_results_roots, must_exist = FALSE)
+  sarek_assert_allowed_paths(work_root, allowed_work_roots, must_exist = FALSE)
 
   patient_ids <- unique(selected$patient_id)
   patients <- lapply(patient_ids, function(patient_id) {
@@ -350,7 +492,12 @@ sarek_build_manifest <- function(
     sample_ids <- unique(patient_rows$sample_id)
     samples <- lapply(sample_ids, function(sample_id) {
       sample_rows <- patient_rows[patient_rows$sample_id == sample_id, , drop = FALSE]
-      notes <- unique(sample_rows$warning[nzchar(sample_rows$warning)])
+      notes <- if ("warning" %in% names(sample_rows)) {
+        note_values <- as.character(sample_rows$warning)
+        unique(note_values[!is.na(note_values) & nzchar(note_values)])
+      } else {
+        character(0)
+      }
       sample <- list(
         sample_id = sample_id,
         role = unique(sample_rows$role)[[1]],
@@ -365,14 +512,14 @@ sarek_build_manifest <- function(
     relationships <- list()
     if (identical(analysis_mode, "matched_tumor_normal")) {
       tumors <- unique(patient_rows$sample_id[patient_rows$role == "tumor"])
-      normals <- unique(patient_rows$sample_id[patient_rows$role == "normal"])
       for (tumor in tumors) {
-        for (normal in normals) {
-          relationships[[length(relationships) + 1L]] <- list(
-            type = "matched_tumor_normal",
-            sample_ids = c(tumor, normal)
-          )
-        }
+        tumor_rows <- patient_rows[patient_rows$sample_id == tumor, , drop = FALSE]
+        matched_normal <- unique(trimws(as.character(tumor_rows$matched_normal_id)))
+        matched_normal <- matched_normal[nzchar(matched_normal)][[1]]
+        relationships[[length(relationships) + 1L]] <- list(
+          type = "matched_tumor_normal",
+          sample_ids = c(tumor, matched_normal)
+        )
       }
     }
 
@@ -396,16 +543,16 @@ sarek_build_manifest <- function(
     created_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
     created_by = sarek_text(created_by, "unknown"),
     reference = list(
-      species = species,
-      assembly = assembly,
-      sarek_genome = sarek_genome
+      species = sarek_text(species),
+      assembly = sarek_text(assembly),
+      sarek_genome = sarek_text(sarek_genome)
     ),
     assay = list(
-      type = assay_type,
+      type = sarek_text(assay_type),
       intervals = NULL
     ),
     analysis = list(
-      mode = analysis_mode,
+      mode = sarek_text(analysis_mode),
       preset = sarek_text(preset, "core")
     ),
     storage = list(
