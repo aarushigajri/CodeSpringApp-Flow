@@ -357,17 +357,30 @@ if (!file.exists(SAREK_MANIFEST_HELPERS)) stop("Sarek manifest helpers are missi
 if (!file.exists(SAREK_MANIFEST_SHINY)) stop("Sarek Shiny module is missing: ", SAREK_MANIFEST_SHINY)
 source(SAREK_MANIFEST_HELPERS, local = FALSE)
 source(SAREK_MANIFEST_SHINY, local = FALSE)
-SAREK_RESULTS_ROOT <- normalizePath(
-  Sys.getenv("CSL_SAREK_RESULTS_ROOT", unset = file.path(DEFAULT_RESULTS_ROOT, "sarek")),
+SAREK_USER_STORAGE_ROOT <- normalizePath(
+  Sys.getenv(
+    "CSL_USER_STORAGE_ROOT",
+    unset = file.path("/grid/bsr/data/data", CURRENT_USER)
+  ),
   winslash = "/",
   mustWork = FALSE
 )
-requested_sarek_work_root <- trimws(Sys.getenv("CSL_SAREK_WORK_ROOT", unset = ""))
-SAREK_WORK_ROOT <- if (nzchar(requested_sarek_work_root)) {
-  normalizePath(requested_sarek_work_root, winslash = "/", mustWork = FALSE)
-} else {
-  ""
-}
+SAREK_RESULTS_ROOT <- normalizePath(
+  Sys.getenv(
+    "CSL_SAREK_RESULTS_ROOT",
+    unset = file.path(DEFAULT_RESULTS_ROOT, "sarek")
+  ),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_WORK_ROOT <- normalizePath(
+  Sys.getenv(
+    "CSL_SAREK_WORK_ROOT",
+    unset = file.path(SAREK_USER_STORAGE_ROOT, "csl_work", "sarek")
+  ),
+  winslash = "/",
+  mustWork = FALSE
+)
 FETCHNGS_RESULTS_ROOT <- normalizePath(
   Sys.getenv("CSL_FETCHNGS_RESULTS_ROOT", unset = file.path(DEFAULT_RESULTS_ROOT, "fetchngs")),
   winslash = "/",
