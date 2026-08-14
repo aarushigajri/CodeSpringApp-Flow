@@ -19,6 +19,13 @@ assert_true(isTRUE(sarek_parse_include_value("yes")), "Truthy include value was 
 assert_true(identical(sarek_parse_include_value("0"), FALSE), "False include value was not recognized.")
 assert_true(is.na(sarek_parse_include_value("maybe")), "Ambiguous include value should remain invalid.")
 
+widths <- sarek_manifest_column_widths()
+assert_true(all(c("patient_id", "sample_id", "path", "warning") %in% names(widths)), "Manifest column widths are incomplete.")
+assert_true(identical(widths[["path"]], "360px"), "The input path column should remain readable.")
+assert_true(sarek_manifest_status_kind("Enter input paths.") == "info", "Instruction status should use the information style.")
+assert_true(sarek_manifest_status_kind("ACTION REQUIRED: Review fields.") == "review", "Review status should use the attention style.")
+assert_true(sarek_manifest_status_kind("ERROR: Missing path.") == "error", "Error status should use the error style.")
+
 test_root <- tempfile("sarek-shiny-test-")
 dir.create(test_root, recursive = TRUE)
 on.exit(unlink(test_root, recursive = TRUE, force = TRUE), add = TRUE)
@@ -50,6 +57,8 @@ assert_true(!include_validation$valid, "Invalid include edit unexpectedly passed
 ui_text <- paste(as.character(sarek_manifest_ui("sarek_test")), collapse = "\n")
 assert_true(grepl("sarek_test-paths", ui_text, fixed = TRUE), "Shiny module inputs were not namespaced.")
 assert_true(grepl("corroborate", ui_text, ignore.case = TRUE), "UI does not explain manual corroboration.")
+assert_true(grepl("sarek-confirmation-table", ui_text, fixed = TRUE), "Manifest table is missing its horizontal-scroll container.")
+assert_true(grepl("sarek-status-banner", ui_text, fixed = TRUE), "Manifest status is missing its visible banner style.")
 
 results_root <- file.path(test_root, "results")
 work_root <- file.path(test_root, "work")

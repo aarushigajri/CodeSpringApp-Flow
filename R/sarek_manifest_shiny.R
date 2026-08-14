@@ -33,6 +33,40 @@ sarek_editable_columns <- function() {
   )
 }
 
+sarek_manifest_column_widths <- function() {
+  c(
+    include = "80px",
+    patient_id = "150px",
+    sample_id = "170px",
+    role = "110px",
+    matched_normal_id = "180px",
+    input_format = "120px",
+    processing_state = "170px",
+    path = "360px",
+    index = "320px",
+    lane = "90px",
+    read = "80px",
+    size_bytes = "120px",
+    role_confidence = "140px",
+    warning = "340px"
+  )
+}
+
+sarek_manifest_column_defs <- function(table) {
+  widths <- sarek_manifest_column_widths()
+  widths <- widths[names(widths) %in% names(table)]
+  lapply(names(widths), function(column) {
+    list(targets = match(column, names(table)) - 1L, width = unname(widths[[column]]))
+  })
+}
+
+sarek_manifest_status_kind <- function(message) {
+  message <- trimws(as.character(sarek_shiny_value(message)))
+  if (startsWith(message, "ERROR:")) return("error")
+  if (startsWith(message, "ACTION REQUIRED:")) return("review")
+  "info"
+}
+
 sarek_apply_confirmation_edit <- function(table, edit) {
   if (is.null(table) || !NROW(table) || is.null(edit$row) || is.null(edit$col)) return(table)
   row <- suppressWarnings(as.integer(edit$row))
@@ -119,6 +153,82 @@ sarek_manifest_table_output <- function(output_id) {
 sarek_manifest_ui <- function(id) {
   ns <- shiny::NS(id)
   shiny::tagList(
+    shiny::tags$style(shiny::HTML(
+      ".sarek-confirmation-table { width:100%; max-width:100%; overflow-x:auto; padding-bottom:8px; }
+       .sarek-confirmation-table .dataTables_wrapper { overflow-x:visible; }
+       .sarek-confirmation-table .dataTables_scroll { width:100%; overflow-x:auto; }
+       .sarek-confirmation-table .dataTables_scrollHeadInner,
+       .sarek-confirmation-table table.dataTable {
+         width:max-content !important;
+         min-width:2550px !important;
+         table-layout:auto !important;
+       }
+       .sarek-confirmation-table table.dataTable thead th,
+       .sarek-confirmation-table table.dataTable tbody td {
+         min-width:110px !important;
+         max-width:none !important;
+         white-space:nowrap !important;
+       }
+       .sarek-confirmation-table table.dataTable thead th:nth-child(8),
+       .sarek-confirmation-table table.dataTable tbody td:nth-child(8),
+       .sarek-confirmation-table table.dataTable thead th:nth-child(9),
+       .sarek-confirmation-table table.dataTable tbody td:nth-child(9),
+       .sarek-confirmation-table table.dataTable thead th:nth-child(14),
+       .sarek-confirmation-table table.dataTable tbody td:nth-child(14) {
+         min-width:320px !important;
+       }
+       .sarek-status-banner {
+         display:flex;
+         align-items:flex-start;
+         gap:10px;
+         width:100%;
+         margin:8px 0 16px 0;
+         padding:13px 15px;
+         border:1px solid #b8d4f2;
+         border-left:6px solid #1769aa;
+         border-radius:8px;
+         background:#eef6ff;
+         color:#17324d;
+         font-size:14px;
+         font-weight:650;
+         line-height:1.45;
+         white-space:normal;
+         overflow-wrap:anywhere;
+         box-shadow:0 2px 7px rgba(23,50,77,.08);
+       }
+       .sarek-status-banner::before {
+         content:'i';
+         flex:0 0 22px;
+         width:22px;
+         height:22px;
+         border-radius:50%;
+         background:#1769aa;
+         color:#fff;
+         text-align:center;
+         font-weight:800;
+         line-height:22px;
+       }
+       .sarek-status-banner-review {
+         border-color:#e7c66a;
+         border-left-color:#b7791f;
+         background:#fff8df;
+         color:#5c3b08;
+       }
+       .sarek-status-banner-review::before {
+         content:'!';
+         background:#b7791f;
+       }
+       .sarek-status-banner-error {
+         border-color:#efb0b0;
+         border-left-color:#b42318;
+         background:#fff1f0;
+         color:#7a1c16;
+       }
+       .sarek-status-banner-error::before {
+         content:'!';
+         background:#b42318;
+       }"
+    )),
     shiny::div(
       class = "progress-header-row",
       shiny::div(
@@ -154,7 +264,7 @@ sarek_manifest_ui <- function(id) {
         shiny::actionButton(ns("discover"), "Discover inputs", class = "btn-primary"),
         shiny::br(),
         shiny::br(),
-        shiny::verbatimTextOutput(ns("status"))
+        shiny::uiOutput(ns("status"))
       ),
       shiny::column(
         8,
@@ -170,7 +280,10 @@ sarek_manifest_ui <- function(id) {
           )
         ),
         shiny::tableOutput(ns("summary")),
-        sarek_manifest_table_output(ns("confirmation_table"))
+        shiny::div(
+          class = "sarek-confirmation-table",
+          sarek_manifest_table_output(ns("confirmation_table"))
+        )
       )
     ),
     shiny::tags$hr(),
@@ -287,9 +400,9 @@ sarek_manifest_server <- function(
         invalidate_confirmation()
         ignored <- as.integer(sarek_shiny_value(attr(table, "ignored_count"), 0L))
         status_state(paste0(
-          "Discovered ", NROW(table), " supported file", if (NROW(table) == 1L) "" else "s",
+          "ACTION REQUIRED: Discovered ", NROW(table), " supported file", if (NROW(table) == 1L) "" else "s",
           if (ignored > 0L) paste0("; ignored ", ignored, " unsupported file", if (ignored == 1L) "" else "s") else "",
-          ". Review the table before confirmation."
+          ". Review every inferred patient, sample, role, format, and processing-state field before confirmation."
         ))
         validation_state("Discovery complete. The current draft has not been confirmed.")
       }, error = function(error) {
@@ -301,7 +414,14 @@ sarek_manifest_server <- function(
       invisible(NULL)
     }, ignoreInit = TRUE)
 
-    output$status <- shiny::renderText(status_state())
+    output$status <- shiny::renderUI({
+      message <- status_state()
+      kind <- sarek_manifest_status_kind(message)
+      shiny::div(
+        class = paste("sarek-status-banner", paste0("sarek-status-banner-", kind)),
+        shiny::tags$span(message)
+      )
+    })
     output$summary <- shiny::renderTable(
       sarek_confirmation_summary(confirmation_state()),
       striped = TRUE,
@@ -319,11 +439,15 @@ sarek_manifest_server <- function(
           table,
           rownames = FALSE,
           editable = list(target = "cell", disable = list(columns = disabled)),
+          class = "stripe hover compact nowrap",
+          width = "100%",
           options = list(
             scrollX = TRUE,
+            scrollCollapse = FALSE,
             pageLength = 25,
             lengthMenu = list(c(10, 25, 50, 100), c("10", "25", "50", "100")),
-            autoWidth = FALSE
+            autoWidth = TRUE,
+            columnDefs = sarek_manifest_column_defs(table)
           )
         )
       }, server = FALSE)
