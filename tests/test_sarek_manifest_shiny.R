@@ -36,7 +36,7 @@ on.exit(unlink(test_root, recursive = TRUE, force = TRUE), add = TRUE)
 
 fastq_r1 <- file.path(test_root, "patient_T_L001_R1.fastq.gz")
 fastq_r2 <- file.path(test_root, "patient_T_L001_R2.fastq.gz")
-file.create(fastq_r1, fastq_r2)
+invisible(file.create(fastq_r1, fastq_r2))
 
 table <- sarek_build_discovery_table(test_root, allowed_roots = test_root)
 assert_true(NROW(table) == 2L, "Synthetic paired FASTQs were not discovered.")
@@ -73,7 +73,7 @@ assert_true(file_updated$lane[[1]] == "L999" && file_updated$read[[1]] == 2L, "A
 
 normal_r1 <- file.path(test_root, "patient_N_L001_R1.fastq.gz")
 normal_r2 <- file.path(test_root, "patient_N_L001_R2.fastq.gz")
-file.create(normal_r1, normal_r2)
+invisible(file.create(normal_r1, normal_r2))
 matched_table <- sarek_build_discovery_table(
   c(fastq_r1, fastq_r2, normal_r1, normal_r2),
   allowed_roots = test_root
@@ -96,7 +96,7 @@ assert_true(!include_validation$valid, "Invalid include edit unexpectedly passed
 
 ui_text <- paste(as.character(sarek_manifest_ui("sarek_test")), collapse = "\n")
 assert_true(grepl("sarek_test-paths", ui_text, fixed = TRUE), "Shiny module inputs were not namespaced.")
-assert_true(grepl("corroborate", ui_text, ignore.case = TRUE), "UI does not explain manual corroboration.")
+assert_true(grepl("review and correct samples", ui_text, ignore.case = TRUE), "UI does not clearly identify the sample-review step.")
 assert_true(grepl("sarek-confirmation-table", ui_text, fixed = TRUE), "Manifest table is missing its horizontal-scroll container.")
 assert_true(grepl("sarek-status-banner", ui_text, fixed = TRUE), "Manifest status is missing its visible banner style.")
 assert_true(grepl("sarek-review-checklist", ui_text, fixed = TRUE), "The pre-validation checklist is missing.")
