@@ -708,6 +708,7 @@ sarek_manifest_server <- function(
   max_files = 5000L
 ) {
   shiny::moduleServer(id, function(input, output, session) {
+    ns <- session$ns
     confirmation_state <- shiny::reactiveVal(NULL)
     confirmed_manifest <- shiny::reactiveVal(NULL)
     status_state <- shiny::reactiveVal(
