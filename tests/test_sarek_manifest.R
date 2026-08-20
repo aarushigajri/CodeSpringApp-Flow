@@ -46,7 +46,53 @@ stopifnot(sum(discovery$role == "normal") == 1L)
 stopifnot(sum(discovery$role == "unknown") == 1L)
 stopifnot(all(discovery$matched_normal_id[discovery$role == "tumor"] == "P001_N"))
 
+# Facility-style FASTQs may put the read token after the chunk and include a
+# dual index plus flowcell. These technical tokens must not create one sample
+# per lane or make repeated L001 lanes from different flowcells collide.
+facility_dir <- file.path(test_root, "facility_fastqs")
+dir.create(facility_dir)
+facility_units <- c(
+  "23NMNMLT4_L001",
+  "23W33VLT4_L006",
+  "23W33VLT4_L007",
+  "23W33VLT4_L008",
+  "23WFVLLT4_L001"
+)
+facility_files <- unlist(lapply(c("BloodDNA", "PDODNA"), function(specimen) {
+  dual_index <- if (identical(specimen, "BloodDNA")) {
+    "ACAGTTACCT-GAACTGCCGG"
+  } else {
+    "AAACAGTGCA-AGATCTGTGG"
+  }
+  unlist(lapply(facility_units, function(unit) {
+    file.path(
+      facility_dir,
+      paste0("ECO-18-", specimen, "_", dual_index, "_", unit, "_001.R", 1:2, ".fastq.gz")
+    )
+  }), use.names = FALSE)
+}), use.names = FALSE)
+stopifnot(all(file.create(facility_files)))
+
+facility_discovery <- sarek_build_discovery_table(facility_dir, allowed_roots = test_root)
+stopifnot(NROW(facility_discovery) == 20L)
+stopifnot(identical(sort(unique(facility_discovery$patient_id)), "ECO-18"))
+stopifnot(identical(
+  sort(unique(facility_discovery$sample_id)),
+  c("ECO-18-BloodDNA", "ECO-18-PDODNA")
+))
+stopifnot(identical(
+  sort(unique(facility_discovery$lane)),
+  sort(facility_units)
+))
+stopifnot(all(facility_discovery$role[facility_discovery$sample_id == "ECO-18-BloodDNA"] == "normal"))
+stopifnot(all(facility_discovery$role[facility_discovery$sample_id == "ECO-18-PDODNA"] == "tumor"))
+stopifnot(all(
+  facility_discovery$matched_normal_id[facility_discovery$role == "tumor"] == "ECO-18-BloodDNA"
+))
+stopifnot(sarek_validate_confirmation_table(facility_discovery)$valid)
+
 matched <- discovery[discovery$patient_id == "P001", , drop = FALSE]
+matched$processing_state[matched$input_format == "bam"] <- "recalibrated"
 validation <- sarek_validate_confirmation_table(matched)
 stopifnot(validation$valid)
 stopifnot(!length(sarek_validate_analysis_mode(matched, "matched_tumor_normal")))
@@ -155,6 +201,6 @@ missing_index$role <- "germline"
 missing_index$patient_id <- "P003"
 missing_index$sample_id <- "P003"
 index_validation <- sarek_validate_confirmation_table(missing_index)
-stopifnot(any(grepl("do not currently have a detected index", index_validation$warnings, fixed = TRUE)))
+expect_invalid(index_validation, "must have a detected companion index")
 
 cat("Sarek manifest tests: PASS\n")

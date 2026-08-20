@@ -23,6 +23,7 @@ sarek_editable_columns <- function() {
   c(
     "include",
     "patient_id",
+    "sex",
     "sample_id",
     "role",
     "matched_normal_id",
@@ -37,6 +38,7 @@ sarek_manifest_column_widths <- function() {
   c(
     include = "80px",
     patient_id = "150px",
+    sex = "120px",
     sample_id = "170px",
     role = "110px",
     matched_normal_id = "180px",
@@ -101,6 +103,42 @@ sarek_fastq_pairing_status <- function(rows) {
   }
 }
 
+sarek_sample_index_display <- function(rows) {
+  indexed <- rows$input_format %in% c("bam", "cram", "vcf", "bcf")
+  if (!any(indexed)) return("Not required")
+  if (!"index" %in% names(rows)) return("Missing")
+  indexes <- trimws(as.character(rows$index[indexed]))
+  present <- !is.na(indexes) & nzchar(indexes)
+  if (!all(present)) return("Missing")
+  if (length(indexes) == 1L) return(paste0("Detected: ", basename(indexes[[1]])))
+  paste0("Detected: ", length(indexes), " indexes")
+}
+
+sarek_sample_bam_inspection_display <- function(rows) {
+  bam <- rows[rows$input_format == "bam", , drop = FALSE]
+  if (!NROW(bam)) return("Not applicable")
+  if (!"inspection_status" %in% names(bam)) return("Not run")
+  statuses <- unique(trimws(as.character(bam$inspection_status)))
+  statuses <- statuses[!is.na(statuses) & nzchar(statuses)]
+  recommendations <- if ("processing_recommendation" %in% names(bam)) {
+    unique(trimws(as.character(bam$processing_recommendation)))
+  } else character(0)
+  recommendations <- recommendations[!is.na(recommendations) & nzchar(recommendations) & recommendations != "unknown"]
+  confidences <- if ("processing_confidence" %in% names(bam)) {
+    unique(trimws(as.character(bam$processing_confidence)))
+  } else character(0)
+  confidences <- confidences[!is.na(confidences) & nzchar(confidences) & confidences != "none"]
+  status <- if (length(statuses)) statuses[[1]] else "not_run"
+  label <- gsub("_", " ", status, fixed = TRUE)
+  if (identical(status, "passed") && length(recommendations)) {
+    return(paste0(
+      "Passed: ", gsub("_", " ", recommendations[[1]], fixed = TRUE),
+      if (length(confidences)) paste0(" (", confidences[[1]], ")") else ""
+    ))
+  }
+  paste0(toupper(substr(label, 1L, 1L)), substring(label, 2L))
+}
+
 sarek_sample_review_table <- function(table) {
   if (is.null(table) || !NROW(table)) return(data.frame())
   keys <- sarek_sample_key(table$patient_id, table$sample_id)
@@ -115,11 +153,14 @@ sarek_sample_review_table <- function(table) {
     data.frame(
       include = all(suppressWarnings(as.logical(sample_rows$include)), na.rm = TRUE),
       patient_id = as.character(sample_rows$patient_id[[1]]),
+      sex = if ("sex" %in% names(sample_rows)) sarek_normalize_sex(sample_rows$sex[[1]]) else "NA",
       sample_id = as.character(sample_rows$sample_id[[1]]),
       role = values("role", "unknown"),
       matched_normal_id = values("matched_normal_id"),
       input_format = values("input_format"),
       processing_state = values("processing_state"),
+      index = sarek_sample_index_display(sample_rows),
+      BAM_inspection = sarek_sample_bam_inspection_display(sample_rows),
       file_count = NROW(sample_rows),
       FASTQ_pairing = sarek_fastq_pairing_status(sample_rows),
       stringsAsFactors = FALSE,
@@ -129,6 +170,49 @@ sarek_sample_review_table <- function(table) {
   result <- do.call(rbind, rows)
   rownames(result) <- NULL
   result
+}
+
+sarek_sample_review_display_table <- function(table) {
+  review <- sarek_sample_review_table(table)
+  required <- c(
+    "include", "patient_id", "sex", "sample_id", "role", "matched_normal_id",
+    "input_format", "processing_state", "index", "BAM_inspection", "file_count", "FASTQ_pairing"
+  )
+  if (!NROW(review)) {
+    return(data.frame(
+      Include = character(0), `Patient ID` = character(0), `Sample ID` = character(0),
+      `Sex chromosomes` = character(0), Role = character(0), `Matched normal` = character(0), `Input format` = character(0),
+      `Processing state` = character(0), Index = character(0), `BAM inspection` = character(0),
+      Files = integer(0), `FASTQ pairing` = character(0),
+      stringsAsFactors = FALSE, check.names = FALSE
+    ))
+  }
+  missing <- setdiff(required, names(review))
+  if (length(missing)) {
+    stop("The sample review table is missing required fields: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+  data.frame(
+    Include = ifelse(!is.na(review$include) & as.logical(review$include), "☑", "☐"),
+    `Patient ID` = as.character(review$patient_id),
+    `Sex chromosomes` = ifelse(review$sex == "NA", "Not provided", as.character(review$sex)),
+    `Sample ID` = as.character(review$sample_id),
+    Role = as.character(review$role),
+    `Matched normal` = as.character(review$matched_normal_id),
+    `Input format` = as.character(review$input_format),
+    `Processing state` = as.character(review$processing_state),
+    Index = as.character(review$index),
+    `BAM inspection` = as.character(review$BAM_inspection),
+    Files = as.integer(review$file_count),
+    `FASTQ pairing` = as.character(review$FASTQ_pairing),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+}
+
+sarek_run_history_label <- function(run) {
+  run_id <- sarek_text(run[["run_id"]], "unnamed run")
+  submitted <- sarek_text(run[["submitted_at"]])
+  if (nzchar(submitted)) paste(run_id, submitted, sep = " — ") else run_id
 }
 
 sarek_recommend_analysis_mode <- function(table) {
@@ -167,13 +251,18 @@ sarek_apply_sample_update <- function(
   sample_id,
   role,
   matched_normal_id,
-  processing_state
+  processing_state,
+  sex = "NA"
 ) {
   keys <- sarek_sample_key(table$patient_id, table$sample_id)
   rows <- which(keys == sample_key)
   if (!length(rows)) stop("The selected sample is no longer available. Select it again.")
   table$include[rows] <- isTRUE(include)
   table$patient_id[rows] <- trimws(as.character(patient_id))
+  if (!"sex" %in% names(table)) table$sex <- "NA"
+  sex <- sarek_normalize_sex(sex)
+  if (!sex %in% SAREK_SEX_CHROMOSOMES) stop("Sex chromosomes must be XX, XY, or Not provided.")
+  table$sex[table$patient_id == trimws(as.character(patient_id))] <- sex
   table$sample_id[rows] <- trimws(as.character(sample_id))
   table$role[rows] <- as.character(role)
   table$matched_normal_id[rows] <- if (identical(role, "tumor")) trimws(as.character(matched_normal_id)) else ""
@@ -287,6 +376,38 @@ sarek_manifest_validation_heading <- function(kind) {
   )
 }
 
+sarek_confirmed_samples_table <- function(manifest) {
+  if (is.null(manifest) || !is.list(manifest) || !length(manifest$patients)) return(data.frame())
+  rows <- list()
+  for (patient in manifest$patients) {
+    patient_id <- sarek_text(patient$patient_id)
+    matched_normals <- list()
+    for (relationship in patient$relationships) {
+      if (identical(sarek_text(relationship$type), "matched_tumor_normal") && length(relationship$sample_ids) >= 2L) {
+        matched_normals[[sarek_text(relationship$sample_ids[[1]])]] <- sarek_text(relationship$sample_ids[[2]])
+      }
+    }
+    for (sample in patient$samples) {
+      sample_id <- sarek_text(sample$sample_id)
+      rows[[length(rows) + 1L]] <- data.frame(
+        Patient = patient_id,
+        `Sex chromosomes` = if (sarek_normalize_sex(patient$sex) == "NA") "Not provided" else sarek_normalize_sex(patient$sex),
+        Sample = sample_id,
+        Role = sarek_text(sample$role),
+        `Matched normal` = sarek_text(matched_normals[[sample_id]]),
+        Input = toupper(sarek_text(sample$input_format)),
+        `Processing stage` = gsub("_", " ", sarek_text(sample$processing_state), fixed = TRUE),
+        Files = length(sample$files),
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+    }
+  }
+  result <- do.call(rbind, rows)
+  rownames(result) <- NULL
+  result
+}
+
 sarek_manifest_field_guide <- function() {
   shiny::tags$details(
     class = "sarek-field-guide",
@@ -301,6 +422,8 @@ sarek_manifest_field_guide <- function() {
           shiny::tags$dd("Checkbox controlling whether the entire sample and all its files enter the manifest."),
           shiny::tags$dt("Patient ID"),
           shiny::tags$dd("Groups related samples. A matched tumor and normal must use the same patient ID."),
+          shiny::tags$dt("Sex chromosomes"),
+          shiny::tags$dd("Patient-level XX or XY used by CNV callers. If not provided, ASCAT or Control-FREEC is skipped and the remaining callers still run."),
           shiny::tags$dt("Sample ID"),
           shiny::tags$dd("Identifies one biological sample within a patient. It must be unique within that patient."),
           shiny::tags$dt("Role"),
@@ -316,11 +439,11 @@ sarek_manifest_field_guide <- function() {
           shiny::tags$dt("Input format"),
           shiny::tags$dd("Detected from the file extension and read-only: FASTQ, uBAM, BAM, CRAM, VCF, or BCF."),
           shiny::tags$dt("Processing state"),
-          shiny::tags$dd("How far the input has already been processed, from unmapped through analysis-ready or variant calls."),
+          shiny::tags$dd("How far the input has already been processed. BAM recommendations come from lightweight header inspection and still require user confirmation."),
           shiny::tags$dt("FASTQ lane and read"),
           shiny::tags$dd("Every included sample lane must contain exactly one R1 and one R2. Correct detection only when the filename was interpreted incorrectly."),
           shiny::tags$dt("Index"),
-          shiny::tags$dd("Detected companion index for BAM, CRAM, VCF, or BCF. Missing indexes are reported before pipeline submission.")
+          shiny::tags$dd("Detected companion index for BAM, CRAM, VCF, or BCF. BAM/CRAM submission is blocked when its index is missing or unreadable.")
         )
       ),
       shiny::column(
@@ -332,9 +455,9 @@ sarek_manifest_field_guide <- function() {
           shiny::tags$dt("Results root"),
           shiny::tags$dd("Permanent destination for final pipeline outputs and reports. It must be an absolute writable server path."),
           shiny::tags$dt("Work root"),
-          shiny::tags$dd("High-capacity temporary space used by Nextflow for intermediate files. It can be much larger than the final results and should not use a space-limited home directory."),
+          shiny::tags$dd("Temporary space used by Nextflow for intermediate files. The default follows the Unix home directory; users with limited home quotas should select high-capacity storage."),
           shiny::tags$dt("Manifest ID"),
-          shiny::tags$dd("Short name used to identify this requested analysis and its exported JSON manifest.")
+          shiny::tags$dd("Short name used for the submitted run, its results folder, and its cluster job.")
         )
       )
     )
@@ -407,6 +530,20 @@ sarek_manifest_ui <- function(id) {
          font-weight:800;
          line-height:22px;
        }
+       .sarek-bam-inspection {
+         margin:12px 0 16px 0;
+         padding:14px 16px;
+         border:1px solid #c9d6e4;
+         border-left:6px solid #1769aa;
+         border-radius:8px;
+         background:#f7fbff;
+       }
+       .sarek-bam-inspection-pass { border-left-color:#27864a; background:#f0faf3; }
+       .sarek-bam-inspection-failed { border-left-color:#b3261e; background:#fff3f2; }
+       .sarek-bam-inspection-review { border-left-color:#b26a00; background:#fff8e8; }
+       .sarek-bam-inspection dl { display:grid; grid-template-columns:minmax(150px,220px) 1fr; gap:6px 14px; margin:10px 0; }
+       .sarek-bam-inspection dt { font-weight:700; }
+       .sarek-bam-inspection dd { margin:0; overflow-wrap:anywhere; }
        .sarek-status-banner-review {
          border-color:#e7c66a;
          border-left-color:#b7791f;
@@ -541,19 +678,173 @@ sarek_manifest_ui <- function(id) {
          color:#536273;
          font-size:13px;
          line-height:1.4;
+       }
+       .sarek-run-review {
+         margin:10px 0 16px 0;
+         padding:16px;
+         border:1px solid #d7e0ea;
+         border-radius:10px;
+         background:#fbfcfe;
+       }
+       .sarek-run-review-grid {
+         display:grid;
+         grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+         gap:10px;
+       }
+       .sarek-run-review-card {
+         min-width:0;
+         padding:11px 12px;
+         border:1px solid #dce4ec;
+         border-radius:8px;
+         background:#fff;
+       }
+       .sarek-run-review-card span {
+         display:block;
+         margin-bottom:4px;
+         color:#647386;
+         font-size:12px;
+         font-weight:700;
+         letter-spacing:.03em;
+         text-transform:uppercase;
+       }
+       .sarek-run-review-card strong {
+         display:block;
+         color:#17324d;
+         line-height:1.35;
+         overflow-wrap:anywhere;
+       }
+       .sarek-submit-panel {
+         margin:10px 0 16px 0;
+         padding:15px 17px;
+         border:1px solid #b8d4f2;
+         border-radius:9px;
+         background:#f5f9ff;
+       }
+       .sarek-submit-panel .checkbox { margin-top:0; }
+       .sarek-submit-panel .btn-primary { min-width:190px; font-weight:700; }
+       .sarek-advanced-downloads {
+         margin-top:12px;
+         color:#536273;
+       }
+       .sarek-file-details {
+         clear:both;
+         display:block;
+         margin-top:18px;
+         padding-top:4px;
+       }
+       .sarek-file-details > summary {
+         font-weight:700;
+         color:#17324d;
+       }
+       .sarek-sample-review-table .shiny-output-error,
+       .sarek-file-details .shiny-output-error {
+         display:block;
+         position:static;
+         margin:10px 0;
+         padding:10px 12px;
+         white-space:normal;
+         overflow-wrap:anywhere;
+       }
+       .sarek-run-history {
+         margin:10px 0 18px 0;
+         padding:14px 16px;
+         border:1px solid #c9d8e8;
+         border-radius:10px;
+         background:#f8fbff;
+       }
+       .sarek-run-history > summary {
+         cursor:pointer;
+         color:#17324d;
+         font-size:16px;
+         font-weight:750;
+       }
+       .sarek-run-history-actions,
+       .sarek-path-actions {
+         display:flex;
+         flex-wrap:wrap;
+         gap:8px;
+         margin:6px 0 10px 0;
+       }
+       .sarek-progress-shell {
+         height:24px;
+         margin:10px 0 8px 0;
+         overflow:hidden;
+         border-radius:12px;
+         background:#e5ebf2;
+       }
+       .sarek-progress-bar {
+         min-width:8px;
+         height:100%;
+         color:#fff;
+         background:#2d78c4;
+         font-size:12px;
+         font-weight:750;
+         line-height:24px;
+         text-align:center;
+         transition:width .35s ease;
+       }
+       .sarek-progress-bar.running {
+         background-image:linear-gradient(45deg,rgba(255,255,255,.18) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.18) 50%,rgba(255,255,255,.18) 75%,transparent 75%,transparent);
+         background-size:32px 32px;
+       }
+       .sarek-progress-bar.success { background:#218739; }
+       .sarek-progress-bar.error { background:#b42318; }
+       .sarek-progress-bar.unknown { background:#687586; }
+       .sarek-run-paths {
+         margin-top:8px;
+         color:#536273;
+         font-size:12px;
+         line-height:1.45;
+         overflow-wrap:anywhere;
+       }
+       .sarek-section-tabs > .nav-tabs {
+         margin:0 0 20px 0;
+         border-bottom:2px solid #d7e0ea;
+       }
+       .sarek-section-tabs > .nav-tabs > li > a {
+         padding:12px 20px;
+         color:#42566d;
+         font-size:15px;
+         font-weight:700;
+       }
+       .sarek-section-tabs > .nav-tabs > li.active > a,
+       .sarek-section-tabs > .nav-tabs > li.active > a:hover,
+       .sarek-section-tabs > .nav-tabs > li.active > a:focus {
+         border:1px solid #c8d6e5;
+         border-bottom-color:#fff;
+         color:#1769aa;
+       }
+       .sarek-results-table {
+         width:100%;
+         max-width:100%;
+         margin-top:14px;
+         overflow-x:auto;
+       }
+       .sarek-results-table table.dataTable th,
+       .sarek-results-table table.dataTable td {
+         white-space:nowrap;
        }"
     )),
     shiny::div(
-      class = "progress-header-row",
-      shiny::div(
-        shiny::h3("Build a Sarek input manifest"),
-        shiny::tags$p(
-          class = "muted",
-          "Discover sequencing files, review every inferred field, and export a confirmed JSON manifest."
-        )
-      )
-    ),
-    sarek_manifest_field_guide(),
+      class = "sarek-section-tabs",
+      shiny::tabsetPanel(
+        id = ns("sarek_sections"),
+        selected = "prepare",
+        type = "tabs",
+        shiny::tabPanel(
+          "Prepare job",
+          value = "prepare",
+          shiny::div(
+            class = "progress-header-row",
+            shiny::div(
+              shiny::h3("Prepare a Sarek analysis"),
+              shiny::tags$p(
+                class = "muted",
+                "Discover sequencing files, review every inferred field, and submit a confirmed analysis to the cluster."
+              )
+            )
+          ),
+          sarek_manifest_field_guide(),
     shiny::tags$div(
       class = "read-source-note",
       shiny::tags$strong("Step 1: discover files"),
@@ -562,7 +853,7 @@ sarek_manifest_ui <- function(id) {
       ),
       shiny::tags$p(
         class = "muted small-note",
-        "Supported inputs: paired FASTQ, uBAM, BAM, CRAM, VCF, and BCF."
+        "Supported inputs: paired FASTQ, uBAM, BAM, CRAM, VCF, and BCF. Discovered BAMs receive a lightweight header and index inspection; no reads or variants are scanned."
       )
     ),
     shiny::fluidRow(
@@ -574,6 +865,10 @@ sarek_manifest_ui <- function(id) {
           value = "",
           rows = 8,
           placeholder = "/absolute/path/sample_T_L001_R1.fastq.gz\n/absolute/path/sample_T_L001_R2.fastq.gz"
+        ),
+        shiny::div(
+          class = "sarek-path-actions",
+          shiny::actionButton(ns("browse_input_folder"), "Browse and add server folder")
         ),
         shiny::checkboxInput(ns("recursive"), "Search inside subfolders", value = FALSE),
         shiny::actionButton(ns("discover"), "Discover inputs", class = "btn-primary")
@@ -606,8 +901,10 @@ sarek_manifest_ui <- function(id) {
       sarek_manifest_table_output(ns("sample_review_table"))
     ),
     shiny::uiOutput(ns("sample_editor")),
+    shiny::uiOutput(ns("bam_inspection")),
     shiny::tags$details(
-      shiny::tags$summary("Show files for the selected sample"),
+      class = "sarek-file-details",
+      shiny::tags$summary("Show input and index paths for the selected sample"),
       shiny::br(),
       shiny::uiOutput(ns("file_editor")),
       shiny::div(
@@ -620,7 +917,7 @@ sarek_manifest_ui <- function(id) {
       class = "read-source-note",
       shiny::tags$strong("Step 3: describe the intended analysis"),
       shiny::tags$p(
-        "These settings describe the confirmed request. They do not submit nf-core/sarek."
+        "These settings define the run that will be shown for final review before submission."
       )
     ),
     shiny::fluidRow(
@@ -640,9 +937,16 @@ sarek_manifest_ui <- function(id) {
           choices = c("Germline" = "germline", "Tumor only" = "tumor_only",
                       "Matched tumor-normal" = "matched_tumor_normal",
                       "Annotation only" = "annotation_only"),
-          selected = "germline"
+          selected = "germline",
+          selectize = FALSE
         ),
-        shiny::textInput(ns("preset"), "Analysis preset", value = "core")
+        shiny::selectInput(
+          ns("preset"),
+          "Analysis preset",
+          choices = c("Core, mode-aware variant calling" = "core"),
+          selected = "core",
+          selectize = FALSE
+        )
       ),
       shiny::column(
         4,
@@ -652,6 +956,7 @@ sarek_manifest_ui <- function(id) {
           value = "",
           placeholder = "/absolute/path/results/sarek/user"
         ),
+        shiny::actionButton(ns("browse_results_root"), "Browse server folder"),
         shiny::tags$p(
           class = "sarek-storage-note",
           "Final results, reports, and deliverables will be stored here."
@@ -662,9 +967,10 @@ sarek_manifest_ui <- function(id) {
           value = "",
           placeholder = "/high-capacity/path/work/sarek/user"
         ),
+        shiny::actionButton(ns("browse_work_root"), "Browse server folder"),
         shiny::tags$p(
           class = "sarek-storage-note",
-          "Intermediate files can be much larger than the final results. Use high-capacity storage, not a space-limited home directory."
+          "Intermediate files can be much larger than the final results. The default follows your Unix home; use Browse to select high-capacity storage if your home quota is limited."
         ),
         shiny::tags$p(
           class = "muted small-note",
@@ -681,18 +987,87 @@ sarek_manifest_ui <- function(id) {
           shiny::textInput(ns("sarek_genome"), "nf-core/sarek genome key", value = "GATK.GRCh38")
         ),
         shiny::br(),
-        shiny::actionButton(ns("confirm"), "Validate and confirm manifest", class = "btn-primary"),
-        shiny::br(),
-        shiny::br(),
-        shiny::uiOutput(ns("download_ui"))
+        shiny::actionButton(ns("confirm"), "Validate and confirm manifest", class = "btn-primary")
       )
     ),
     shiny::h4("Validation"),
     shiny::uiOutput(ns("validation")),
-    shiny::tags$details(
-      shiny::tags$summary("Confirmed JSON preview"),
-      shiny::br(),
-      shiny::verbatimTextOutput(ns("manifest_preview"))
+    shiny::h4("Nextflow input"),
+    shiny::tags$p(
+      class = "muted small-note",
+      "A confirmed analysis is converted into the nf-core/sarek input and starting step. Submission remains locked until the review below is acknowledged."
+    ),
+    shiny::uiOutput(ns("nextflow_input")),
+    shiny::h4("Confirmed run review"),
+    shiny::uiOutput(ns("run_review")),
+    shiny::tableOutput(ns("confirmed_samples")),
+    shiny::h4("Submit run"),
+    shiny::uiOutput(ns("submission_ui")),
+          shiny::uiOutput(ns("submission_status"))
+        ),
+        shiny::tabPanel(
+          "Run status",
+          value = "status",
+          shiny::div(
+            class = "progress-header-row",
+            shiny::div(
+              shiny::h3("Sarek run status"),
+              shiny::tags$p(
+                class = "muted",
+                "Track active controller jobs and review previously submitted analyses."
+              )
+            )
+          ),
+          shiny::div(
+            class = "sarek-run-history",
+            shiny::tags$h4("Previous and active Sarek runs"),
+            shiny::fluidRow(
+              shiny::column(
+                7,
+                shiny::textInput(ns("history_root"), "Results location to view", value = ""),
+                shiny::div(
+                  class = "sarek-run-history-actions",
+                  shiny::actionButton(ns("browse_history_root"), "Browse server folder"),
+                  shiny::actionButton(ns("refresh_runs"), "Refresh runs")
+                ),
+                shiny::tags$p(
+                  class = "muted small-note",
+                  "Runs are discovered from their private CodeSpring submission records. Active status refreshes automatically."
+                )
+              ),
+              shiny::column(5, shiny::uiOutput(ns("run_history_selector")))
+            ),
+            shiny::tableOutput(ns("run_history_table")),
+            shiny::uiOutput(ns("selected_run_status"))
+          )
+        ),
+        shiny::tabPanel(
+          "Results",
+          value = "results",
+          shiny::div(
+            class = "progress-header-row",
+            shiny::div(
+              shiny::h3("Sarek results"),
+              shiny::tags$p(
+                class = "muted",
+                "Choose a submitted run and find its reports, variants, alignments, and other result files."
+              )
+            )
+          ),
+          shiny::fluidRow(
+            shiny::column(7, shiny::uiOutput(ns("results_run_selector"))),
+            shiny::column(
+              5,
+              shiny::actionButton(ns("refresh_results"), "Refresh results")
+            )
+          ),
+          shiny::uiOutput(ns("selected_results_summary")),
+          shiny::div(
+            class = "sarek-results-table",
+            sarek_manifest_table_output(ns("results_file_table"))
+          )
+        )
+      )
     )
   )
 }
@@ -705,7 +1080,15 @@ sarek_manifest_server <- function(
   allowed_input_roots = NULL,
   allowed_results_roots = NULL,
   allowed_work_roots = NULL,
-  max_files = 5000L
+  max_files = 5000L,
+  submit_handler = NULL,
+  browse_handler = NULL,
+  bam_inspector = sarek_inspect_bam,
+  samtools = "samtools",
+  max_auto_bam_inspections = 20L,
+  run_catalog_handler = sarek_submission_catalog,
+  run_status_handler = sarek_run_status,
+  run_refresh_ms = 15000L
 ) {
   shiny::moduleServer(id, function(input, output, session) {
     ns <- session$ns
@@ -720,15 +1103,316 @@ sarek_manifest_server <- function(
     selected_sample_state <- shiny::reactiveVal("")
     validation_version <- shiny::reactiveVal(0L)
     reviewed_validation_version <- shiny::reactiveVal(-1L)
+    submission_state <- shiny::reactiveVal(list(
+      kind = "info",
+      message = "Confirm and review a valid run before submission.",
+      result = NULL
+    ))
+    submission_in_progress <- shiny::reactiveVal(FALSE)
+    run_history_refresh <- shiny::reactiveVal(Sys.time())
+    run_poll <- shiny::reactiveTimer(max(5000L, as.integer(run_refresh_ms)), session = session)
+
+    nextflow_input_state <- shiny::reactive({
+      manifest <- confirmed_manifest()
+      if (is.null(manifest)) {
+        return(list(valid = FALSE, pending = TRUE, input = NULL, error = ""))
+      }
+      tryCatch(
+        list(
+          valid = TRUE,
+          pending = FALSE,
+          input = sarek_build_nextflow_input(manifest),
+          error = ""
+        ),
+        error = function(error) {
+          list(
+            valid = FALSE,
+            pending = FALSE,
+            input = NULL,
+            error = conditionMessage(error)
+          )
+        }
+      )
+    })
+
+    submission_readiness <- shiny::reactive({
+      manifest <- confirmed_manifest()
+      nextflow_state <- nextflow_input_state()
+      if (is.null(manifest) || !isTRUE(nextflow_state$valid)) {
+        return(list(valid = FALSE, error = "The confirmed Sarek input is not ready."))
+      }
+      tryCatch(
+        {
+          paths <- sarek_submission_paths(manifest)
+          params <- sarek_submission_params(manifest, nextflow_state$input, paths)
+          list(valid = TRUE, error = "", params = params, paths = paths)
+        },
+        error = function(error) list(valid = FALSE, error = conditionMessage(error))
+      )
+    })
 
     shiny::observe({
       shiny::updateTextInput(session, "results_root", value = default_results_root)
       shiny::updateTextInput(session, "work_root", value = default_work_root)
+      shiny::updateTextInput(session, "history_root", value = default_results_root)
     })
+
+    request_browser <- function(target, current, input_type = "text", append = FALSE) {
+      if (!is.function(browse_handler)) {
+        status_state("ERROR: Server folder browsing is not configured for this app session.")
+        return(invisible(FALSE))
+      }
+      tryCatch(
+        {
+          browse_handler(
+            target = ns(target), mode = "dir", current = current,
+            input_type = input_type, append = append
+          )
+          invisible(TRUE)
+        },
+        error = function(error) {
+          status_state(paste0("ERROR: Could not open the server folder browser: ", conditionMessage(error)))
+          invisible(FALSE)
+        }
+      )
+    }
+
+    shiny::observeEvent(input$browse_input_folder, {
+      paths <- sarek_parse_path_input(input$paths)
+      current <- if (length(paths)) paths[[length(paths)]] else default_results_root
+      request_browser("paths", current, input_type = "textarea", append = TRUE)
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$browse_results_root, {
+      request_browser("results_root", sarek_shiny_value(input$results_root, default_results_root))
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$browse_work_root, {
+      request_browser("work_root", sarek_shiny_value(input$work_root, default_work_root))
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$browse_history_root, {
+      request_browser("history_root", sarek_shiny_value(input$history_root, default_results_root))
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$refresh_runs, {
+      run_history_refresh(Sys.time())
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$refresh_results, {
+      run_history_refresh(Sys.time())
+    }, ignoreInit = TRUE)
+
+    run_catalog <- shiny::reactive({
+      run_poll()
+      run_history_refresh()
+      root <- trimws(as.character(sarek_shiny_value(input$history_root, default_results_root)))
+      if (!is.function(run_catalog_handler)) return(data.frame())
+      tryCatch(run_catalog_handler(root), error = function(error) data.frame())
+    })
+
+    output$run_history_selector <- shiny::renderUI({
+      catalog <- run_catalog()
+      if (!NROW(catalog)) {
+        return(shiny::div(class = "empty-box", "No submitted Sarek runs were found in this results location."))
+      }
+      labels <- vapply(seq_len(NROW(catalog)), function(index) {
+        sarek_run_history_label(as.list(catalog[index, , drop = FALSE]))
+      }, character(1))
+      choices <- stats::setNames(as.character(catalog$run_id), labels)
+      selected <- as.character(sarek_shiny_value(input$selected_run))
+      if (!selected %in% catalog$run_id) selected <- catalog$run_id[[1]]
+      shiny::selectInput(ns("selected_run"), "Run to view", choices = choices, selected = selected, selectize = FALSE)
+    })
+
+    output$run_history_table <- shiny::renderTable({
+      catalog <- run_catalog()
+      if (!NROW(catalog)) return(NULL)
+      shown <- utils::head(catalog, 25L)
+      data.frame(
+        Run = shown$run_id,
+        Submitted = gsub("T", " ", sub("Z$", " UTC", shown$submitted_at)),
+        `Job ID` = shown$job_id,
+        `Starting step` = shown$step,
+        Tools = shown$tools,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+    }, striped = TRUE, bordered = TRUE, spacing = "s", rownames = FALSE)
+
+    selected_run <- shiny::reactive({
+      catalog <- run_catalog()
+      shiny::req(NROW(catalog))
+      selected <- as.character(sarek_shiny_value(input$selected_run, catalog$run_id[[1]]))
+      if (!selected %in% catalog$run_id) selected <- catalog$run_id[[1]]
+      catalog[catalog$run_id == selected, , drop = FALSE][1, , drop = FALSE]
+    })
+
+    output$selected_run_status <- shiny::renderUI({
+      run_poll()
+      run <- selected_run()
+      status <- if (is.function(run_status_handler)) {
+        tryCatch(run_status_handler(as.list(run)), error = function(error) {
+          list(state = "", elapsed = "", source = "error", error = conditionMessage(error))
+        })
+      } else {
+        list(state = sarek_text(run$status, "submitted"), elapsed = "", source = "record")
+      }
+      progress <- sarek_run_progress(status$state)
+      details <- c(
+        if (nzchar(sarek_text(run$job_id))) paste0("Slurm job ", sarek_text(run$job_id)) else "No Slurm job ID recorded",
+        if (nzchar(sarek_text(status$elapsed))) paste0("elapsed ", sarek_text(status$elapsed)) else NULL,
+        paste0("status source: ", sarek_text(status$source, "record"))
+      )
+      shiny::div(
+        class = "sarek-run-review",
+        shiny::tags$h4(paste0(sarek_text(run$run_id), " — ", progress$label)),
+        shiny::tags$p(class = "muted small-note", paste(details, collapse = " · ")),
+        shiny::div(
+          class = "sarek-progress-shell",
+          role = "progressbar",
+          `aria-valuemin` = "0",
+          `aria-valuemax` = "100",
+          `aria-valuenow` = as.character(progress$percent),
+          shiny::div(
+            class = paste("sarek-progress-bar", progress$kind),
+            style = paste0("width:", progress$percent, "%;"),
+            progress$label
+          )
+        ),
+        if (nzchar(sarek_text(status$error))) {
+          shiny::tags$p(class = "sarek-validation-panel sarek-validation-panel-error", sarek_text(status$error))
+        },
+        shiny::div(
+          class = "sarek-run-paths",
+          shiny::tags$strong("Results: "), sarek_text(run$output_dir),
+          shiny::tags$br(),
+          shiny::tags$strong("Run record: "), sarek_text(run$run_dir),
+          if (nzchar(sarek_text(run$work_dir))) shiny::tagList(
+            shiny::tags$br(), shiny::tags$strong("Temporary work: "), sarek_text(run$work_dir)
+          )
+        ),
+        shiny::actionButton(ns("open_selected_results"), "View this run's results")
+      )
+    })
+
+    output$results_run_selector <- shiny::renderUI({
+      catalog <- run_catalog()
+      if (!NROW(catalog)) {
+        return(shiny::div(class = "empty-box", "No submitted Sarek runs were found in this results location."))
+      }
+      labels <- vapply(seq_len(NROW(catalog)), function(index) {
+        sarek_run_history_label(as.list(catalog[index, , drop = FALSE]))
+      }, character(1))
+      choices <- stats::setNames(as.character(catalog$run_id), labels)
+      selected <- as.character(sarek_shiny_value(
+        input$results_run,
+        sarek_shiny_value(input$selected_run, catalog$run_id[[1]])
+      ))
+      if (!selected %in% catalog$run_id) selected <- catalog$run_id[[1]]
+      shiny::selectInput(ns("results_run"), "Run results to view", choices = choices, selected = selected, selectize = FALSE)
+    })
+
+    selected_results_run <- shiny::reactive({
+      catalog <- run_catalog()
+      shiny::req(NROW(catalog))
+      selected <- as.character(sarek_shiny_value(
+        input$results_run,
+        sarek_shiny_value(input$selected_run, catalog$run_id[[1]])
+      ))
+      if (!selected %in% catalog$run_id) selected <- catalog$run_id[[1]]
+      catalog[catalog$run_id == selected, , drop = FALSE][1, , drop = FALSE]
+    })
+
+    results_file_catalog <- shiny::reactive({
+      run_history_refresh()
+      run <- selected_results_run()
+      sarek_result_file_catalog(sarek_text(run$output_dir), max_files = 5000L)
+    })
+
+    output$selected_results_summary <- shiny::renderUI({
+      run <- selected_results_run()
+      status <- if (is.function(run_status_handler)) {
+        tryCatch(run_status_handler(as.list(run)), error = function(error) {
+          list(state = "", elapsed = "", source = "error", error = conditionMessage(error))
+        })
+      } else {
+        list(state = sarek_text(run$status, "submitted"), elapsed = "", source = "record")
+      }
+      progress <- sarek_run_progress(status$state)
+      files <- results_file_catalog()
+      output_dir <- sarek_text(run$output_dir)
+      directory_ready <- nzchar(output_dir) && dir.exists(output_dir)
+      truncated <- isTRUE(attr(files, "truncated"))
+      panel_kind <- if (!directory_ready || !NROW(files)) "warning" else "success"
+      shiny::div(
+        class = paste("sarek-validation-panel", paste0("sarek-validation-panel-", panel_kind)),
+        shiny::div(
+          shiny::h4(paste0(sarek_text(run$run_id), " — ", progress$label)),
+          if (!directory_ready) {
+            shiny::tags$p("The results directory is not available yet. It may not have been created by the active run.")
+          } else if (!NROW(files)) {
+            shiny::tags$p("The results directory exists but does not contain readable result files yet.")
+          } else {
+            shiny::tags$p(
+              paste0(
+                NROW(files), " readable result file", if (NROW(files) == 1L) "" else "s", " found",
+                if (truncated) " (display limited to the first 5,000 files)" else "", "."
+              )
+            )
+          },
+          shiny::tags$p(class = "sarek-run-paths", shiny::tags$strong("Results location: "), output_dir)
+        )
+      )
+    })
+
+    results_table_data <- shiny::reactive({
+      files <- results_file_catalog()
+      shown <- files[, c("file", "folder", "type", "size", "modified"), drop = FALSE]
+      names(shown) <- c("File", "Folder", "Type", "Size", "Modified")
+      shown
+    })
+
+    if (requireNamespace("DT", quietly = TRUE)) {
+      output$results_file_table <- DT::renderDT({
+        shown <- results_table_data()
+        shiny::req(NROW(shown))
+        DT::datatable(
+          shown,
+          rownames = FALSE,
+          filter = "top",
+          selection = "none",
+          options = list(
+            pageLength = 25,
+            lengthMenu = c(10, 25, 50, 100),
+            autoWidth = TRUE,
+            scrollX = TRUE
+          ),
+          class = "stripe hover compact"
+        )
+      })
+    } else {
+      output$results_file_table <- shiny::renderTable({
+        shown <- results_table_data()
+        if (!NROW(shown)) return(NULL)
+        utils::head(shown, 100L)
+      }, striped = TRUE, bordered = TRUE, spacing = "s", rownames = FALSE)
+    }
+
+    shiny::observeEvent(input$open_selected_results, {
+      run <- selected_run()
+      shiny::updateSelectInput(session, "results_run", selected = sarek_text(run$run_id))
+      shiny::updateTabsetPanel(session, "sarek_sections", selected = "results")
+    }, ignoreInit = TRUE)
 
     invalidate_confirmation <- function() {
       confirmed_manifest(NULL)
       reviewed_validation_version(-1L)
+      submission_state(list(
+        kind = "info",
+        message = "Run settings changed. Confirm the updated analysis before submission.",
+        result = NULL
+      ))
       invisible(NULL)
     }
 
@@ -748,6 +1432,14 @@ sarek_manifest_server <- function(
           max_files = max_files,
           allowed_roots = allowed_input_roots
         )
+        if (is.function(bam_inspector)) {
+          table <- sarek_auto_inspect_bams(
+            table,
+            inspector = bam_inspector,
+            samtools = samtools,
+            max_bams = max_auto_bam_inspections
+          )
+        }
         confirmation_state(table)
         sample_review <- sarek_sample_review_table(table)
         selected_sample_state(sarek_sample_key(sample_review$patient_id[[1]], sample_review$sample_id[[1]]))
@@ -757,12 +1449,19 @@ sarek_manifest_server <- function(
           shiny::updateSelectInput(session, "analysis_mode", selected = recommended_mode)
         }
         ignored <- as.integer(sarek_shiny_value(attr(table, "ignored_count"), 0L))
+        bam_rows <- table[table$input_format == "bam", , drop = FALSE]
+        inspection_note <- ""
+        if (NROW(bam_rows)) {
+          statuses <- base::table(bam_rows$inspection_status)
+          status_text <- paste0(names(statuses), "=", as.integer(statuses), collapse = ", ")
+          inspection_note <- paste0(" BAM inspection: ", status_text, ".")
+        }
         status_state(paste0(
           "ACTION REQUIRED: Discovered ", NROW(table), " supported file", if (NROW(table) == 1L) "" else "s",
           if (ignored > 0L) paste0("; ignored ", ignored, " unsupported file", if (ignored == 1L) "" else "s") else "",
           ". Review every inferred sample field and FASTQ pairing before confirmation",
           if (nzchar(recommended_mode)) paste0(". Suggested analysis mode: ", sarek_analysis_mode_label(recommended_mode)) else "",
-          "."
+          ".", inspection_note
         ))
         validation_state("Discovery complete. The current draft has not been confirmed.")
       }, error = function(error) {
@@ -839,10 +1538,52 @@ sarek_manifest_server <- function(
         )
       }
 
+      included_samples <- !is.na(review$include) & as.logical(review$include)
+      indexed_samples <- included_samples & review$input_format %in% c("bam", "cram", "vcf", "bcf")
+      missing_indexes <- indexed_samples & review$index == "Missing"
+      index_item <- if (!any(missing_indexes)) {
+        shiny::div(class = "sarek-review-item sarek-review-item-pass", "✓ Every required input index was detected.")
+      } else {
+        shiny::div(
+          class = "sarek-review-item sarek-review-item-review",
+          paste0("! Missing index: ", paste(review$sample_id[missing_indexes], collapse = ", "), ".")
+        )
+      }
+
+      bam_samples <- included_samples & review$input_format == "bam"
+      bam_verified <- bam_samples & startsWith(review$BAM_inspection, "Passed:")
+      bam_item <- if (!any(bam_samples)) {
+        shiny::div(class = "sarek-review-item sarek-review-item-pass", "✓ No BAM inspection is required for these inputs.")
+      } else if (all(bam_verified[bam_samples])) {
+        shiny::div(class = "sarek-review-item sarek-review-item-pass", "✓ Lightweight BAM integrity, header, and index inspection passed.")
+      } else {
+        shiny::div(
+          class = "sarek-review-item sarek-review-item-review",
+          paste0("! BAM inspection needs review: ", paste(review$sample_id[bam_samples & !bam_verified], collapse = ", "), ".")
+        )
+      }
+
+      alignment_samples <- included_samples & review$input_format %in% c("bam", "cram")
+      state_item <- if (!any(alignment_samples & review$processing_state == "unknown")) {
+        shiny::div(class = "sarek-review-item sarek-review-item-pass", "✓ Processing state has been explicitly selected for every alignment input.")
+      } else {
+        shiny::div(
+          class = "sarek-review-item sarek-review-item-review",
+          paste0(
+            "! Confirm processing state for: ",
+            paste(review$sample_id[alignment_samples & review$processing_state == "unknown"], collapse = ", "),
+            "."
+          )
+        )
+      }
+
       shiny::div(
         class = "sarek-review-checklist",
         shiny::tags$strong("Pre-validation checklist"),
         pairing_item,
+        index_item,
+        bam_item,
+        state_item,
         mode_item
       )
     })
@@ -857,6 +1598,21 @@ sarek_manifest_server <- function(
       selected <- selected_sample_key()
       row <- review[keys == selected, , drop = FALSE]
       if (!NROW(row)) row <- review[1, , drop = FALSE]
+      file_keys <- sarek_sample_key(table$patient_id, table$sample_id)
+      sample_files <- table[file_keys == sarek_sample_key(row$patient_id[[1]], row$sample_id[[1]]), , drop = FALSE]
+      recommendations <- if ("processing_recommendation" %in% names(sample_files)) {
+        unique(trimws(as.character(sample_files$processing_recommendation)))
+      } else character(0)
+      recommendations <- recommendations[
+        !is.na(recommendations) & recommendations %in% SAREK_PROCESSING_STATES & recommendations != "unknown"
+      ]
+      recommended_state <- if (length(recommendations) == 1L) recommendations[[1]] else ""
+      current_state <- as.character(row$processing_state[[1]])
+      selected_state <- if (identical(current_state, "unknown") && nzchar(recommended_state)) {
+        recommended_state
+      } else {
+        current_state
+      }
 
       normal_ids <- unique(review$sample_id[
         review$patient_id == row$patient_id[[1]] & review$role == "normal"
@@ -878,11 +1634,24 @@ sarek_manifest_server <- function(
             6,
             shiny::checkboxInput(ns("edit_include"), "Include this sample", value = isTRUE(row$include[[1]])),
             shiny::textInput(ns("edit_patient_id"), "Patient ID", value = row$patient_id[[1]]),
-            shiny::textInput(ns("edit_sample_id"), "Sample ID", value = row$sample_id[[1]])
+            shiny::textInput(ns("edit_sample_id"), "Sample ID", value = row$sample_id[[1]]),
+            shiny::selectInput(
+              ns("edit_sex"),
+              "Patient sex chromosomes",
+              choices = c("Not provided" = "NA", "XX" = "XX", "XY" = "XY"),
+              selected = row$sex[[1]],
+              selectize = FALSE
+            )
           ),
           shiny::column(
             6,
-            shiny::selectInput(ns("edit_role"), "Sample role", choices = SAREK_SAMPLE_ROLES, selected = row$role[[1]]),
+            shiny::selectInput(
+              ns("edit_role"),
+              "Sample role",
+              choices = SAREK_SAMPLE_ROLES,
+              selected = row$role[[1]],
+              selectize = FALSE
+            ),
             shiny::selectInput(
               ns("edit_matched_normal_id"),
               "Matched normal (tumor samples only)",
@@ -893,17 +1662,119 @@ sarek_manifest_server <- function(
               ns("edit_processing_state"),
               "Processing state",
               choices = SAREK_PROCESSING_STATES,
-              selected = row$processing_state[[1]]
+              selected = selected_state
             )
           )
         ),
         shiny::tags$p(
           class = "muted small-note",
-          paste0("Detected format: ", row$input_format[[1]], ". FASTQ pairing: ", row$FASTQ_pairing[[1]], ".")
+          paste0(
+            "Sex chromosomes apply to every sample for this patient. Detected format: ",
+            row$input_format[[1]], ". FASTQ pairing: ", row$FASTQ_pairing[[1]], "."
+          )
         ),
+        if (identical(current_state, "unknown") && nzchar(recommended_state)) {
+          shiny::tags$p(
+            class = "sarek-storage-note",
+            paste0(
+              "BAM inspection recommends '", gsub("_", " ", recommended_state, fixed = TRUE),
+              "'. It is preselected above but is not confirmed until you select Apply sample changes."
+            )
+          )
+        },
         shiny::actionButton(ns("apply_sample"), "Apply sample changes", class = "btn-primary")
       )
     })
+
+    output$bam_inspection <- shiny::renderUI({
+      table <- confirmation_state()
+      shiny::req(!is.null(table) && NROW(table))
+      keys <- sarek_sample_key(table$patient_id, table$sample_id)
+      bam <- table[keys == selected_sample_key() & table$input_format == "bam", , drop = FALSE]
+      if (!NROW(bam)) return(NULL)
+      row <- bam[1, , drop = FALSE]
+      value <- function(field, default = "") {
+        if (!field %in% names(row)) return(default)
+        sarek_text(row[[field]], default)
+      }
+      status <- value("inspection_status", "not_run")
+      panel_kind <- if (identical(status, "passed")) {
+        "pass"
+      } else if (identical(status, "failed")) {
+        "failed"
+      } else {
+        "review"
+      }
+      index_path <- value("index")
+      recommendation <- value("processing_recommendation", "unknown")
+      confidence <- value("processing_confidence", "none")
+      summary <- value("inspection_summary", "BAM inspection has not run.")
+      sample_ids <- value("header_sample_ids", "Not reported")
+      sort_order <- value("sort_order", "unknown")
+      reference <- value("reference_compatibility", "Not inspected")
+      evidence <- value("inspection_evidence")
+
+      shiny::div(
+        class = paste("sarek-bam-inspection", paste0("sarek-bam-inspection-", panel_kind)),
+        shiny::h4("Lightweight BAM inspection"),
+        shiny::tags$p(shiny::tags$strong(summary)),
+        shiny::tags$dl(
+          shiny::tags$dt("BAM"), shiny::tags$dd(value("path")),
+          shiny::tags$dt("Index"), shiny::tags$dd(if (nzchar(index_path)) index_path else "Missing"),
+          shiny::tags$dt("Header sample ID"), shiny::tags$dd(sample_ids),
+          shiny::tags$dt("Sort order"), shiny::tags$dd(sort_order),
+          shiny::tags$dt("GRCh38 evidence"), shiny::tags$dd(reference),
+          shiny::tags$dt("Suggested state"),
+          shiny::tags$dd(paste0(gsub("_", " ", recommendation, fixed = TRUE), " (", confidence, " confidence)"))
+        ),
+        if (nzchar(evidence)) shiny::tags$p(class = "muted small-note", evidence),
+        shiny::tags$p(
+          class = "muted small-note",
+          "This check reads the BAM header and index metadata only; it does not scan reads or call variants."
+        ),
+        shiny::actionButton(ns("rerun_bam_inspection"), "Re-run BAM inspection")
+      )
+    })
+
+    shiny::observeEvent(input$rerun_bam_inspection, {
+      table <- confirmation_state()
+      shiny::req(!is.null(table) && NROW(table))
+      if (!is.function(bam_inspector)) {
+        status_state("ERROR: BAM inspection is not configured for this app session.")
+        return(invisible(NULL))
+      }
+      keys <- sarek_sample_key(table$patient_id, table$sample_id)
+      rows <- which(keys == selected_sample_key() & table$input_format == "bam")
+      if (!length(rows)) {
+        status_state("ERROR: The selected sample does not contain a BAM file.")
+        return(invisible(NULL))
+      }
+      tryCatch({
+        for (row in rows) {
+          inspection <- bam_inspector(
+            path = as.character(table$path[[row]]),
+            index = as.character(table$index[[row]]),
+            samtools = samtools
+          )
+          table <- sarek_apply_bam_inspection(table, table$path[[row]], inspection)
+        }
+        confirmation_state(table)
+        invalidate_confirmation()
+        statuses <- unique(table$inspection_status[rows])
+        if (all(statuses == "passed")) {
+          status_state("ACTION REQUIRED: BAM inspection passed. Review its evidence and confirm the recommended processing state.")
+        } else {
+          status_state(paste0(
+            "ACTION REQUIRED: BAM inspection requires review. Status: ",
+            paste(statuses, collapse = ", "), "."
+          ))
+        }
+        validation_state("The BAM inspection changed. Confirm the processing state, then validate the manifest again.")
+      }, error = function(error) {
+        status_state(paste0("ERROR: BAM inspection failed unexpectedly: ", conditionMessage(error)))
+      })
+      invisible(NULL)
+    }, ignoreInit = TRUE)
 
     shiny::observeEvent(input$apply_sample, {
       table <- confirmation_state()
@@ -923,7 +1794,8 @@ sarek_manifest_server <- function(
           sample_id = sample_id,
           role = input$edit_role,
           matched_normal_id = input$edit_matched_normal_id,
-          processing_state = input$edit_processing_state
+          processing_state = input$edit_processing_state,
+          sex = input$edit_sex
         )
         confirmation_state(table)
         selected_sample_state(sarek_sample_key(patient_id, sample_id))
@@ -1003,13 +1875,8 @@ sarek_manifest_server <- function(
 
     if (requireNamespace("DT", quietly = TRUE)) {
       output$sample_review_table <- DT::renderDT({
-        table <- sarek_sample_review_table(confirmation_state())
+        table <- sarek_sample_review_display_table(confirmation_state())
         shiny::validate(shiny::need(NROW(table), "Discover inputs to populate this table."))
-        table$include <- ifelse(table$include, "☑", "☐")
-        names(table) <- c(
-          "Include", "Patient ID", "Sample ID", "Role", "Matched normal",
-          "Input format", "Processing state", "Files", "FASTQ pairing"
-        )
         DT::datatable(
           table,
           rownames = FALSE,
@@ -1067,7 +1934,7 @@ sarek_manifest_server <- function(
       }, server = FALSE)
     } else {
       output$sample_review_table <- shiny::renderTable({
-        sarek_sample_review_table(confirmation_state())
+        sarek_sample_review_display_table(confirmation_state())
       }, striped = TRUE, bordered = TRUE, spacing = "xs")
       output$file_detail_table <- shiny::renderTable({
         table <- confirmation_state()
@@ -1132,17 +1999,30 @@ sarek_manifest_server <- function(
           allowed_results_roots = allowed_results_roots,
           allowed_work_roots = allowed_work_roots
         )
+        tool_resolution <- sarek_submission_tool_resolution(
+          manifest$analysis$mode,
+          manifest$analysis$preset,
+          manifest
+        )
+        confirmation_warnings <- unique(c(validation$warnings, tool_resolution$warnings))
+        confirmation_validation <- validation
+        confirmation_validation$warnings <- confirmation_warnings
         confirmed_manifest(manifest)
         validation_version(validation_version() + 1L)
         reviewed_validation_version(-1L)
-        validation_state(paste0(
-          sarek_manifest_validation_text(validation, mode_errors),
-          "\n\nCONFIRMED\n- The JSON manifest is ready to download."
+        submission_state(list(
+          kind = "info",
+          message = "The confirmed run is ready for final review.",
+          result = NULL
         ))
-        if (length(validation$warnings)) {
-          status_state("ACTION REQUIRED: Validation passed with warnings. Read the amber validation panel before downloading the JSON manifest.")
+        validation_state(paste0(
+          sarek_manifest_validation_text(confirmation_validation, mode_errors),
+          "\n\nCONFIRMED\n- Review the run summary and submission settings below."
+        ))
+        if (length(confirmation_warnings)) {
+          status_state("ACTION REQUIRED: Validation passed with warnings. Read the amber panels before submitting this run.")
         } else {
-          status_state("Manifest validation passed. Review the green validation panel before downloading the JSON manifest.")
+          status_state("Manifest validation passed. Review the confirmed run before submission.")
         }
       }, error = function(error) {
         confirmed_manifest(NULL)
@@ -1163,33 +2043,190 @@ sarek_manifest_server <- function(
         )
       )
     })
-    output$manifest_preview <- shiny::renderText({
-      manifest <- confirmed_manifest()
-      if (is.null(manifest)) return("No confirmed manifest is available.")
-      text <- jsonlite::toJSON(manifest, auto_unbox = TRUE, pretty = TRUE, null = "null", na = "null")
-      if (nchar(text, type = "bytes") > 30000L) {
-        paste0(substr(text, 1L, 30000L), "\n\n[Preview truncated; download contains the complete JSON.]")
-      } else {
-        text
+
+    output$nextflow_input <- shiny::renderUI({
+      state <- nextflow_input_state()
+      if (isTRUE(state$pending)) {
+        return(shiny::div(
+          class = "sarek-validation-panel",
+          shiny::div(
+            shiny::h4("Nextflow input has not been generated"),
+            shiny::tags$pre("Confirm a valid manifest to generate the Sarek samplesheet and starting step.")
+          )
+        ))
       }
+      if (!isTRUE(state$valid)) {
+        return(shiny::div(
+          class = "sarek-validation-panel sarek-validation-panel-error",
+          shiny::div(
+            shiny::h4("Nextflow input requires correction"),
+            shiny::tags$pre(paste0("ERRORS\n- ", state$error))
+          )
+        ))
+      }
+
+      nextflow_input <- state$input
+      warnings <- as.character(nextflow_input$warnings)
+      warnings <- warnings[!is.na(warnings) & nzchar(warnings)]
+      kind <- if (length(warnings)) "warning" else "success"
+      message <- c(
+        "READY",
+        paste0("- Pipeline: ", nextflow_input$pipeline, " ", nextflow_input$pipeline_version),
+        paste0("- Starting step: ", nextflow_input$step),
+        paste0("- Input format: ", toupper(nextflow_input$input_format)),
+        paste0("- Samplesheet rows: ", NROW(nextflow_input$samplesheet))
+      )
+      if (length(warnings)) {
+        message <- c(message, "", "WARNINGS", paste0("- ", warnings))
+      }
+      shiny::div(
+        class = paste("sarek-validation-panel", paste0("sarek-validation-panel-", kind)),
+        shiny::div(
+          shiny::h4(if (length(warnings)) "Nextflow input ready — review warning" else "Nextflow input ready"),
+          shiny::tags$pre(paste(message, collapse = "\n"))
+        )
+      )
     })
 
-    output$download_ui <- shiny::renderUI({
-      if (is.null(confirmed_manifest())) {
-        return(shiny::tags$p(class = "muted small-note", "Confirm a valid draft to enable JSON download."))
+    output$run_review <- shiny::renderUI({
+      manifest <- confirmed_manifest()
+      state <- nextflow_input_state()
+      if (is.null(manifest)) {
+        return(shiny::div(
+          class = "sarek-run-review",
+          shiny::tags$p(class = "muted small-note", "Confirm a valid analysis to display its final run summary.")
+        ))
+      }
+      if (!isTRUE(state$valid)) {
+        return(shiny::div(
+          class = "sarek-validation-panel sarek-validation-panel-error",
+          shiny::div(shiny::h4("Run review is unavailable"), shiny::tags$pre(state$error))
+        ))
+      }
+      samples <- sarek_confirmed_samples_table(manifest)
+      tool_resolution <- tryCatch(
+        sarek_submission_tool_resolution(
+          manifest$analysis$mode,
+          manifest$analysis$preset,
+          manifest
+        ),
+        error = function(error) list(
+          tools = paste("Not available:", conditionMessage(error)),
+          warnings = character(0)
+        )
+      )
+      card <- function(label, value) {
+        shiny::div(
+          class = "sarek-run-review-card",
+          shiny::tags$span(label),
+          shiny::tags$strong(as.character(value))
+        )
+      }
+      shiny::div(
+        class = "sarek-run-review",
+        shiny::div(
+          class = "sarek-run-review-grid",
+          card("Run name", manifest$manifest_id),
+          card("Analysis", sarek_analysis_mode_label(manifest$analysis$mode)),
+          card("Assay", manifest$assay$type),
+          card("Reference", paste(manifest$reference$assembly, manifest$reference$sarek_genome, sep = " · ")),
+          card("Patients", length(manifest$patients)),
+          card("Samples", NROW(samples)),
+          card("Starting stage", state$input$step),
+          card("Pipeline tools", tool_resolution$tools)
+        ),
+        if (length(tool_resolution$warnings)) {
+          shiny::div(
+            class = "sarek-validation-panel sarek-validation-panel-warning",
+            shiny::div(
+              shiny::h4("Caller adjusted - run will continue"),
+              shiny::tags$pre(paste(tool_resolution$warnings, collapse = "\n"))
+            )
+          )
+        },
+        shiny::tags$p(
+          class = "muted small-note",
+          shiny::tags$strong("Results: "), manifest$storage$results_root,
+          shiny::tags$br(),
+          shiny::tags$strong("Temporary work: "), manifest$storage$work_root
+        )
+      )
+    })
+
+    output$confirmed_samples <- shiny::renderTable({
+      manifest <- confirmed_manifest()
+      if (is.null(manifest)) return(NULL)
+      sarek_confirmed_samples_table(manifest)
+    }, striped = TRUE, bordered = TRUE, spacing = "s", rownames = FALSE)
+
+    output$submission_ui <- shiny::renderUI({
+      manifest <- confirmed_manifest()
+      if (is.null(manifest)) {
+        return(shiny::div(
+          class = "sarek-submit-panel",
+          shiny::tags$p("Validate and confirm the analysis before submission becomes available.")
+        ))
+      }
+      nextflow_state <- nextflow_input_state()
+      if (!isTRUE(nextflow_state$valid)) {
+        return(shiny::div(
+          class = "sarek-submit-panel",
+          shiny::tags$p("Submission is locked until the Nextflow input error is corrected.")
+        ))
+      }
+      readiness <- submission_readiness()
+      if (!isTRUE(readiness$valid)) {
+        return(shiny::div(
+          class = "sarek-validation-panel sarek-validation-panel-error",
+          shiny::div(
+            shiny::h4("Submission requires another setting"),
+            shiny::tags$pre(readiness$error)
+          )
+        ))
+      }
+      state <- submission_state()
+      if (identical(state$kind, "success")) {
+        return(shiny::div(
+          class = "sarek-submit-panel",
+          shiny::tags$strong("This run has been submitted."),
+          shiny::tags$p(class = "muted small-note", "Use the recorded Slurm job ID to track the controller job.")
+        ))
       }
       reviewed <- identical(reviewed_validation_version(), validation_version())
-      shiny::tagList(
+      shiny::div(
+        class = "sarek-submit-panel",
         shiny::checkboxInput(
           session$ns("validation_reviewed"),
-          "I reviewed the validation results above",
+          "I reviewed the validation, warnings, run settings, samples, and storage paths above",
           value = reviewed
         ),
-        if (reviewed) {
-          shiny::downloadButton(session$ns("download_manifest"), "Download confirmed JSON")
+        if (reviewed && !isTRUE(submission_in_progress())) {
+          shiny::tagList(
+            shiny::actionButton(session$ns("request_submit"), "Submit Sarek run", class = "btn-primary"),
+            shiny::tags$details(
+              class = "sarek-advanced-downloads",
+              shiny::tags$summary("Advanced: download generated samplesheet"),
+              shiny::br(),
+              shiny::downloadButton(session$ns("download_nextflow_input"), "Download Sarek samplesheet CSV")
+            )
+          )
+        } else if (isTRUE(submission_in_progress())) {
+          shiny::tags$p(class = "muted small-note", "Submitting the controller job to Slurm...")
         } else {
-          shiny::tags$p(class = "muted small-note", "Review and acknowledge the validation panel to enable download.")
+          shiny::tags$p(class = "muted small-note", "Acknowledge the review above to enable submission.")
         }
+      )
+    })
+
+    output$submission_status <- shiny::renderUI({
+      state <- submission_state()
+      if (identical(state$kind, "info")) return(NULL)
+      shiny::div(
+        class = paste("sarek-validation-panel", paste0("sarek-validation-panel-", state$kind)),
+        shiny::div(
+          shiny::h4(if (identical(state$kind, "success")) "Run submitted" else "Submission failed"),
+          shiny::tags$pre(state$message)
+        )
       )
     })
 
@@ -1201,25 +2238,119 @@ sarek_manifest_server <- function(
       }
     }, ignoreInit = TRUE)
 
-    output$download_manifest <- shiny::downloadHandler(
+    shiny::observeEvent(input$request_submit, {
+      manifest <- confirmed_manifest()
+      state <- nextflow_input_state()
+      readiness <- submission_readiness()
+      if (is.null(manifest) || !isTRUE(state$valid) || !isTRUE(readiness$valid) ||
+          !identical(reviewed_validation_version(), validation_version())) return(invisible(NULL))
+      tool_resolution <- tryCatch(
+        sarek_submission_tool_resolution(
+          manifest$analysis$mode,
+          manifest$analysis$preset,
+          manifest
+        ),
+        error = function(error) list(tools = conditionMessage(error), warnings = character(0))
+      )
+      shiny::showModal(shiny::modalDialog(
+        title = "Submit this Sarek run?",
+        shiny::tags$p("This creates a private run bundle and submits the Nextflow controller to Slurm."),
+        shiny::tags$ul(
+          shiny::tags$li(shiny::tags$strong("Run: "), manifest$manifest_id),
+          shiny::tags$li(shiny::tags$strong("Starting stage: "), state$input$step),
+          shiny::tags$li(shiny::tags$strong("Tools that will run: "), tool_resolution$tools),
+          shiny::tags$li(shiny::tags$strong("Results root: "), manifest$storage$results_root),
+          shiny::tags$li(shiny::tags$strong("Work root: "), manifest$storage$work_root)
+        ),
+        if (length(tool_resolution$warnings)) {
+          shiny::div(
+            class = "sarek-validation-panel sarek-validation-panel-warning",
+            shiny::div(
+              shiny::h4("Important caller change"),
+              shiny::tags$pre(paste(tool_resolution$warnings, collapse = "\n"))
+            )
+          )
+        },
+        footer = shiny::tagList(
+          shiny::modalButton("Cancel"),
+          shiny::actionButton(session$ns("confirm_submit"), "Confirm and submit", class = "btn-primary")
+        ),
+        easyClose = FALSE
+      ))
+    }, ignoreInit = TRUE)
+
+    shiny::observeEvent(input$confirm_submit, {
+      shiny::removeModal()
+      if (isTRUE(submission_in_progress())) return(invisible(NULL))
+      submission_in_progress(TRUE)
+      on.exit(submission_in_progress(FALSE), add = TRUE)
+      result <- tryCatch({
+        manifest <- confirmed_manifest()
+        state <- nextflow_input_state()
+        readiness <- submission_readiness()
+        if (is.null(manifest)) stop("The run is no longer confirmed.")
+        if (!isTRUE(state$valid)) stop("The generated Sarek input is no longer valid: ", state$error)
+        if (!isTRUE(readiness$valid)) stop(readiness$error)
+        if (!identical(reviewed_validation_version(), validation_version())) {
+          stop("Review acknowledgement is required before submission.")
+        }
+        if (!is.function(submit_handler)) stop("The Sarek submission backend is not configured.")
+        submitted <- submit_handler(manifest, state$input)
+        if (!is.list(submitted) || !identical(sarek_text(submitted$status), "submitted") ||
+            !nzchar(sarek_text(submitted$job_id))) {
+          stop("The Sarek submission backend did not return a Slurm job ID.")
+        }
+        submitted
+      }, error = function(error) error)
+      if (inherits(result, "error")) {
+        submission_state(list(
+          kind = "error",
+          message = paste0("ERROR\n- ", conditionMessage(result)),
+          result = NULL
+        ))
+      } else {
+        submission_state(list(
+          kind = "success",
+          message = paste0(
+            "SUBMITTED\n- Slurm controller job: ", result$job_id,
+            "\n- Run directory: ", result$run_dir,
+            "\n- Results directory: ", result$output_dir
+          ),
+          result = result
+        ))
+        shiny::updateTextInput(session, "history_root", value = dirname(result$run_dir))
+        run_history_refresh(Sys.time())
+        shiny::updateSelectInput(session, "selected_run", selected = basename(result$run_dir))
+        shiny::updateTabsetPanel(session, "sarek_sections", selected = "status")
+      }
+      invisible(NULL)
+    }, ignoreInit = TRUE)
+
+    output$download_nextflow_input <- shiny::downloadHandler(
       filename = function() {
-        paste0(sarek_identifier(input$manifest_id, "sarek_analysis"), ".manifest.json")
+        paste0(sarek_identifier(input$manifest_id, "sarek_analysis"), ".sarek.samplesheet.csv")
       },
       content = function(file) {
-        manifest <- confirmed_manifest()
-        if (is.null(manifest)) stop("The manifest must be confirmed before download.")
         if (!identical(reviewed_validation_version(), validation_version())) {
           stop("Review and acknowledge the validation results before downloading.")
         }
-        sarek_write_manifest(manifest, file)
+        state <- nextflow_input_state()
+        if (!isTRUE(state$valid)) {
+          stop("A valid Sarek Nextflow input is not available: ", state$error)
+        }
+        sarek_write_nextflow_samplesheet(state$input, file)
       },
-      contentType = "application/json"
+      contentType = "text/csv"
     )
 
     list(
       confirmation_table = shiny::reactive(confirmation_state()),
       manifest = shiny::reactive(confirmed_manifest()),
-      valid = shiny::reactive(!is.null(confirmed_manifest()))
+      valid = shiny::reactive(!is.null(confirmed_manifest())),
+      nextflow_input = shiny::reactive(nextflow_input_state()$input),
+      nextflow_valid = shiny::reactive(isTRUE(nextflow_input_state()$valid)),
+      submission_ready = shiny::reactive(isTRUE(submission_readiness()$valid)),
+      submission = shiny::reactive(submission_state()$result)
     )
   })
 }

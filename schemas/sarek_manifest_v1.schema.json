@@ -240,6 +240,10 @@
         "patient_id": {
           "$ref": "#/$defs/identifier"
         },
+        "sex": {
+          "description": "Patient sex chromosome complement for CNV callers; NA means not provided.",
+          "enum": ["NA", "XX", "XY"]
+        },
         "samples": {
           "type": "array",
           "minItems": 1,

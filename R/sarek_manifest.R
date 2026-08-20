@@ -2,11 +2,12 @@
 # This module deliberately has no Shiny or pipeline-runtime dependency.
 
 SAREK_MANIFEST_SCHEMA_VERSION <- "1.0"
-SAREK_INSPECTOR_VERSION <- "0.1.0"
+SAREK_INSPECTOR_VERSION <- "0.2.0"
 SAREK_SUPPORTED_INPUT_FORMATS <- c("fastq", "ubam", "bam", "cram", "vcf", "bcf")
 SAREK_SAMPLE_ROLES <- c("germline", "tumor", "normal", "unknown")
 SAREK_ASSAY_TYPES <- c("WGS", "WES", "targeted", "annotation_only")
 SAREK_ANALYSIS_MODES <- c("germline", "tumor_only", "matched_tumor_normal", "annotation_only")
+SAREK_SEX_CHROMOSOMES <- c("NA", "XX", "XY")
 SAREK_PROCESSING_STATES <- c(
   "unknown",
   "unmapped",
@@ -27,6 +28,12 @@ sarek_identifier <- function(value, fallback = "sample") {
   value <- gsub("[^A-Za-z0-9_.-]+", "_", sarek_text(value, fallback))
   value <- gsub("^[_.-]+|[_.-]+$", "", value)
   if (nzchar(value)) substr(value, 1L, 128L) else fallback
+}
+
+sarek_normalize_sex <- function(value, default = "NA") {
+  value <- toupper(sarek_text(value, default))
+  if (value %in% c("", "UNKNOWN", "NOT PROVIDED")) value <- "NA"
+  value
 }
 
 sarek_detect_input_format <- function(path) {
@@ -135,13 +142,54 @@ sarek_discover_input_paths <- function(paths, recursive = FALSE, max_files = 500
   )
 }
 
+sarek_fastq_technical_tokens <- function(stem) {
+  # Some sequencing facilities append a dual index, flowcell, lane, chunk, and
+  # read token to the biological sample name, for example:
+  # ECO-18-BloodDNA_ACAGTTACCT-GAACTGCCGG_23W33VLT4_L006_001.R1
+  #
+  # Requiring the dual-index + flowcell + lane chain keeps this conservative:
+  # an ordinary sample ending in _L001 is not shortened accidentally.
+  pattern <- paste0(
+    "(^|[_.-])",
+    "([ACGTN]{6,16}-[ACGTN]{6,16})[_.-]",
+    "([A-Za-z0-9]{6,20})[_.-]",
+    "(L[0-9]{3})(?:[_.-]|$)"
+  )
+  match <- regexec(pattern, stem, ignore.case = TRUE, perl = TRUE)
+  parts <- regmatches(stem, match)[[1]]
+  if (length(parts) < 5L) {
+    return(list(sample_prefix = "", flowcell = "", lane = ""))
+  }
+
+  start <- as.integer(match[[1]][[1]])
+  sample_prefix <- if (is.finite(start) && start > 1L) {
+    sub("[_.-]+$", "", substr(stem, 1L, start - 1L), perl = TRUE)
+  } else {
+    ""
+  }
+  flowcell <- toupper(parts[[4]])
+  lane <- toupper(parts[[5]])
+  list(
+    sample_prefix = sample_prefix,
+    flowcell = flowcell,
+    lane = paste(flowcell, lane, sep = "_")
+  )
+}
+
 sarek_filename_tokens <- function(path, format = sarek_detect_input_format(path)) {
   name <- basename(path)
   stem <- name
   stem <- sub("\\.(fastq|fq)(\\.gz)?$", "", stem, ignore.case = TRUE, perl = TRUE)
   stem <- sub("\\.(ubam|bam|cram|vcf|bcf)(\\.gz)?$", "", stem, ignore.case = TRUE, perl = TRUE)
 
-  lane <- if (grepl("(^|[_.-])L[0-9]{3}([_.-]|$)", stem, ignore.case = TRUE, perl = TRUE)) {
+  fastq_technical <- if (identical(format, "fastq")) {
+    sarek_fastq_technical_tokens(stem)
+  } else {
+    list(sample_prefix = "", flowcell = "", lane = "")
+  }
+  lane <- if (nzchar(fastq_technical$lane)) {
+    fastq_technical$lane
+  } else if (grepl("(^|[_.-])L[0-9]{3}([_.-]|$)", stem, ignore.case = TRUE, perl = TRUE)) {
     sub(".*(?:^|[_.-])L([0-9]{3})(?:[_.-]|$).*", "L\\1", stem, ignore.case = TRUE, perl = TRUE)
   } else {
     ""
@@ -151,38 +199,72 @@ sarek_filename_tokens <- function(path, format = sarek_detect_input_format(path)
     1L
   } else if (grepl("(^|[_.-])R2([_.-]|$)", stem, ignore.case = TRUE, perl = TRUE)) {
     2L
+  } else if (identical(format, "fastq") &&
+             grepl("(^|[_.-])1([_.-][0-9]{3})?$", stem, perl = TRUE)) {
+    1L
+  } else if (identical(format, "fastq") &&
+             grepl("(^|[_.-])2([_.-][0-9]{3})?$", stem, perl = TRUE)) {
+    2L
   } else {
     NA_integer_
   }
 
-  sample_stem <- stem
-  sample_stem <- sub("([_.-])R[12]([_.-][0-9]{3})?$", "", sample_stem, ignore.case = TRUE, perl = TRUE)
-  sample_stem <- sub("([_.-])L[0-9]{3}$", "", sample_stem, ignore.case = TRUE, perl = TRUE)
+  sample_stem <- fastq_technical$sample_prefix
+  if (!nzchar(sample_stem)) {
+    sample_stem <- stem
+    # Support both ..._L001_R1_001.fastq.gz and
+    # ..._L001_001.R1.fastq.gz without removing numeric sample suffixes from
+    # filenames that do not contain a lane token.
+    for (iteration in seq_len(2L)) {
+      sample_stem <- sub("([_.-])R[12]([_.-][0-9]{3})?$", "", sample_stem, ignore.case = TRUE, perl = TRUE)
+      if (identical(format, "fastq")) {
+        sample_stem <- sub("([_.-])[12]([_.-][0-9]{3})?$", "", sample_stem, perl = TRUE)
+      }
+      if (nzchar(lane)) {
+        sample_stem <- sub("([_.-])[0-9]{3}$", "", sample_stem, perl = TRUE)
+      }
+      sample_stem <- sub("([_.-])L[0-9]{3}$", "", sample_stem, ignore.case = TRUE, perl = TRUE)
+    }
+  }
   sample_stem <- sub("([_.-])S[0-9]+$", "", sample_stem, ignore.case = TRUE, perl = TRUE)
   sample_stem <- sarek_identifier(sample_stem)
 
   role <- "unknown"
   role_confidence <- "none"
-  if (grepl("(^|[_.-])tumou?r([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
+  role_basis <- ""
+  if (grepl("(^|[_.-])(tumou?r|pdodna|pdo)([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
     role <- "tumor"
     role_confidence <- "medium"
-  } else if (grepl("(^|[_.-])normal([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
+    role_basis <- if (grepl("(^|[_.-])pdo(dna)?([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
+      "the PDO/PDO-DNA filename token"
+    } else {
+      "the tumor filename token"
+    }
+  } else if (grepl("(^|[_.-])(normal|blooddna)([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
     role <- "normal"
     role_confidence <- "medium"
+    role_basis <- if (grepl("(^|[_.-])blooddna([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
+      "the BloodDNA filename token"
+    } else {
+      "the normal filename token"
+    }
   } else if (grepl("(^|[_.-])germline([_.-]|$)", sample_stem, ignore.case = TRUE, perl = TRUE)) {
     role <- "germline"
     role_confidence <- "medium"
+    role_basis <- "the germline filename token"
   } else if (grepl("([_.-])T$", sample_stem, ignore.case = TRUE, perl = TRUE)) {
     role <- "tumor"
     role_confidence <- "low"
+    role_basis <- "a terminal T filename token"
   } else if (grepl("([_.-])N$", sample_stem, ignore.case = TRUE, perl = TRUE)) {
     role <- "normal"
     role_confidence <- "low"
+    role_basis <- "a terminal N filename token"
   }
 
   patient_stem <- sample_stem
   patient_stem <- gsub(
-    "(^|[_.-])(tumou?r|normal|germline)([_.-]|$)",
+    "(^|[_.-])(tumou?r|normal|germline|pdodna|pdo|blooddna)([_.-]|$)",
     "_",
     patient_stem,
     ignore.case = TRUE,
@@ -205,7 +287,7 @@ sarek_filename_tokens <- function(path, format = sarek_detect_input_format(path)
   warning <- if (identical(role, "unknown")) {
     "Sample role requires confirmation."
   } else {
-    paste0("Sample role was inferred from the filename with ", role_confidence, " confidence.")
+    paste0("Sample role was inferred from ", role_basis, " with ", role_confidence, " confidence; confirm before submission.")
   }
 
   list(
@@ -235,16 +317,26 @@ sarek_build_discovery_table <- function(paths, recursive = FALSE, max_files = 50
     format <- sarek_detect_input_format(path)
     tokens <- sarek_filename_tokens(path, format)
     info <- file.info(path)
+    index <- sarek_find_index(path, format)
     data.frame(
       include = TRUE,
       patient_id = tokens$patient_id,
+      sex = "NA",
       sample_id = tokens$sample_id,
       role = tokens$role,
       matched_normal_id = "",
       input_format = format,
       processing_state = tokens$processing_state,
       path = normalizePath(path, winslash = "/", mustWork = TRUE),
-      index = sarek_find_index(path, format),
+      index = index,
+      inspection_status = if (identical(format, "bam")) "not_run" else "not_applicable",
+      processing_recommendation = "",
+      processing_confidence = "",
+      inspection_summary = if (identical(format, "bam")) "BAM inspection has not run." else "",
+      header_sample_ids = "",
+      sort_order = "",
+      reference_compatibility = "",
+      inspection_evidence = "",
       lane = tokens$lane,
       read = tokens$read,
       size_bytes = as.numeric(info$size[[1]]),
@@ -304,6 +396,26 @@ sarek_validate_confirmation_table <- function(table) {
   bad_sample <- is.na(sample_ids) | !nzchar(sample_ids) | !grepl(identifier_pattern, sample_ids, perl = TRUE)
   if (any(bad_patient)) errors <- c(errors, "Patient IDs may contain only letters, numbers, periods, underscores, and hyphens.")
   if (any(bad_sample)) errors <- c(errors, "Sample IDs may contain only letters, numbers, periods, underscores, and hyphens.")
+  sex <- if ("sex" %in% names(selected)) {
+    vapply(selected$sex, sarek_normalize_sex, character(1))
+  } else {
+    rep("NA", NROW(selected))
+  }
+  if (any(!sex %in% SAREK_SEX_CHROMOSOMES)) {
+    errors <- c(errors, "Sex chromosomes must be XX, XY, or Not provided.")
+  }
+  sex_by_patient <- split(sex, patient_ids)
+  inconsistent_sex <- names(sex_by_patient)[vapply(
+    sex_by_patient,
+    function(values) length(unique(values)) > 1L,
+    logical(1)
+  )]
+  if (length(inconsistent_sex)) {
+    errors <- c(errors, paste0(
+      "Sex chromosomes are patient-level metadata and must agree across all samples for: ",
+      paste(inconsistent_sex, collapse = ", ")
+    ))
+  }
   if (any(!selected$role %in% SAREK_SAMPLE_ROLES)) errors <- c(errors, "One or more sample roles are invalid.")
   if (any(!selected$input_format %in% SAREK_SUPPORTED_INPUT_FORMATS)) errors <- c(errors, "One or more input formats are invalid.")
   if (any(!selected$processing_state %in% SAREK_PROCESSING_STATES)) errors <- c(errors, "One or more processing states are invalid.")
@@ -363,7 +475,52 @@ sarek_validate_confirmation_table <- function(table) {
   }
   missing_index <- selected$input_format %in% c("bam", "cram", "vcf", "bcf") &
     index_missing
-  if (any(missing_index)) warnings <- c(warnings, "One or more indexed formats do not currently have a detected index.")
+  missing_alignment_index <- selected$input_format %in% c("bam", "cram") & index_missing
+  if (any(missing_alignment_index)) {
+    errors <- c(errors, "Every included BAM or CRAM must have a detected companion index before confirmation.")
+  }
+  alignment_with_index <- selected$input_format %in% c("bam", "cram") & !index_missing
+  unreadable_alignment_index <- rep(FALSE, NROW(selected))
+  if (any(alignment_with_index)) {
+    index_paths <- as.character(selected$index[alignment_with_index])
+    unreadable_alignment_index[alignment_with_index] <- !file.exists(index_paths) |
+      file.access(index_paths, mode = 4) != 0
+  }
+  if (any(unreadable_alignment_index)) {
+    errors <- c(errors, "One or more detected BAM or CRAM indexes are missing or unreadable.")
+  }
+  if (any(missing_index & !missing_alignment_index)) {
+    warnings <- c(warnings, "One or more indexed variant formats do not currently have a detected index.")
+  }
+
+  alignment_rows <- selected$input_format %in% c("bam", "cram")
+  unknown_alignment_state <- alignment_rows & selected$processing_state == "unknown"
+  if (any(unknown_alignment_state)) {
+    errors <- c(errors, "Every included BAM or CRAM processing state must be explicitly confirmed before submission.")
+  }
+  if ("inspection_status" %in% names(selected)) {
+    failed_bam_inspection <- selected$input_format == "bam" & selected$inspection_status == "failed"
+    if (any(failed_bam_inspection, na.rm = TRUE)) {
+      errors <- c(errors, "One or more BAM files failed lightweight integrity or index inspection.")
+    }
+    unverified_bam <- selected$input_format == "bam" & selected$inspection_status %in% c(
+      "not_run", "unavailable", "deferred"
+    )
+    if (any(unverified_bam, na.rm = TRUE)) {
+      warnings <- c(warnings, "One or more BAM files could not be automatically inspected; review their processing provenance manually.")
+    }
+    if ("reference_compatibility" %in% names(selected)) {
+      reference_review <- selected$input_format == "bam" & grepl(
+        "may not match GATK[.]GRCh38|not the GRCh38 length|could not be inferred",
+        as.character(selected$reference_compatibility),
+        ignore.case = TRUE,
+        perl = TRUE
+      )
+      if (any(reference_review, na.rm = TRUE)) {
+        warnings <- c(warnings, "One or more BAM headers require manual review for GATK.GRCh38 reference compatibility.")
+      }
+    }
+  }
 
   list(valid = !length(errors), errors = unique(errors), warnings = unique(warnings))
 }
@@ -489,6 +646,11 @@ sarek_build_manifest <- function(
   patient_ids <- unique(selected$patient_id)
   patients <- lapply(patient_ids, function(patient_id) {
     patient_rows <- selected[selected$patient_id == patient_id, , drop = FALSE]
+    patient_sex <- if ("sex" %in% names(patient_rows)) {
+      sarek_normalize_sex(patient_rows$sex[[1]])
+    } else {
+      "NA"
+    }
     sample_ids <- unique(patient_rows$sample_id)
     samples <- lapply(sample_ids, function(sample_id) {
       sample_rows <- patient_rows[patient_rows$sample_id == sample_id, , drop = FALSE]
@@ -525,6 +687,7 @@ sarek_build_manifest <- function(
 
     list(
       patient_id = patient_id,
+      sex = patient_sex,
       samples = samples,
       relationships = relationships
     )

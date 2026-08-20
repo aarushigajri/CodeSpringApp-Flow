@@ -7,7 +7,7 @@ SAREK_NEXTFLOW_PIPELINE <- "nf-core/sarek"
 SAREK_NEXTFLOW_PIPELINE_VERSION <- "3.9.0"
 
 sarek_nextflow_require_helpers <- function() {
-  required <- c("sarek_text", "sarek_is_absolute_path")
+  required <- c("sarek_text", "sarek_is_absolute_path", "sarek_normalize_sex")
   missing <- required[!vapply(required, exists, logical(1), mode = "function")]
   if (length(missing)) {
     stop(
@@ -16,8 +16,14 @@ sarek_nextflow_require_helpers <- function() {
       call. = FALSE
     )
   }
-  if (!exists("SAREK_MANIFEST_SCHEMA_VERSION", inherits = TRUE)) {
-    stop("Source R/sarek_manifest.R before R/sarek_nextflow_input.R. Missing manifest schema version.", call. = FALSE)
+  constants <- c("SAREK_MANIFEST_SCHEMA_VERSION", "SAREK_SEX_CHROMOSOMES")
+  missing_constants <- constants[!vapply(constants, exists, logical(1), inherits = TRUE)]
+  if (length(missing_constants)) {
+    stop(
+      "Source R/sarek_manifest.R before R/sarek_nextflow_input.R. Missing constants: ",
+      paste(missing_constants, collapse = ", "), ".",
+      call. = FALSE
+    )
   }
   invisible(TRUE)
 }
@@ -52,6 +58,14 @@ sarek_nextflow_manifest_samples <- function(manifest) {
   for (patient in manifest$patients) {
     patient_id <- sarek_text(patient$patient_id)
     if (!nzchar(patient_id)) stop("A manifest patient is missing patient_id.", call. = FALSE)
+    patient_sex <- sarek_normalize_sex(patient$sex, "NA")
+    if (!patient_sex %in% SAREK_SEX_CHROMOSOMES) {
+      stop(
+        "Patient ", patient_id, " has unsupported sex chromosomes: ", patient_sex,
+        ". Expected XX, XY, or NA.",
+        call. = FALSE
+      )
+    }
     if (!length(patient$samples)) {
       stop("Patient ", patient_id, " contains no samples.", call. = FALSE)
     }
@@ -64,6 +78,7 @@ sarek_nextflow_manifest_samples <- function(manifest) {
       }
       records[[length(records) + 1L]] <- list(
         patient = patient_id,
+        sex = patient_sex,
         sample = sample_id,
         role = sarek_text(sample$role),
         input_format = sarek_text(sample$input_format),
@@ -224,7 +239,7 @@ sarek_nextflow_base_row <- function(record) {
   sample_key <- paste(record$patient, record$sample, sep = "::")
   data.frame(
     patient = record$patient,
-    sex = "NA",
+    sex = record$sex,
     status = sarek_nextflow_status(record$role, sample_key),
     sample = record$sample,
     stringsAsFactors = FALSE,
@@ -381,6 +396,16 @@ sarek_build_nextflow_input <- function(manifest) {
   samplesheet <- do.call(rbind, rows)
   rownames(samplesheet) <- NULL
 
+  sex_dependent_mode <- analysis_mode %in% c("tumor_only", "matched_tumor_normal")
+  missing_sex_patients <- if (!sex_dependent_mode || identical(step, "annotate")) {
+    character(0)
+  } else {
+    unique(vapply(records, function(record) {
+      if (identical(record$sex, "NA")) record$patient else ""
+    }, character(1)))
+  }
+  missing_sex_patients <- missing_sex_patients[nzchar(missing_sex_patients)]
+
   list(
     generator_version = SAREK_NEXTFLOW_INPUT_VERSION,
     pipeline = SAREK_NEXTFLOW_PIPELINE,
@@ -390,9 +415,13 @@ sarek_build_nextflow_input <- function(manifest) {
     step = step,
     input_format = format,
     samplesheet = samplesheet,
-    warnings = if (identical(step, "annotate")) character(0) else {
-      "Sex is set to NA because manifest schema 1.0 does not collect sex chromosomes; review this before CNV analysis."
-    }
+    warnings = if (length(missing_sex_patients)) {
+      paste0(
+        "Sex chromosomes are not provided for patient(s): ",
+        paste(missing_sex_patients, collapse = ", "),
+        ". A caller that requires sex will be omitted before submission; the remaining callers can still run."
+      )
+    } else character(0)
   )
 }
 
