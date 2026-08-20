@@ -461,8 +461,8 @@ sarek_run_activity <- function(run, state = "", max_events = 12L) {
   running <- max(sum(trace_status %in% c("RUNNING", "SUBMITTED", "NEW")), length(active_names))
   list(
     available = length(log_lines) > 0L || NROW(trace) > 0L,
-    current_steps = utils::tail(active_names, 5L),
-    current_labels = vapply(utils::tail(active_names, 5L), sarek_process_label, character(1)),
+    current_steps = unname(utils::tail(active_names, 5L)),
+    current_labels = unname(vapply(utils::tail(active_names, 5L), sarek_process_label, character(1))),
     completed = completed,
     failed = failed,
     running = running,

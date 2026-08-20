@@ -73,13 +73,13 @@ assert_true(
   identical(
     names(sample_display),
     c(
-      "Include", "Patient ID", "Sample ID", "Role", "Matched normal", "Input format",
+      "Include", "Patient ID", "Sex chromosomes", "Sample ID", "Role", "Matched normal", "Input format",
       "Processing state", "Index", "BAM inspection", "Files", "FASTQ pairing"
     )
   ),
-  "The one-sample display table does not have eleven stable frontend columns."
+  "The one-sample display table does not have twelve stable frontend columns."
 )
-assert_true(NROW(sample_display) == 1L && NCOL(sample_display) == 11L, "The one-sample display table collapsed during rendering.")
+assert_true(NROW(sample_display) == 1L && NCOL(sample_display) == 12L, "The one-sample display table collapsed during rendering.")
 assert_true(startsWith(sarek_fastq_pairing_status(table[1, , drop = FALSE]), "Needs attention:"), "A missing FASTQ mate was not surfaced before validation.")
 assert_true(sarek_recommend_analysis_mode(table) == "tumor_only", "Tumor FASTQs did not recommend tumor-only mode.")
 
