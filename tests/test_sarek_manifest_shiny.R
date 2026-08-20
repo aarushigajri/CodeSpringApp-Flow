@@ -332,6 +332,23 @@ shiny::testServer(
     expected_key <- sarek_sample_key(confirmation_state()$patient_id[[1]], confirmation_state()$sample_id[[1]])
     assert_true(selected_sample_state() == expected_key, "A single table-row selection did not select the sample for editing.")
 
+    reviewed_sample <- confirmation_state()[1, , drop = FALSE]
+    session$setInputs(
+      edit_include = TRUE,
+      edit_patient_id = reviewed_sample$patient_id[[1]],
+      edit_sample_id = reviewed_sample$sample_id[[1]],
+      edit_sex = "XX",
+      edit_role = "tumor",
+      edit_matched_normal_id = "",
+      edit_processing_state = "unmapped"
+    )
+    session$setInputs(apply_sample = 1L)
+    session$flushReact()
+    assert_true(
+      all(confirmation_state()$sex == "XX"),
+      "The corroborated patient sex chromosomes were not applied to the FASTQ sample."
+    )
+
     session$setInputs(confirm = 1L)
     session$flushReact()
     manifest <- confirmed_manifest()
