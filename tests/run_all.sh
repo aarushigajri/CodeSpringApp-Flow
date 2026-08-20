@@ -10,6 +10,7 @@ lab_root="${1:-$(cd -- "$repo_root/../CodeSpringLab-fix" && pwd)}"
 (cd "$repo_root" && Rscript --vanilla tests/test_sarek_manifest_shiny.R)
 (cd "$repo_root" && Rscript --vanilla tests/test_sarek_nextflow_input.R)
 (cd "$repo_root" && Rscript --vanilla tests/test_sarek_sex_fallback.R)
+(cd "$repo_root" && Rscript --vanilla tests/test_sarek_live_activity.R)
 (cd "$repo_root" && Rscript --vanilla tests/test_sarek_submission.R)
 (cd "$repo_root" && Rscript tests/smoke_test_app_helpers.R "$lab_root")
 CSL_CODESPRINGLAB_ROOT="$lab_root" "$repo_root/run_codespringweb.sh" --check-config

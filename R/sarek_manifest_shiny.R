@@ -243,6 +243,65 @@ sarek_analysis_mode_label <- function(mode) {
   if (mode %in% names(labels)) unname(labels[[mode]]) else "No clear recommendation"
 }
 
+sarek_run_activity_panel <- function(activity, state = "") {
+  state <- sarek_normalize_slurm_state(state)
+  if (!is.list(activity) || !isTRUE(activity$available)) {
+    message <- if (state %in% c("PENDING", "CONFIGURING", "SUBMITTED")) {
+      "The controller job is queued. Nextflow activity will appear after it starts."
+    } else if (state %in% c("RUNNING", "COMPLETING", "SUSPENDED")) {
+      "The controller is active, but no readable Nextflow activity has been recorded yet."
+    } else {
+      "No Nextflow activity log is available for this run."
+    }
+    return(shiny::div(
+      class = "sarek-live-activity sarek-live-activity-empty",
+      shiny::h4("Live Nextflow activity"),
+      shiny::tags$p(message)
+    ))
+  }
+
+  current <- as.character(activity$current_labels)
+  current <- current[nzchar(current)]
+  current_text <- if (length(current)) {
+    paste(current, collapse = ", ")
+  } else if (state %in% c("RUNNING", "COMPLETING", "SUSPENDED")) {
+    "Nextflow is starting or is between task submissions."
+  } else {
+    "No task is currently running."
+  }
+  estimate <- sarek_text(activity$estimate$label, "A current-task estimate is not available yet.")
+  events <- as.character(activity$recent_events)
+  events <- events[nzchar(events)]
+
+  shiny::div(
+    class = "sarek-live-activity",
+    shiny::h4("Live Nextflow activity"),
+    shiny::div(
+      class = "sarek-live-task",
+      shiny::tags$strong("Current step: "),
+      current_text
+    ),
+    shiny::div(
+      class = "sarek-live-counts",
+      shiny::span(shiny::tags$strong(activity$running), " running"),
+      shiny::span(shiny::tags$strong(activity$completed), " completed"),
+      shiny::span(shiny::tags$strong(activity$failed), " failed")
+    ),
+    shiny::tags$p(class = "sarek-live-estimate", estimate),
+    shiny::tags$p(
+      class = "muted small-note",
+      "Any time estimate applies only to the current task and is based on completed tasks of the same step; it is not a whole-workflow ETA."
+    ),
+    if (length(events)) {
+      shiny::tags$details(
+        class = "sarek-live-log",
+        shiny::tags$summary("Recent Nextflow events"),
+        shiny::tags$pre(paste(events, collapse = "\n"))
+      )
+    }
+  )
+}
+
 sarek_apply_sample_update <- function(
   table,
   sample_key,
@@ -790,6 +849,33 @@ sarek_manifest_ui <- function(id) {
        .sarek-progress-bar.success { background:#218739; }
        .sarek-progress-bar.error { background:#b42318; }
        .sarek-progress-bar.unknown { background:#687586; }
+       .sarek-live-activity {
+         margin:12px 0;
+         padding:14px 16px;
+         border:1px solid #bfd5ea;
+         border-left:6px solid #2d78c4;
+         border-radius:9px;
+         background:#f4f9ff;
+       }
+       .sarek-live-activity h4 { margin:0 0 9px 0; }
+       .sarek-live-activity-empty { border-left-color:#8795a5; background:#f7f8fa; }
+       .sarek-live-task { margin:5px 0 10px 0; overflow-wrap:anywhere; }
+       .sarek-live-counts { display:flex; flex-wrap:wrap; gap:10px; margin:7px 0; }
+       .sarek-live-counts span { padding:4px 9px; border-radius:12px; background:#e3edf7; }
+       .sarek-live-estimate { margin:9px 0 4px 0; font-weight:650; }
+       .sarek-live-log { margin-top:10px; }
+       .sarek-live-log summary { cursor:pointer; font-weight:700; }
+       .sarek-live-log pre {
+         max-height:260px;
+         margin:8px 0 0 0;
+         padding:10px;
+         overflow:auto;
+         border:1px solid #d7e0ea;
+         border-radius:6px;
+         background:#fff;
+         white-space:pre-wrap;
+         overflow-wrap:anywhere;
+       }
        .sarek-run-paths {
          margin-top:8px;
          color:#536273;
@@ -1259,6 +1345,7 @@ sarek_manifest_server <- function(
         list(state = sarek_text(run$status, "submitted"), elapsed = "", source = "record")
       }
       progress <- sarek_run_progress(status$state)
+      activity <- sarek_run_activity(as.list(run), state = status$state)
       details <- c(
         if (nzchar(sarek_text(run$job_id))) paste0("Slurm job ", sarek_text(run$job_id)) else "No Slurm job ID recorded",
         if (nzchar(sarek_text(status$elapsed))) paste0("elapsed ", sarek_text(status$elapsed)) else NULL,
@@ -1280,6 +1367,7 @@ sarek_manifest_server <- function(
             progress$label
           )
         ),
+        sarek_run_activity_panel(activity, status$state),
         if (nzchar(sarek_text(status$error))) {
           shiny::tags$p(class = "sarek-validation-panel sarek-validation-panel-error", sarek_text(status$error))
         },

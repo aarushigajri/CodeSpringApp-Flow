@@ -112,6 +112,7 @@ sarek_submission_paths <- function(manifest) {
     params_path = file.path(internal_dir, "params.json"),
     launch_script = file.path(internal_dir, "launch.sh"),
     nextflow_log = file.path(internal_dir, "logs", "nextflow.log"),
+    trace_path = file.path(internal_dir, "logs", "trace.tsv"),
     stdout = file.path(internal_dir, "logs", "controller.out"),
     stderr = file.path(internal_dir, "logs", "controller.err"),
     submission_record = file.path(internal_dir, "submission.tsv"),
@@ -195,6 +196,7 @@ sarek_submission_launch_script <- function(paths, runtime, pipeline, pipeline_ve
     "-profile", "singularity",
     "-params-file", shQuote(paths$params_path),
     "-work-dir", shQuote(paths$work_dir),
+    "-with-trace", shQuote(paths$trace_path),
     "-name", shQuote(paste0("codespring_", paths$manifest_id))
   )
   c(
@@ -245,6 +247,232 @@ sarek_read_key_value_file <- function(path) {
   keep <- nzchar(keys) & keys != "field"
   if (!any(keep)) return(character(0))
   stats::setNames(values[keep], keys[keep])
+}
+
+sarek_tail_text_lines <- function(path, max_lines = 200L, max_bytes = 262144L) {
+  path <- sarek_text(path)
+  max_lines <- suppressWarnings(as.integer(max_lines)[1])
+  max_bytes <- suppressWarnings(as.numeric(max_bytes)[1])
+  if (!length(max_lines) || is.na(max_lines) || max_lines < 1L) max_lines <- 200L
+  if (!length(max_bytes) || is.na(max_bytes) || max_bytes < 1024) max_bytes <- 262144
+  if (!nzchar(path) || !file.exists(path) || dir.exists(path) || file.access(path, mode = 4) != 0) {
+    return(character(0))
+  }
+  size <- suppressWarnings(as.numeric(file.info(path)$size[[1]]))
+  if (!is.finite(size) || size <= 0) return(character(0))
+  start <- max(0, size - max_bytes)
+  connection <- file(path, open = "rb")
+  on.exit(close(connection), add = TRUE)
+  if (start > 0) seek(connection, where = start, origin = "start")
+  raw <- readBin(connection, what = "raw", n = as.integer(min(size, max_bytes)))
+  if (!length(raw)) return(character(0))
+  text <- tryCatch(rawToChar(raw), error = function(error) "")
+  if (!nzchar(text)) return(character(0))
+  text <- iconv(text, from = "UTF-8", to = "UTF-8", sub = "")
+  lines <- strsplit(text, "\n", fixed = TRUE)[[1]]
+  if (start > 0 && length(lines)) lines <- lines[-1L]
+  lines <- sub("\r$", "", lines)
+  utils::tail(lines[nzchar(trimws(lines))], max_lines)
+}
+
+sarek_read_nextflow_trace <- function(path, max_rows = 20000L) {
+  empty <- data.frame(stringsAsFactors = FALSE)
+  path <- sarek_text(path)
+  if (!nzchar(path) || !file.exists(path) || dir.exists(path) || file.access(path, mode = 4) != 0) return(empty)
+  trace <- tryCatch(
+    utils::read.delim(
+      path,
+      header = TRUE,
+      sep = "\t",
+      quote = "",
+      comment.char = "",
+      fill = TRUE,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ),
+    error = function(error) empty
+  )
+  if (!NROW(trace)) return(empty)
+  names(trace) <- tolower(gsub("[^A-Za-z0-9]+", "_", names(trace)))
+  max_rows <- suppressWarnings(as.integer(max_rows)[1])
+  if (!length(max_rows) || is.na(max_rows) || max_rows < 1L) max_rows <- 20000L
+  if (NROW(trace) > max_rows) trace <- utils::tail(trace, max_rows)
+  trace
+}
+
+sarek_duration_seconds <- function(value) {
+  values <- as.character(value)
+  vapply(values, function(item) {
+    item <- trimws(tolower(item))
+    if (!nzchar(item) || item %in% c("na", "-") ) return(NA_real_)
+    if (grepl("^[0-9]+(?:[.][0-9]+)?$", item, perl = TRUE)) return(suppressWarnings(as.numeric(item)))
+    if (grepl("^[0-9]+:[0-5]?[0-9]:[0-5]?[0-9](?:[.][0-9]+)?$", item, perl = TRUE)) {
+      parts <- suppressWarnings(as.numeric(strsplit(item, ":", fixed = TRUE)[[1]]))
+      return(parts[[1]] * 3600 + parts[[2]] * 60 + parts[[3]])
+    }
+    matches <- gregexpr("[0-9]+(?:[.][0-9]+)?[[:space:]]*(?:ms|d|h|m|s)", item, perl = TRUE)
+    tokens <- regmatches(item, matches)[[1]]
+    if (!length(tokens) || identical(tokens, "")) return(NA_real_)
+    numbers <- suppressWarnings(as.numeric(sub("[[:space:]]*(ms|d|h|m|s)$", "", tokens, perl = TRUE)))
+    units <- sub("^.*[0-9][[:space:]]*", "", tokens, perl = TRUE)
+    multipliers <- c(ms = 0.001, s = 1, m = 60, h = 3600, d = 86400)
+    if (anyNA(numbers) || any(!units %in% names(multipliers))) return(NA_real_)
+    sum(numbers * unname(multipliers[units]))
+  }, numeric(1))
+}
+
+sarek_format_duration <- function(seconds) {
+  seconds <- suppressWarnings(as.numeric(seconds)[1])
+  if (!length(seconds) || !is.finite(seconds) || seconds < 0) return("")
+  seconds <- round(seconds)
+  if (seconds < 60) return(paste0(seconds, " sec"))
+  if (seconds < 3600) return(paste0(round(seconds / 60), " min"))
+  if (seconds < 86400) {
+    hours <- floor(seconds / 3600)
+    minutes <- round((seconds %% 3600) / 60)
+    return(paste0(hours, " hr", if (hours == 1L) "" else "s", if (minutes > 0) paste0(" ", minutes, " min") else ""))
+  }
+  days <- floor(seconds / 86400)
+  hours <- round((seconds %% 86400) / 3600)
+  paste0(days, " day", if (days == 1L) "" else "s", if (hours > 0) paste0(" ", hours, " hr") else "")
+}
+
+sarek_trace_column <- function(trace, candidates, default = "") {
+  selected <- candidates[candidates %in% names(trace)]
+  if (!length(selected)) return(rep(default, NROW(trace)))
+  as.character(trace[[selected[[1]]]])
+}
+
+sarek_process_group <- function(name) {
+  trimws(sub("[[:space:]]*[(][^()]*[)][[:space:]]*$", "", as.character(name), perl = TRUE))
+}
+
+sarek_process_label <- function(name) {
+  name <- trimws(as.character(name))
+  sub("^.*:", "", name)
+}
+
+sarek_nextflow_log_events <- function(lines, max_events = 12L) {
+  if (!length(lines)) return(list(events = character(0), submitted = character(0)))
+  events <- character(0)
+  submitted <- character(0)
+  for (line in lines) {
+    process_match <- regexec("(Submitted|Cached) process >[[:space:]]*(.+)$", line, perl = TRUE)
+    process_parts <- regmatches(line, process_match)[[1]]
+    if (length(process_parts) >= 3L) {
+      kind <- process_parts[[2]]
+      process <- trimws(process_parts[[3]])
+      events <- c(events, paste0(kind, ": ", sarek_process_label(process)))
+      if (identical(kind, "Submitted")) submitted <- c(submitted, process)
+      next
+    }
+    if (grepl("ERROR[[:space:]]*~|Session aborted|Execution complete|Workflow completed|WARN[[:space:]]*~", line, perl = TRUE)) {
+      message <- sub("^.* - ", "", line)
+      events <- c(events, trimws(message))
+    }
+  }
+  list(events = utils::tail(events, max_events), submitted = submitted)
+}
+
+sarek_multiset_difference <- function(values, remove) {
+  remaining <- as.character(values)
+  for (item in as.character(remove)) {
+    position <- match(item, remaining)
+    if (!is.na(position)) remaining <- remaining[-position]
+  }
+  remaining
+}
+
+sarek_task_time_estimate <- function(trace, active_names, now = Sys.time(), min_completed = 2L) {
+  unavailable <- list(available = FALSE, label = "Not enough completed tasks of this step to estimate its duration.")
+  if (!NROW(trace) || !length(active_names)) return(unavailable)
+  names_value <- sarek_trace_column(trace, c("name", "process"))
+  status <- toupper(sarek_trace_column(trace, "status"))
+  duration_value <- sarek_trace_column(trace, c("realtime", "duration"), default = NA_character_)
+  duration <- sarek_duration_seconds(duration_value)
+  groups <- sarek_process_group(names_value)
+  active <- as.character(active_names[[length(active_names)]])
+  active_group <- sarek_process_group(active)
+  completed <- status %in% c("COMPLETED", "CACHED") & groups == active_group & is.finite(duration) & duration > 0
+  completed_count <- sum(completed)
+  min_completed <- suppressWarnings(as.integer(min_completed)[1])
+  if (!length(min_completed) || is.na(min_completed) || min_completed < 1L) min_completed <- 2L
+  if (completed_count < min_completed) return(unavailable)
+  expected <- stats::median(duration[completed])
+
+  active_rows <- which(status %in% c("RUNNING", "SUBMITTED", "NEW") & groups == active_group)
+  elapsed <- NA_real_
+  if (length(active_rows)) {
+    start_value <- sarek_trace_column(trace[active_rows, , drop = FALSE], c("start", "submit"))
+    starts <- suppressWarnings(as.POSIXct(
+      start_value,
+      tz = "UTC",
+      tryFormats = c("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%OS")
+    ))
+    starts <- starts[!is.na(starts)]
+    if (length(starts)) elapsed <- max(0, as.numeric(difftime(now, utils::tail(starts, 1L), units = "secs")))
+  }
+  remaining <- if (is.finite(elapsed)) max(0, expected - elapsed) else NA_real_
+  detail <- paste0("median of ", completed_count, " completed task", if (completed_count == 1L) "" else "s", " of this step")
+  label <- if (is.finite(remaining)) {
+    paste0("Estimated time remaining for the current task: about ", sarek_format_duration(remaining), " (", detail, ").")
+  } else {
+    paste0("Typical duration for this task: about ", sarek_format_duration(expected), " (", detail, ").")
+  }
+  list(
+    available = TRUE,
+    label = label,
+    expected_seconds = expected,
+    elapsed_seconds = elapsed,
+    remaining_seconds = remaining,
+    completed_examples = completed_count
+  )
+}
+
+sarek_run_activity <- function(run, state = "", max_events = 12L) {
+  scalar <- function(name, default = "") {
+    value <- tryCatch(run[[name]], error = function(error) NULL)
+    sarek_text(value, default)
+  }
+  run_dir <- scalar("run_dir")
+  internal_dir <- if (nzchar(run_dir)) file.path(run_dir, ".codespring") else ""
+  log_path <- scalar("nextflow_log", if (nzchar(internal_dir)) file.path(internal_dir, "logs", "nextflow.log") else "")
+  trace_path <- scalar("trace_path", if (nzchar(internal_dir)) file.path(internal_dir, "logs", "trace.tsv") else "")
+  trace <- sarek_read_nextflow_trace(trace_path)
+  log_lines <- sarek_tail_text_lines(log_path, max_lines = 2000L)
+  log <- sarek_nextflow_log_events(log_lines, max_events = max_events)
+  trace_names <- sarek_trace_column(trace, c("name", "process"))
+  trace_status <- toupper(sarek_trace_column(trace, "status"))
+  terminal <- trace_status %in% c("COMPLETED", "CACHED", "FAILED", "ABORTED", "CANCELLED")
+  trace_active <- trace_names[trace_status %in% c("RUNNING", "SUBMITTED", "NEW") & nzchar(trace_names)]
+  inferred_active <- if (NROW(trace)) {
+    sarek_multiset_difference(log$submitted, trace_names[terminal])
+  } else {
+    utils::tail(log$submitted, 1L)
+  }
+  active_names <- unique(c(trace_active, inferred_active))
+  normalized_state <- sarek_normalize_slurm_state(state)
+  if (nzchar(normalized_state) && !normalized_state %in% c("RUNNING", "COMPLETING", "SUSPENDED")) {
+    active_names <- character(0)
+  }
+  estimate <- sarek_task_time_estimate(trace, active_names)
+  completed <- sum(trace_status %in% c("COMPLETED", "CACHED"))
+  failed <- sum(trace_status %in% c("FAILED", "ABORTED", "CANCELLED"))
+  running <- max(sum(trace_status %in% c("RUNNING", "SUBMITTED", "NEW")), length(active_names))
+  list(
+    available = length(log_lines) > 0L || NROW(trace) > 0L,
+    current_steps = utils::tail(active_names, 5L),
+    current_labels = vapply(utils::tail(active_names, 5L), sarek_process_label, character(1)),
+    completed = completed,
+    failed = failed,
+    running = running,
+    observed = completed + failed + running,
+    recent_events = log$events,
+    estimate = estimate,
+    log_path = log_path,
+    trace_path = trace_path,
+    trace_available = NROW(trace) > 0L
+  )
 }
 
 sarek_submission_catalog <- function(results_root) {
