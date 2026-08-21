@@ -276,13 +276,29 @@ oversize_preflight_error <- tryCatch({
   ""
 }, error = conditionMessage)
 missing_size_fetcher <- function(accession, max_rows) data.frame(run_accession = accession, fastq_bytes = "", stringsAsFactors = FALSE)
-missing_size_preflight_error <- tryCatch({
-  app_env$fetchngs_download_preflight(
+missing_size_preflight <- app_env$fetchngs_download_preflight(
+  c("SRR14593545", "ERR1160846"), fetchngs_root, fetchngs_runtime_root,
+  report_fetcher = function(accession, max_rows) {
+    if (identical(accession, "SRR14593545")) return(missing_size_fetcher(accession, max_rows))
+    fake_ena_reports[[accession]]
+  },
+  space_fetcher = fake_shared_space
+)
+missing_size_skip <- app_env$fetchngs_preflight_accessions(missing_size_preflight, "skip")
+missing_size_continue <- app_env$fetchngs_preflight_accessions(missing_size_preflight, "continue")
+all_unknown_skip_error <- tryCatch({
+  all_unknown <- app_env$fetchngs_download_preflight(
     "SRR14593545", fetchngs_root, fetchngs_runtime_root,
     report_fetcher = missing_size_fetcher, space_fetcher = fake_shared_space
   )
+  app_env$fetchngs_preflight_accessions(all_unknown, "skip")
   ""
 }, error = conditionMessage)
+lookup_failure_preflight <- app_env$fetchngs_download_preflight(
+  "SRP256957", fetchngs_root, fetchngs_runtime_root,
+  report_fetcher = function(accession, max_rows) stop("simulated ENA timeout"),
+  space_fetcher = fake_shared_space
+)
 too_many_resolved_fetcher <- function(accession, max_rows) {
   data.frame(
     run_accession = paste0("SRR", seq_len(max_rows)),
@@ -308,10 +324,29 @@ low_space_preflight_error <- tryCatch({
 }, error = conditionMessage)
 assert(
   grepl("above the administrator limit", oversize_preflight_error, fixed = TRUE) &&
-    grepl("could not determine FASTQ size", missing_size_preflight_error, fixed = TRUE) &&
     grepl("more than the administrator limit", too_many_resolved_error, fixed = TRUE) &&
     grepl("Insufficient free storage", low_space_preflight_error, fixed = TRUE),
-  "FetchNGS blocks oversized, unknown-size, over-20-run, and insufficient-storage downloads before submission"
+  "FetchNGS blocks oversized, over-20-run, and insufficient-storage downloads before submission"
+)
+assert(
+  isTRUE(missing_size_preflight$has_unknown_size) &&
+    identical(missing_size_preflight$unknown_runs, "SRR14593545") &&
+    identical(missing_size_skip, "ERR1160846") &&
+    identical(missing_size_continue, c("SRR14593545", "ERR1160846")) &&
+    grepl("nothing left to submit", all_unknown_skip_error, fixed = TRUE) &&
+    isTRUE(lookup_failure_preflight$has_unknown_size) &&
+    identical(lookup_failure_preflight$unknown_accessions, "SRP256957"),
+  "FetchNGS reports unknown sizes and supports explicit skip or acknowledged-continue decisions"
+)
+fetchngs_bundle_input <- file.path(fetchngs_run, "input", "accessions.csv")
+fetchngs_bundle_backup <- app_env$replace_fetchngs_run_accession_input(
+  fetchngs_bundle_input, missing_size_skip, fetchngs_run
+)
+assert(
+  file.exists(fetchngs_bundle_backup) &&
+    identical(readLines(fetchngs_bundle_backup, warn = FALSE), fetchngs_accessions) &&
+    identical(readLines(fetchngs_bundle_input, warn = FALSE), missing_size_skip),
+  "FetchNGS resume skip safely backs up and replaces the bundle accession list"
 )
 fetchngs_metadata_dir <- file.path(fetchngs_run, "results", "metadata")
 fetchngs_fastq_dir <- file.path(fetchngs_run, "results", "fastq")
@@ -377,6 +412,10 @@ assert(
     grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE) &&
     grepl('tags$strong("Accepted accessions")', app_text, fixed = TRUE) &&
     grepl('tags$strong("Download safeguards")', app_text, fixed = TRUE) &&
+    grepl('uiOutput("fetchngs_message")', app_text, fixed = TRUE) &&
+    grepl('actionButton("confirm_fetchngs_unknown_size"', server_source, fixed = TRUE) &&
+    grepl('actionButton("cancel_fetchngs_unknown_size"', server_source, fixed = TRUE) &&
+    grepl('fetchngs_unknown_size_ack', server_source, fixed = TRUE) &&
     grepl("fetchngs_download_preflight(accessions, results_root = results_root)", server_source, fixed = TRUE) &&
     grepl("Rechecking accession and download safety before resuming", server_source, fixed = TRUE) &&
     grepl("manifest <- fetchngs_read_manifest(run_dir)", server_source, fixed = TRUE),

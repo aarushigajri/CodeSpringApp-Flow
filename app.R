@@ -797,39 +797,64 @@ fetchngs_download_preflight <- function(
   if (length(accessions) > max_runs) {
     stop("A download submission may contain at most ", max_runs, " accession identifiers before ENA resolution.")
   }
-  reports <- lapply(accessions, function(accession) {
-    report <- report_fetcher(accession, max_rows = max_runs + 1L)
-    if (NROW(report) > max_runs) {
+  reports <- list()
+  lookup_errors <- setNames(character(0), character(0))
+  for (accession in accessions) {
+    fetched <- tryCatch(
+      report_fetcher(accession, max_rows = max_runs + 1L),
+      error = function(e) e
+    )
+    if (inherits(fetched, "error")) {
+      lookup_errors[[accession]] <- conditionMessage(fetched)
+      next
+    }
+    if (NROW(fetched) > max_runs) {
       stop(accession, " resolves to more than the administrator limit of ", max_runs, " sequencing runs.")
     }
-    report$source_accession <- accession
-    report
-  })
-  report <- do.call(rbind, reports)
+    if (!NROW(fetched) || !all(c("run_accession", "fastq_bytes") %in% names(fetched))) {
+      lookup_errors[[accession]] <- "ENA returned no usable run-level FASTQ size report."
+      next
+    }
+    fetched$source_accession <- accession
+    reports[[length(reports) + 1L]] <- fetched[, c("run_accession", "fastq_bytes", "source_accession"), drop = FALSE]
+  }
+  report <- if (length(reports)) {
+    do.call(rbind, reports)
+  } else {
+    data.frame(run_accession = character(0), fastq_bytes = character(0), source_accession = character(0), stringsAsFactors = FALSE)
+  }
   report$run_accession <- toupper(trimws(as.character(report$run_accession)))
-  report$bytes <- vapply(report$fastq_bytes, fetchngs_fastq_bytes_value, numeric(1))
-  if (any(!grepl(FETCHNGS_ACCESSION_PATTERNS[["run"]], report$run_accession))) {
+  if (NROW(report) && any(!grepl(FETCHNGS_ACCESSION_PATTERNS[["run"]], report$run_accession))) {
     stop("ENA returned an invalid run accession while checking download size.")
   }
-  missing_size <- unique(report$run_accession[!is.finite(report$bytes) | report$bytes <= 0])
-  if (length(missing_size)) {
-    stop(
-      "ENA could not determine FASTQ size for ", paste(utils::head(missing_size, 5L), collapse = ", "),
-      ". Use metadata-only mode; the FASTQ download was not submitted."
-    )
+  report$bytes <- if (NROW(report)) {
+    vapply(report$fastq_bytes, fetchngs_fastq_bytes_value, numeric(1))
+  } else {
+    numeric(0)
   }
-  bytes_by_run <- tapply(report$bytes, report$run_accession, max)
+  bytes_by_run <- if (NROW(report)) {
+    vapply(split(report$bytes, report$run_accession), function(values) {
+      known <- values[is.finite(values) & values > 0]
+      if (length(known)) max(known) else NA_real_
+    }, numeric(1))
+  } else {
+    setNames(numeric(0), character(0))
+  }
   resolved_runs <- names(bytes_by_run)
-  if (length(resolved_runs) > max_runs) {
+  unresolved_input_runs <- names(lookup_errors)[
+    vapply(names(lookup_errors), fetchngs_accession_type, character(1)) == "run"
+  ]
+  counted_runs <- unique(c(resolved_runs, unresolved_input_runs))
+  if (length(counted_runs) > max_runs) {
     stop(
-      "These accessions resolve to ", length(resolved_runs), " unique sequencing runs. The administrator limit is ",
+      "These accessions resolve to ", length(counted_runs), " unique sequencing runs. The administrator limit is ",
       max_runs, " runs per submission."
     )
   }
-  estimated_bytes <- sum(as.numeric(bytes_by_run))
-  if (!is.finite(estimated_bytes) || estimated_bytes <= 0) {
-    stop("ENA did not provide a usable compressed FASTQ size. Use metadata-only mode; the download was not submitted.")
-  }
+  known_runs <- names(bytes_by_run)[is.finite(bytes_by_run) & bytes_by_run > 0]
+  unknown_runs <- names(bytes_by_run)[!is.finite(bytes_by_run) | bytes_by_run <= 0]
+  unknown_accessions <- unique(c(unknown_runs, names(lookup_errors)))
+  estimated_bytes <- if (length(known_runs)) sum(as.numeric(bytes_by_run[known_runs])) else 0
   if (estimated_bytes > max_download_bytes) {
     stop(
       "Estimated compressed FASTQ download is ", fetchngs_human_size(estimated_bytes),
@@ -837,21 +862,40 @@ fetchngs_download_preflight <- function(
       ". Use metadata-only mode or ask an administrator about an approved large download."
     )
   }
-  storage <- fetchngs_check_storage_capacity(
-    estimated_bytes,
-    results_root,
-    runtime_root,
-    storage_multiplier,
-    space_fetcher
-  )
+  storage <- if (estimated_bytes > 0) {
+    fetchngs_check_storage_capacity(
+      estimated_bytes,
+      results_root,
+      runtime_root,
+      storage_multiplier,
+      space_fetcher
+    )
+  } else NULL
   list(
     accessions = accessions,
     resolved_runs = resolved_runs,
-    run_count = length(resolved_runs),
+    known_runs = known_runs,
+    unknown_runs = unknown_runs,
+    unknown_accessions = unknown_accessions,
+    lookup_errors = lookup_errors,
+    has_unknown_size = length(unknown_accessions) > 0,
+    run_count = length(counted_runs),
     estimated_bytes = estimated_bytes,
-    required_storage_bytes = storage$required_bytes,
+    required_storage_bytes = storage$required_bytes %||% 0,
     storage = storage
   )
+}
+
+fetchngs_preflight_accessions <- function(preflight, unknown_size_action = c("ask", "skip", "continue")) {
+  unknown_size_action <- match.arg(unknown_size_action)
+  if (!isTRUE(preflight$has_unknown_size)) return(preflight$accessions)
+  if (identical(unknown_size_action, "ask")) return(character(0))
+  if (identical(unknown_size_action, "continue")) return(preflight$accessions)
+  known_runs <- unique(as.character(preflight$known_runs %||% character(0)))
+  if (!length(known_runs)) {
+    stop("All requested accessions have unknown FASTQ sizes, so there is nothing left to submit after skipping them.")
+  }
+  known_runs
 }
 
 fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_scheduler = TRUE) {
@@ -1071,6 +1115,27 @@ write_fetchngs_accession_input <- function(run_name, value, app_home = APP_HOME)
   path <- file.path(input_dir, paste0(validate_fetchngs_run_name(run_name), "_accessions.csv"))
   writeLines(accessions, path, useBytes = TRUE)
   path
+}
+
+replace_fetchngs_run_accession_input <- function(input_path, value, run_dir) {
+  accessions <- parse_fetchngs_accessions(value)
+  input_path <- normalizePath(input_path, winslash = "/", mustWork = TRUE)
+  run_dir <- normalizePath(run_dir, winslash = "/", mustWork = TRUE)
+  if (!path_is_within(input_path, run_dir)) {
+    stop("Refusing to replace a FetchNGS input file outside the selected run folder.")
+  }
+  stamp <- format(Sys.time(), "%Y%m%d-%H%M%S")
+  backup_path <- file.path(dirname(input_path), paste0("accessions.before-unknown-skip-", stamp, ".csv"))
+  if (!file.copy(input_path, backup_path, overwrite = FALSE)) {
+    stop("Could not back up the original FetchNGS accession file before applying the skip choice.")
+  }
+  temporary_path <- tempfile("accessions-", tmpdir = dirname(input_path), fileext = ".csv")
+  on.exit(if (file.exists(temporary_path)) unlink(temporary_path, force = TRUE), add = TRUE)
+  writeLines(accessions, temporary_path, useBytes = TRUE)
+  if (!file.rename(temporary_path, input_path)) {
+    stop("Could not replace the FetchNGS accession file with the known-size run list. The backup is at ", backup_path)
+  }
+  backup_path
 }
 
 LOGO_CSL_PATH <- file.path(SCRIPTS_DIR, "Logo_CSL.png")
@@ -11006,6 +11071,14 @@ body { background:#eef3f8; color:#17202f; }
 .fetchngs-safeguards li {
   margin: 0 0 2px 0;
   line-height: 1.25;}
+.fetchngs-status-alert { margin-top:4px; white-space:normal; }
+.fetchngs-status-alert.error { border:2px solid #c83d32; border-left-width:8px; background:#fff0ed; box-shadow:0 8px 22px rgba(157,42,32,.16); color:#74251d; font-size:15px; }
+.fetchngs-status-alert.active { border:2px solid #d79a28; border-left-width:8px; box-shadow:0 6px 18px rgba(124,61,0,.12); }
+.fetchngs-status-alert.success { border:2px solid #58a77b; border-left-width:8px; }
+.fetchngs-status-alert .fetchngs-message-text { white-space:pre-wrap; overflow-wrap:anywhere; }
+.fetchngs-unknown-warning { border:2px solid #c83d32; border-left-width:8px; background:#fff0ed; color:#74251d; }
+.fetchngs-unknown-warning ul { margin:7px 0 4px 20px; padding-left:0; }
+.fetchngs-unknown-warning li { margin-bottom:4px; }
 .tool-message-alert { margin:12px 0; }
 .tool-cancel-zone { margin-top:12px; padding-top:12px; border-top:1px dashed #d8dde8; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
 .tool-delete-zone { margin-top:8px; padding:10px 12px; border:1px solid #f0c1ba; border-radius:8px; background:#fff7f5; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
@@ -11788,7 +11861,7 @@ ui <- fluidPage(
                                 tags$li(paste0("At most ", FETCHNGS_MAX_RUNS, " resolved sequencing runs per download.")),
                                 tags$li(paste0("Estimated compressed FASTQs must not exceed ", format(FETCHNGS_MAX_DOWNLOAD_GB, trim = TRUE), " GB.")),
                                 tags$li(paste0("Available server storage must satisfy a ", format(FETCHNGS_STORAGE_MULTIPLIER, trim = TRUE), "x sra-tools working-space allowance.")),
-                                tags$li("If ENA cannot determine the size, FASTQ download is blocked; metadata-only mode remains available.")
+                                tags$li("If ENA cannot determine a size, you must explicitly skip the affected accession(s) or accept the risk and continue.")
                               )),
                           radioButtons(
                             "fetchngs_input_mode", "Accession source",
@@ -11822,7 +11895,7 @@ ui <- fluidPage(
                           br(),
                           actionButton("submit_fetchngs", "Create and run FetchNGS", class = "btn-primary"),
                           br(), br(),
-                          verbatimTextOutput("fetchngs_message")
+                          uiOutput("fetchngs_message")
                    ),
                    column(7,
                           radioButtons(
@@ -11959,6 +12032,7 @@ server <- function(input, output, session) {
   fetchngs_known_roots_refresh <- reactiveVal(0L)
   fetchngs_output_root_preference <- reactiveVal("")
   fetchngs_message_state <- reactiveVal("")
+  fetchngs_pending_unknown_size <- reactiveVal(list())
   fetchngs_delete_target <- reactiveVal(list())
   tool_messages <- reactiveVal(list())
   progress_refresh <- reactiveVal(Sys.time())
@@ -12464,7 +12538,23 @@ server <- function(input, output, session) {
     }, error = function(e) paste("Output location needs attention:", conditionMessage(e)))
   })
 
-  output$fetchngs_message <- renderText(fetchngs_message_state())
+  output$fetchngs_message <- renderUI({
+    message <- trimws(fetchngs_message_state() %||% "")
+    if (!nzchar(message)) return(NULL)
+    is_error <- startsWith(message, "ERROR:")
+    is_active <- startsWith(message, "WARNING:") || grepl(
+      "^(Validating|Checking|Rechecking|Waiting)", message
+    )
+    style <- if (is_error) "error" else if (is_active) "active" else "success"
+    heading <- if (is_error) "Action needed" else if (is_active) "Please review" else "FetchNGS update"
+    div(
+      class = paste("run-message-alert fetchngs-status-alert", style),
+      role = "alert",
+      `aria-live` = if (is_error) "assertive" else "polite",
+      tags$strong(heading),
+      div(class = "fetchngs-message-text", message)
+    )
+  })
 
   output$fetchngs_run_select_ui <- renderUI({
     fetchngs_refresh()
@@ -12501,6 +12591,131 @@ server <- function(input, output, session) {
     fetchngs_message_state(paste("FetchNGS run status refreshed at", format(Sys.time(), "%Y-%m-%d %H:%M:%S")))
   })
 
+  fetchngs_unknown_size_label <- function(preflight) {
+    identifiers <- unique(as.character(preflight$unknown_accessions %||% character(0)))
+    if (!length(identifiers)) return("the affected accession(s)")
+    shown <- utils::head(identifiers, 10L)
+    paste0(
+      paste(shown, collapse = ", "),
+      if (length(identifiers) > length(shown)) paste0(" and ", length(identifiers) - length(shown), " more") else ""
+    )
+  }
+
+  fetchngs_safety_message <- function(preflight, prefix = "Safety check passed", unknown_size_action = "ask") {
+    if (is.null(preflight)) return("")
+    known_summary <- paste0(
+      length(preflight$known_runs), " known-size run(s), ",
+      fetchngs_human_size(preflight$estimated_bytes), " estimated compressed FASTQs, and ",
+      fetchngs_human_size(preflight$required_storage_bytes), " required by the ",
+      FETCHNGS_STORAGE_MULTIPLIER, "x storage allowance"
+    )
+    if (!isTRUE(preflight$has_unknown_size)) return(paste0(prefix, ": ", known_summary, "."))
+    unknown_label <- fetchngs_unknown_size_label(preflight)
+    if (identical(unknown_size_action, "skip")) {
+      return(paste0(prefix, " after skipping unknown-size accession(s): ", unknown_label, ". Submitted ", known_summary, "."))
+    }
+    paste0(
+      "WARNING: Risk accepted for unknown-size accession(s): ", unknown_label, ". ", prefix,
+      " with the original accession list. The safety checks cover only the known portion: ", known_summary,
+      ". Unresolved studies/projects may also exceed the run-count limit. The final download may exceed the ",
+      "administrator size limit or available storage, and it may fail."
+    )
+  }
+
+  show_fetchngs_unknown_size_modal <- function(context) {
+    preflight <- context$preflight
+    identifiers <- unique(as.character(preflight$unknown_accessions %||% character(0)))
+    fetchngs_pending_unknown_size(context)
+    showModal(modalDialog(
+      title = "FASTQ size could not be determined",
+      div(
+        class = "run-message-alert fetchngs-unknown-warning",
+        role = "alert",
+        tags$strong("A decision is required before FetchNGS can start"),
+        tags$p("ENA could not provide a usable compressed FASTQ size for:"),
+        tags$ul(lapply(identifiers, tags$li)),
+        tags$p(
+          "The known portion is approximately ", tags$strong(fetchngs_human_size(preflight$estimated_bytes)),
+          ". Its run-count, size-limit, and storage checks have passed."
+        )
+      ),
+      radioButtons(
+        "fetchngs_unknown_size_action", "Choose what to do",
+        choices = c(
+          "Skip the unknown-size accession(s) and download only known-size resolved runs" = "skip",
+          "Continue with the original accession list despite the unknown size" = "continue"
+        ),
+        selected = "skip"
+      ),
+      checkboxInput(
+        "fetchngs_unknown_size_ack",
+        paste0(
+          "I understand that continuing may exceed ", format(FETCHNGS_MAX_DOWNLOAD_GB, trim = TRUE),
+          " GB, the run-count limit, or available server storage, and the download may fail."
+        ),
+        value = FALSE
+      ),
+      tags$p(
+        class = "muted small-note",
+        "The acknowledgement is required only for Continue. Cancel leaves the run unsubmitted."
+      ),
+      footer = tagList(
+        actionButton("cancel_fetchngs_unknown_size", "Cancel", class = "btn-default"),
+        actionButton("confirm_fetchngs_unknown_size", "Apply choice and submit", class = "btn-danger")
+      ),
+      easyClose = FALSE
+    ))
+  }
+
+  finish_fetchngs_submission <- function(context, unknown_size_action = "ask") {
+    preflight <- context$preflight
+    submit_accessions <- if (is.null(preflight)) {
+      context$accessions
+    } else {
+      fetchngs_preflight_accessions(preflight, unknown_size_action)
+    }
+    input_path <- write_fetchngs_accession_input(context$run_name, submit_accessions)
+    args <- c(
+      "fetchngs", "--input", input_path, "--name", context$run_name,
+      "--pipeline-version", context$version
+    )
+    if (context$metadata_only) args <- c(args, "--metadata-only")
+    if (context$bundle_only) args <- c(args, "--dry-run")
+    output <- run_fetchngs_cli(args, results_root = context$results_root)
+    updateSelectInput(session, "fetchngs_selected_run", selected = context$run_name)
+    safety_message <- if (!is.null(preflight)) {
+      fetchngs_safety_message(preflight, unknown_size_action = unknown_size_action)
+    } else if (context$metadata_only) {
+      "Metadata-only mode: no FASTQ size or storage check was required."
+    } else {
+      "Bundle-only mode: no job was submitted and no FASTQs will be downloaded."
+    }
+    paste(
+      output,
+      "",
+      safety_message,
+      paste("FASTQ output folder:", file.path(fetchngs_run_dir(context$run_name, context$results_root), "results", "fastq")),
+      sep = "\n"
+    )
+  }
+
+  finish_fetchngs_resume <- function(context, unknown_size_action = "ask") {
+    preflight <- context$preflight
+    backup_message <- ""
+    if (!is.null(preflight) && isTRUE(preflight$has_unknown_size) && identical(unknown_size_action, "skip")) {
+      submit_accessions <- fetchngs_preflight_accessions(preflight, "skip")
+      backup_path <- replace_fetchngs_run_accession_input(context$input_path, submit_accessions, context$run_dir)
+      backup_message <- paste("Original accession list backed up to:", backup_path)
+    }
+    output <- run_fetchngs_cli(c("resume", context$run_name), results_root = context$results_root)
+    safety_message <- if (!is.null(preflight)) {
+      fetchngs_safety_message(preflight, prefix = "Resume safety check passed", unknown_size_action = unknown_size_action)
+    } else {
+      "Metadata-only run: no FASTQ size or storage check was required."
+    }
+    paste(c(output, "", safety_message, backup_message), collapse = "\n")
+  }
+
   observeEvent(input$submit_fetchngs, {
     fetchngs_message_state("Validating accession formats and download safety before creating the run bundle...")
     result <- tryCatch({
@@ -12529,32 +12744,21 @@ server <- function(input, output, session) {
         fetchngs_message_state("Checking ENA run count, estimated FASTQ size, and available server storage...")
         fetchngs_download_preflight(accessions, results_root = results_root)
       } else NULL
-      input_path <- write_fetchngs_accession_input(run_name, accessions)
       version <- trimws(input$fetchngs_pipeline_version %||% FETCHNGS_DEFAULT_VERSION)
-      args <- c("fetchngs", "--input", input_path, "--name", run_name, "--pipeline-version", version)
-      if (metadata_only) args <- c(args, "--metadata-only")
-      if (bundle_only) args <- c(args, "--dry-run")
-      output <- run_fetchngs_cli(args, results_root = results_root)
-      updateSelectInput(session, "fetchngs_selected_run", selected = run_name)
-      safety_message <- if (!is.null(preflight)) {
-        paste0(
-          "Safety check passed: ", preflight$run_count, " unique run(s), ",
-          fetchngs_human_size(preflight$estimated_bytes), " estimated compressed FASTQs, ",
-          fetchngs_human_size(preflight$required_storage_bytes), " required by the ",
-          FETCHNGS_STORAGE_MULTIPLIER, "x storage allowance."
-        )
-      } else if (metadata_only) {
-        "Metadata-only mode: no FASTQ size or storage check was required."
-      } else {
-        "Bundle-only mode: no job was submitted and no FASTQs will be downloaded."
-      }
-      paste(
-        output,
-        "",
-        safety_message,
-        paste("FASTQ output folder:", file.path(fetchngs_run_dir(run_name, results_root), "results", "fastq")),
-        sep = "\n"
+      context <- list(
+        kind = "submit", results_root = results_root, run_name = run_name,
+        accessions = accessions, metadata_only = metadata_only, bundle_only = bundle_only,
+        version = version, preflight = preflight
       )
+      if (!is.null(preflight) && isTRUE(preflight$has_unknown_size)) {
+        show_fetchngs_unknown_size_modal(context)
+        paste0(
+          "WARNING: ENA could not determine FASTQ size for ", fetchngs_unknown_size_label(preflight),
+          ". Choose Skip or Continue in the confirmation dialog. Nothing has been submitted yet."
+        )
+      } else {
+        finish_fetchngs_submission(context)
+      }
     }, error = function(e) paste("ERROR:", conditionMessage(e)))
     fetchngs_message_state(result)
     fetchngs_refresh(fetchngs_refresh() + 1L)
@@ -12576,29 +12780,70 @@ server <- function(input, output, session) {
       input_path <- trimws(as.character(manifest[["copied_input"]] %||% ""))
       if (!nzchar(input_path) || !file.exists(input_path)) input_path <- file.path(run_dir, "input", "accessions.csv")
       if (!file.exists(input_path)) stop("The normalized accession file is missing from this run: ", input_path)
+      input_path <- normalizePath(input_path, winslash = "/", mustWork = TRUE)
+      if (!path_is_within(input_path, normalizePath(run_dir, winslash = "/", mustWork = TRUE))) {
+        stop("The recorded FetchNGS accession file is outside the selected run folder.")
+      }
       accessions <- read_fetchngs_accession_file(input_path)
       fetchngs_validate_run_accession_limit(accessions)
       metadata_only <- identical(tolower(manifest[["metadata_only"]] %||% "false"), "true")
       preflight <- if (!metadata_only) {
         fetchngs_download_preflight(accessions, results_root = results_root)
       } else NULL
-      output <- run_fetchngs_cli(c("resume", run_name), results_root = results_root)
-      safety_message <- if (!is.null(preflight)) {
+      context <- list(
+        kind = "resume", results_root = results_root, run_name = run_name,
+        run_dir = run_dir, input_path = input_path, accessions = accessions,
+        metadata_only = metadata_only, preflight = preflight
+      )
+      if (!is.null(preflight) && isTRUE(preflight$has_unknown_size)) {
+        show_fetchngs_unknown_size_modal(context)
         paste0(
-          "Resume safety check passed: ", preflight$run_count, " unique run(s), ",
-          fetchngs_human_size(preflight$estimated_bytes), " estimated compressed FASTQs, and ",
-          fetchngs_human_size(preflight$required_storage_bytes), " required storage."
+          "WARNING: ENA could not determine FASTQ size for ", fetchngs_unknown_size_label(preflight),
+          ". Choose Skip or Continue in the confirmation dialog. The run has not been resumed yet."
         )
       } else {
-        "Metadata-only run: no FASTQ size or storage check was required."
+        finish_fetchngs_resume(context)
       }
-      paste(output, "", safety_message, sep = "\n")
     },
       error = function(e) paste("ERROR:", conditionMessage(e))
     )
     fetchngs_message_state(result)
     fetchngs_refresh(fetchngs_refresh() + 1L)
   })
+
+  observeEvent(input$confirm_fetchngs_unknown_size, {
+    context <- isolate(fetchngs_pending_unknown_size())
+    if (!length(context)) {
+      removeModal()
+      fetchngs_message_state("ERROR: The pending FetchNGS decision expired. Start the submission again.")
+      return()
+    }
+    action <- isolate(input$fetchngs_unknown_size_action %||% "skip")
+    if (identical(action, "continue") && !isTRUE(isolate(input$fetchngs_unknown_size_ack))) {
+      fetchngs_message_state("ERROR: Tick the risk acknowledgement before continuing with unknown FASTQ sizes.")
+      showNotification("Risk acknowledgement is required before continuing.", type = "error", duration = 10)
+      return()
+    }
+    removeModal()
+    fetchngs_pending_unknown_size(list())
+    fetchngs_message_state("Checking the selected unknown-size action before submission...")
+    result <- tryCatch(
+      if (identical(context$kind, "resume")) {
+        finish_fetchngs_resume(context, action)
+      } else {
+        finish_fetchngs_submission(context, action)
+      },
+      error = function(e) paste("ERROR:", conditionMessage(e))
+    )
+    fetchngs_message_state(result)
+    fetchngs_refresh(fetchngs_refresh() + 1L)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$cancel_fetchngs_unknown_size, {
+    removeModal()
+    fetchngs_pending_unknown_size(list())
+    fetchngs_message_state("FetchNGS submission cancelled. No job was started.")
+  }, ignoreInit = TRUE)
 
   observeEvent(input$delete_fetchngs, {
     run_name <- input$fetchngs_selected_run %||% ""

@@ -128,9 +128,23 @@ files receive the same validation as IDs pasted into the app.
 Before a real FASTQ submission, the app requests an ENA run-level file report,
 deduplicates overlapping resolved runs, and sums the reported compressed
 `fastq_bytes`. By default, a submission is blocked when it resolves to more
-than 20 unique runs, exceeds 50 GB of compressed FASTQs, or has no usable size
-estimate. Metadata-only mode remains available when the size cannot be
-determined.
+than 20 unique runs or its known compressed FASTQs exceed 50 GB.
+
+When ENA cannot provide a usable size for one or more accessions, the app does
+not fail the whole request. It pauses before creating or submitting the job and
+opens a prominent decision dialog:
+
+- **Skip unknown-size accessions** converts the request to the resolved run IDs
+  with known sizes, excluding the affected runs or unresolved input accessions.
+  If every requested accession is unknown, the app explains that nothing is
+  left to submit instead of creating an empty job.
+- **Continue with unknown sizes** keeps the original accession list. The user
+  must tick a separate risk acknowledgement before submission. The known
+  portion must still pass the configured size and storage limits, but the total
+  download, temporary-space need, and number of runs behind an unresolved
+  study/project cannot be guaranteed and the workflow may fail.
+
+Metadata-only mode remains available and does not require a size estimate.
 
 The app also checks free space before submission. When results and private
 Nextflow work use the same filesystem, free space must be at least four times
@@ -141,8 +155,14 @@ temporary files created by `sra-tools`; it is a pre-submission safety check,
 not a storage reservation.
 
 The same checks run again before **Resume selected run** submits a non-metadata
-workflow. Therefore, creating a bundle with **Create bundle only** cannot be
-used to bypass the run-count, size, or free-space limits.
+workflow. When Skip is chosen during resume, the app backs up the run's original
+`accessions.csv` and replaces it with the known-size resolved run list before
+calling Nextflow with `-resume`. Therefore, creating a bundle with **Create
+bundle only** cannot bypass the preflight or the explicit unknown-size decision.
+
+FetchNGS status messages are severity-aware. Errors appear in a high-contrast
+red alert with an **Action needed** heading; checks and unresolved-size choices
+appear in amber; successful updates appear in green.
 
 Administrators can change these server-side limits before launching the app:
 
