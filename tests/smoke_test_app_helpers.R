@@ -235,6 +235,16 @@ fetchngs_output <- app_env$run_fetchngs_cli(
 )
 fetchngs_run <- app_env$fetchngs_run_dir("app_helper_smoke", fetchngs_root)
 fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_root, query_scheduler = FALSE)
+manifest_fixture_dir <- file.path(root, "fetchngs_manifest_fixture")
+dir.create(manifest_fixture_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines(
+  c("field\tvalue", "run_name\tmanifest_fixture", "work_namespace\t", "metadata_only\ttrue"),
+  file.path(manifest_fixture_dir, "run_manifest.tsv")
+)
+manifest_fixture <- app_env$fetchngs_read_manifest(manifest_fixture_dir)
+manifestless_run <- app_env$fetchngs_run_dir("legacy_manifestless", fetchngs_root)
+dir.create(manifestless_run, recursive = TRUE, showWarnings = FALSE)
+manifestless_summary <- app_env$fetchngs_run_summary("legacy_manifestless", fetchngs_root, query_scheduler = FALSE)
 fetchngs_history_path <- file.path(root, "fetchngs_results_roots.tsv")
 app_env$remember_fetchngs_results_root(fetchngs_root, fetchngs_history_path)
 known_fetchngs_roots <- app_env$fetchngs_known_results_roots(custom_fetchngs_root, fetchngs_history_path)
@@ -243,7 +253,13 @@ assert(
     file.exists(file.path(fetchngs_run, "run.sbatch")) &&
     file.exists(file.path(fetchngs_run, "input", "accessions.csv")) &&
     identical(fetchngs_summary$Status[[1]], "Bundle only") &&
-    identical(fetchngs_summary$`Metadata only`[[1]], "Yes"),
+    identical(fetchngs_summary$`Metadata only`[[1]], "Yes") &&
+    identical(app_env$fetchngs_manifest_value(manifest_fixture, "metadata_only", "false"), "true") &&
+    identical(app_env$fetchngs_manifest_value(manifest_fixture, "work_namespace", "default"), "default") &&
+    identical(app_env$fetchngs_manifest_value(manifest_fixture, "missing_field", "fallback"), "fallback") &&
+    identical(manifestless_summary$Status[[1]], "Bundle only") &&
+    identical(manifestless_summary$`Metadata only`[[1]], "No") &&
+    identical(manifestless_summary$`FetchNGS version`[[1]], app_env$FETCHNGS_DEFAULT_VERSION),
   "Shiny FetchNGS helpers create a validator-compatible metadata-only bundle without submitting Slurm"
 )
 assert(

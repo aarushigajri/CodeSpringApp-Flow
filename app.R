@@ -567,14 +567,27 @@ fetchngs_run_names <- function(root = FETCHNGS_RESULTS_ROOT) {
 fetchngs_read_manifest <- function(run_dir) {
   path <- file.path(run_dir, "run_manifest.tsv")
   if (!file.exists(path)) return(setNames(character(0), character(0)))
-  manifest <- tryCatch(
-    utils::read.delim(path, stringsAsFactors = FALSE, check.names = FALSE),
-    error = function(e) data.frame()
-  )
-  if (!NROW(manifest) || !all(c("field", "value") %in% names(manifest))) {
+  lines <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0))
+  if (length(lines) < 2L || !identical(lines[[1L]], "field\tvalue")) {
     return(setNames(character(0), character(0)))
   }
-  stats::setNames(as.character(manifest$value), as.character(manifest$field))
+  entries <- strsplit(lines[-1L], "\t", fixed = TRUE)
+  fields <- vapply(entries, function(entry) {
+    if (length(entry)) trimws(entry[[1L]]) else ""
+  }, character(1))
+  values <- vapply(entries, function(entry) {
+    if (length(entry) < 2L) return("")
+    paste(entry[-1L], collapse = "\t")
+  }, character(1))
+  keep <- nzchar(fields) & !duplicated(fields)
+  stats::setNames(values[keep], fields[keep])
+}
+
+fetchngs_manifest_value <- function(manifest, field, default = "") {
+  field <- trimws(as.character(field %||% ""))
+  if (length(field) != 1L || is.na(field) || !nzchar(field) || !field %in% names(manifest)) return(default)
+  value <- as.character(unname(manifest[field]))
+  if (length(value) != 1L || is.na(value) || !nzchar(trimws(value))) default else value
 }
 
 fetchngs_run_work_dir <- function(
@@ -585,7 +598,7 @@ fetchngs_run_work_dir <- function(
   run_dir <- fetchngs_run_dir(run_name, results_root)
   manifest <- fetchngs_read_manifest(run_dir)
   work_root <- normalizePath(file.path(runtime_root, "work", "fetchngs"), winslash = "/", mustWork = FALSE)
-  recorded <- trimws(as.character(manifest[["work_directory"]] %||% ""))
+  recorded <- trimws(fetchngs_manifest_value(manifest, "work_directory", ""))
   if (nzchar(recorded) && fetchngs_run_path_is_safe(recorded, work_root, run_name)) {
     return(normalizePath(recorded, winslash = "/", mustWork = FALSE))
   }
@@ -946,8 +959,8 @@ fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_s
     `FASTQ files` = length(fastqs),
     `Metadata files` = length(metadata),
     `Output size` = fetchngs_human_size(output_bytes),
-    `Metadata only` = if (identical(tolower(manifest[["metadata_only"]] %||% "false"), "true")) "Yes" else "No",
-    `FetchNGS version` = manifest[["fetchngs_version"]] %||% FETCHNGS_DEFAULT_VERSION,
+    `Metadata only` = if (identical(tolower(fetchngs_manifest_value(manifest, "metadata_only", "false")), "true")) "Yes" else "No",
+    `FetchNGS version` = fetchngs_manifest_value(manifest, "fetchngs_version", FETCHNGS_DEFAULT_VERSION),
     `Run directory` = run_dir,
     check.names = FALSE,
     stringsAsFactors = FALSE
@@ -12830,7 +12843,7 @@ server <- function(input, output, session) {
       run_dir <- fetchngs_run_dir(run_name, results_root)
       if (!dir.exists(run_dir)) stop("The selected FetchNGS run folder no longer exists: ", run_dir)
       manifest <- fetchngs_read_manifest(run_dir)
-      input_path <- trimws(as.character(manifest[["copied_input"]] %||% ""))
+      input_path <- trimws(fetchngs_manifest_value(manifest, "copied_input", ""))
       if (!nzchar(input_path) || !file.exists(input_path)) input_path <- file.path(run_dir, "input", "accessions.csv")
       if (!file.exists(input_path)) stop("The normalized accession file is missing from this run: ", input_path)
       input_path <- normalizePath(input_path, winslash = "/", mustWork = TRUE)
@@ -12839,7 +12852,7 @@ server <- function(input, output, session) {
       }
       accessions <- read_fetchngs_accession_file(input_path)
       fetchngs_validate_run_accession_limit(accessions)
-      metadata_only <- identical(tolower(manifest[["metadata_only"]] %||% "false"), "true")
+      metadata_only <- identical(tolower(fetchngs_manifest_value(manifest, "metadata_only", "false")), "true")
       preflight <- if (!metadata_only) {
         fetchngs_download_preflight(accessions, results_root = results_root)
       } else NULL
