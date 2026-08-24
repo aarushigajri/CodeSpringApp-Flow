@@ -57,6 +57,13 @@ The validated cluster defaults are:
 - Slurm partition `cpuq`
 - FetchNGS download method `sratools`
 
+CodeSpringApp supplies an explicit ENA metadata field list that omits the
+retired `parent_study` field. This is a compatibility workaround for
+nf-core/fetchngs 1.12.0, whose former default request now produces empty
+run-information files against the ENA API. New bundles include the corrected
+field list, and resuming an older CodeSpringApp bundle adds it automatically
+when it is absent.
+
 FTP is not exposed because the tested FetchNGS wget container could not resolve
 DNS under the cluster's Singularity 3.6.3 installation. Aspera is not exposed
 because it has not yet been validated on this cluster.

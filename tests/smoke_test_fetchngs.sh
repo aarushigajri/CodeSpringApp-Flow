@@ -30,8 +30,11 @@ cmp "$input_file" "$fastq_run/input/accessions.csv"
 grep -Fq "input: '$fastq_run/input/accessions.csv'" "$fastq_run/params.yml"
 bash -n "$fastq_run/run.sbatch"
 grep -Fq "download_method: 'sratools'" "$fastq_run/params.yml"
+grep -Fq "ena_metadata_fields: 'run_accession," "$fastq_run/params.yml"
+! grep -Fq "parent_study" "$fastq_run/params.yml"
 grep -Fq "skip_fastq_download: false" "$fastq_run/params.yml"
 grep -Fq $'fetchngs_version\t1.12.0' "$fastq_run/run_manifest.tsv"
+grep -Fq $'ena_metadata_fields\trun_accession,' "$fastq_run/run_manifest.tsv"
 grep -Fq $'nextflow_version\t24.04.4' "$fastq_run/run_manifest.tsv"
 
 HOME="$test_home" "$repo_root/bin/codespringflow" fetchngs \
@@ -88,8 +91,13 @@ submitted_run="$test_home/csl_results/fetchngs/smoke_submit"
 test "$(<"$submitted_run/job_id.txt")" = "424242"
 test "$(wc -l < "$submitted_run/job_history.txt")" -eq 1
 
+# Simulate a bundle generated before the ENA parent_study compatibility fix.
+sed -i '/^ena_metadata_fields:/d' "$submitted_run/params.yml"
 PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
   "$repo_root/bin/codespringflow" resume smoke_submit
 test "$(wc -l < "$submitted_run/job_history.txt")" -eq 2
+grep -Fq "ena_metadata_fields: 'run_accession," "$submitted_run/params.yml"
+! grep -Fq "parent_study" "$submitted_run/params.yml"
+test "$(grep -c '^ena_metadata_fields:' "$submitted_run/params.yml")" -eq 1
 
 echo "CodeSpringApp FetchNGS bundle smoke tests passed."

@@ -151,6 +151,12 @@ assert(
     show_analysis_tabs_pos < hide_fetch_tabs_pos,
   "analysis switching reveals and selects a destination before hiding the active source tab"
 )
+assert(
+  grepl("document.documentElement.classList.add('codespring-tabs-initializing')", app_text, fixed = TRUE) &&
+    grepl("Shiny.addCustomMessageHandler('codespring-tabs-ready'", app_text, fixed = TRUE) &&
+    grepl('session$sendCustomMessage("codespring-tabs-ready", list())', server_source, fixed = TRUE),
+  "FetchNGS tabs remain masked until the server applies the initial analysis tab state"
+)
 for (key in c("rna", "atac", "cutrun", "chip")) {
   tabs <- app_env$results_explorer_tabs(key)
   assert(identical(tabs[[1]], "Overview") && identical(tail(tabs, 1), "Files") && "QC" %in% tabs, paste(key, "follows the shared Results Explorer navigation contract"))

@@ -26,6 +26,10 @@ CONFIG_FILE="${CODESPRINGFLOW_CONFIG:-$APP_ROOT/conf/fetchngs_cshl_slurm.config}
 DEFAULT_NXF_VERSION="24.04.4"
 DEFAULT_PIPELINE_VERSION="1.12.0"
 DEFAULT_DOWNLOAD_METHOD="sratools"
+# ENA retired the parent_study read_run field in August 2026. FetchNGS 1.12.0
+# still requests it by default, which yields header-only runinfo files. Keep an
+# explicit compatible field list until the pinned pipeline release is updated.
+DEFAULT_ENA_METADATA_FIELDS="run_accession,experiment_accession,sample_accession,secondary_sample_accession,study_accession,secondary_study_accession,submission_accession,run_alias,experiment_alias,sample_alias,study_alias,library_layout,library_selection,library_source,library_strategy,library_name,instrument_model,instrument_platform,base_count,read_count,tax_id,scientific_name,sample_title,experiment_title,study_title,sample_description,fastq_md5,fastq_bytes,fastq_ftp,fastq_galaxy,fastq_aspera"
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -126,6 +130,7 @@ write_run_bundle() {
 input: '$copied_input'
 outdir: '$run_dir/results'
 download_method: '$DEFAULT_DOWNLOAD_METHOD'
+ena_metadata_fields: '$DEFAULT_ENA_METADATA_FIELDS'
 skip_fastq_download: $metadata_only
 EOF
 
@@ -189,6 +194,7 @@ EOF
         printf 'input_source\t%s\n' "$(readlink -f "$input_file")"
         printf 'copied_input\t%s\n' "$copied_input"
         printf 'download_method\t%s\n' "$DEFAULT_DOWNLOAD_METHOD"
+        printf 'ena_metadata_fields\t%s\n' "$DEFAULT_ENA_METADATA_FIELDS"
         printf 'metadata_only\t%s\n' "$metadata_only"
         printf 'fetchngs_version\t%s\n' "$pipeline_version"
         printf 'nextflow_version\t%s\n' "$nextflow_version"
@@ -202,6 +208,18 @@ EOF
     printf '%s\n' "$run_dir"
 }
 
+ensure_compatible_ena_metadata_fields() {
+    local run_name="$1"
+    local params_file
+
+    params_file="$(run_dir_for "$run_name")/params.yml"
+    [[ -f "$params_file" ]] || die "No parameter file exists for '$run_name'."
+    if grep -Eq '^[[:space:]]*ena_metadata_fields:' "$params_file"; then
+        return
+    fi
+    printf "ena_metadata_fields: '%s'\n" "$DEFAULT_ENA_METADATA_FIELDS" >> "$params_file"
+}
+
 submit_run() {
     local run_name="$1"
     local resume_mode="$2"
@@ -211,6 +229,9 @@ submit_run() {
 
     run_dir="$(run_dir_for "$run_name")"
     [[ -f "$run_dir/run.sbatch" ]] || die "No generated run exists for '$run_name'."
+    if [[ "$resume_mode" == "true" ]]; then
+        ensure_compatible_ena_metadata_fields "$run_name"
+    fi
     require_command sbatch
 
     if [[ "$resume_mode" == "true" ]]; then

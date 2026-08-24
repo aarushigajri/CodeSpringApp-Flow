@@ -11610,12 +11610,20 @@ select.form-control {
   line-height:1.2;
 }
 
+html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value="FetchNGS"]),
+html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value="FetchNGS Outputs"]),
+html.codespring-tabs-initializing .tab-content > .tab-pane[data-value="FetchNGS"],
+html.codespring-tabs-initializing .tab-content > .tab-pane[data-value="FetchNGS Outputs"] {
+  display:none !important;
+}
+
 "
 
 ui <- fluidPage(
   tags$head(
     tags$title("CodeSpringApp"),
     tags$style(HTML(app_css)),
+    tags$script(HTML("document.documentElement.classList.add('codespring-tabs-initializing');")),
     tags$script(src = "https://cdn.jsdelivr.net/npm/igv@3.0.2/dist/igv.min.js"),
     tags$script(HTML("
       function cslFormatElapsed(total) {
@@ -11770,6 +11778,12 @@ ui <- fluidPage(
         });
       }
       $(document).on('shiny:connected', function() {
+        if (window.Shiny && Shiny.addCustomMessageHandler && !window.codespringTabsReadyHandlerRegistered) {
+          window.codespringTabsReadyHandlerRegistered = true;
+          Shiny.addCustomMessageHandler('codespring-tabs-ready', function() {
+            document.documentElement.classList.remove('codespring-tabs-initializing');
+          });
+        }
         if (window.Shiny && Shiny.addCustomMessageHandler && !window.codespringIgvHandlerRegistered) {
           window.codespringIgvHandlerRegistered = true;
           Shiny.addCustomMessageHandler('codespring-igv-load', function(message) {
@@ -12023,6 +12037,7 @@ ui <- function(request) {
 server <- function(input, output, session) {
   projects <- reactiveVal(discover_projects())
   design_state <- reactiveVal(data.frame())
+  initial_tabs_ready <- reactiveVal(FALSE)
   # scRNA inputs live in a project-local manifest, separate from the bulk-RNA
   # design state. Keeping it reactive makes the same editable-table workflow
   # available without mutating the source manifest selected at project setup.
@@ -13291,6 +13306,13 @@ server <- function(input, output, session) {
     !is.null(selected) && length(selected) && nzchar(selected) && !identical(selected, "__new__")
   })
 
+  release_initial_tab_mask <- function() {
+    if (isTRUE(isolate(initial_tabs_ready()))) return(invisible(NULL))
+    initial_tabs_ready(TRUE)
+    session$sendCustomMessage("codespring-tabs-ready", list())
+    invisible(NULL)
+  }
+
   observe({
     fetchngs_mode <- is_fetchngs_analysis(input$analysis %||% "RNA-seq")
     fetchngs_tabs <- c("FetchNGS", "FetchNGS Outputs")
@@ -13302,6 +13324,7 @@ server <- function(input, output, session) {
         updateTabsetPanel(session, "web_main_tabs", selected = "FetchNGS")
       }
       lapply(analysis_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
+      release_initial_tab_mask()
       return(invisible(NULL))
     }
     viewer_only <- isTRUE(current_project()$external_results)
@@ -13318,6 +13341,7 @@ server <- function(input, output, session) {
       }
     }
     lapply(fetchngs_tabs, function(tab) hideTab("web_main_tabs", tab, session = session))
+    release_initial_tab_mask()
   })
 
   observeEvent(input$project_id, {
