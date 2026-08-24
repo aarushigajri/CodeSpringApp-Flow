@@ -599,6 +599,17 @@ fetchngs_latest_job_id <- function(run_dir) {
   if (length(value) && grepl("^[0-9]+$", value[[1]])) value[[1]] else ""
 }
 
+fetchngs_controller_log_files <- function(run_dir, job_id = fetchngs_latest_job_id(run_dir)) {
+  job_id <- trimws(as.character(job_id %||% ""))
+  if (length(job_id) != 1L || is.na(job_id) || !grepl("^[0-9]+$", job_id)) return(character(0))
+  candidates <- file.path(
+    run_dir,
+    "logs",
+    paste0("controller-", job_id, c(".out", ".err"))
+  )
+  candidates[file.exists(candidates) & !dir.exists(candidates)]
+}
+
 fetchngs_scheduler_state <- function(job_id) {
   if (!nzchar(job_id %||% "")) return("")
   if (nzchar(Sys.which("squeue"))) {
@@ -903,6 +914,7 @@ fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_s
   manifest <- fetchngs_read_manifest(run_dir)
   job_id <- fetchngs_latest_job_id(run_dir)
   scheduler_state <- if (isTRUE(query_scheduler)) fetchngs_scheduler_state(job_id) else ""
+  current_job_logs <- fetchngs_controller_log_files(run_dir, job_id)
   fastqs <- if (dir.exists(file.path(run_dir, "results"))) {
     list.files(file.path(run_dir, "results"), pattern = "\\.fastq\\.gz$", recursive = TRUE, full.names = TRUE)
   } else character(0)
@@ -920,6 +932,8 @@ fetchngs_run_summary <- function(run_name, root = FETCHNGS_RESULTS_ROOT, query_s
     paste("Failed/stopped:", scheduler_state)
   } else if (!nzchar(job_id)) {
     "Bundle only"
+  } else if (!length(current_job_logs)) {
+    "Submitted; waiting for Slurm"
   } else if (length(fastqs) || length(metadata)) {
     "Outputs present"
   } else {
@@ -1037,15 +1051,31 @@ fetchngs_output_preview_kind <- function(path) {
 }
 
 fetchngs_latest_log <- function(run_name, root = FETCHNGS_RESULTS_ROOT, lines = 160L) {
-  log_dir <- file.path(fetchngs_run_dir(run_name, root), "logs")
-  if (!dir.exists(log_dir)) return("No controller log directory exists yet.")
-  files <- list.files(log_dir, pattern = "^controller-.*\\.(out|err)$", full.names = TRUE)
-  if (!length(files)) return("No controller log exists yet. A bundle-only run has not been submitted.")
-  info <- file.info(files)
-  newest <- files[[which.max(info$mtime)]]
-  content <- readLines(newest, warn = FALSE)
-  content <- utils::tail(content, max(1L, as.integer(lines)))
-  paste(c(paste("Log:", newest), "", content), collapse = "\n")
+  run_dir <- fetchngs_run_dir(run_name, root)
+  job_id <- fetchngs_latest_job_id(run_dir)
+  if (!nzchar(job_id)) {
+    return("No current SLURM job is recorded. This run bundle has not been submitted yet.")
+  }
+  files <- fetchngs_controller_log_files(run_dir, job_id)
+  if (!length(files)) {
+    return(paste0(
+      "SLURM job ", job_id, " is the current submission. Its controller log has not been created yet; ",
+      "the job may still be entering the scheduler. Older controller logs are intentionally hidden."
+    ))
+  }
+  sizes <- suppressWarnings(file.info(files)$size)
+  files <- files[is.finite(sizes) & sizes > 0]
+  if (!length(files)) {
+    return(paste0(
+      "SLURM job ", job_id, " is the current submission. Its controller log files exist but are still empty."
+    ))
+  }
+  max_lines <- max(1L, as.integer(lines))
+  sections <- unlist(lapply(files, function(path) {
+    content <- utils::tail(readLines(path, warn = FALSE), max_lines)
+    c(paste("Log:", path), "", content, "")
+  }), use.names = FALSE)
+  paste(c(paste("Current SLURM job:", job_id), "", sections), collapse = "\n")
 }
 
 delete_fetchngs_run <- function(
@@ -11610,6 +11640,13 @@ select.form-control {
   line-height:1.2;
 }
 
+/* The server still owns tab switching; this only prevents FetchNGS tabs from
+   appearing during the initial RNA-seq browser paint before Shiny connects. */
+body:not(:has(#analysis option[value='FetchNGS']:checked)) #web_main_tabs > li:has(> a[data-value='FetchNGS']),
+body:not(:has(#analysis option[value='FetchNGS']:checked)) #web_main_tabs > li:has(> a[data-value='FetchNGS Outputs']) {
+  display:none !important;
+}
+
 "
 
 ui <- fluidPage(
@@ -11922,7 +11959,7 @@ ui <- fluidPage(
                           br(),
                           table_output("fetchngs_runs_table"),
                           br(),
-                          h4("Newest controller log"),
+                          h4("Current job controller log"),
                           tags$pre(class = "log-viewer", textOutput("fetchngs_log_text"))
                    )
                  )),
@@ -12571,6 +12608,7 @@ server <- function(input, output, session) {
   })
 
   output$fetchngs_runs_table <- render_csl_table({
+    invalidateLater(15000, session)
     fetchngs_refresh()
     root <- safe_active_fetchngs_results_root()
     if (!nzchar(root)) return(data.frame())
@@ -12578,9 +12616,10 @@ server <- function(input, output, session) {
   }, page_length = 10, scroll_y = "360px")
 
   output$fetchngs_log_text <- renderText({
+    invalidateLater(5000, session)
     fetchngs_refresh()
     run_name <- input$fetchngs_selected_run %||% ""
-    if (!nzchar(run_name)) return("Select a FetchNGS run to view its newest controller log.")
+    if (!nzchar(run_name)) return("Select a FetchNGS run to view its current controller log.")
     root <- safe_active_fetchngs_results_root()
     if (!nzchar(root)) return("Choose a valid FetchNGS results folder.")
     tryCatch(fetchngs_latest_log(run_name, root = root), error = function(e) paste("Could not read the selected log:", conditionMessage(e)))
@@ -12707,13 +12746,27 @@ server <- function(input, output, session) {
       backup_path <- replace_fetchngs_run_accession_input(context$input_path, submit_accessions, context$run_dir)
       backup_message <- paste("Original accession list backed up to:", backup_path)
     }
+    previous_job_id <- fetchngs_latest_job_id(context$run_dir)
     output <- run_fetchngs_cli(c("resume", context$run_name), results_root = context$results_root)
+    job_id <- fetchngs_latest_job_id(context$run_dir)
+    if (!nzchar(job_id)) {
+      stop("The resume command completed without recording a new numeric SLURM job ID.")
+    }
+    if (identical(job_id, previous_job_id)) {
+      stop("The resume command did not record a new SLURM job ID; the UI will not treat the previous job as a new resume.")
+    }
+    updateSelectInput(session, "fetchngs_selected_run", selected = context$run_name)
+    fetchngs_refresh(fetchngs_refresh() + 1L)
     safety_message <- if (!is.null(preflight)) {
       fetchngs_safety_message(preflight, prefix = "Resume safety check passed", unknown_size_action = unknown_size_action)
     } else {
       "Metadata-only run: no FASTQ size or storage check was required."
     }
-    paste(c(output, "", safety_message, backup_message), collapse = "\n")
+    resume_message <- paste0(
+      "Resume submitted for ", context$run_name, " as SLURM job ", job_id,
+      ". The status table and current-job log now follow this submission automatically."
+    )
+    paste(c(resume_message, "", output, "", safety_message, backup_message), collapse = "\n")
   }
 
   observeEvent(input$submit_fetchngs, {

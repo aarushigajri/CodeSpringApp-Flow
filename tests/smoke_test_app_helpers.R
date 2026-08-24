@@ -379,6 +379,26 @@ assert(
   length(limited_fetchngs_files) == 2L && isTRUE(attr(limited_fetchngs_files, "truncated")),
   "FetchNGS output scanning is bounded so large result trees cannot block the app indefinitely"
 )
+fetchngs_log_dir <- file.path(fetchngs_run, "logs")
+dir.create(fetchngs_log_dir, recursive = TRUE, showWarnings = FALSE)
+writeLines("900002", file.path(fetchngs_run, "job_id.txt"))
+writeLines("OLD FAILURE THAT MUST NOT BE SHOWN", file.path(fetchngs_log_dir, "controller-900001.err"))
+waiting_fetchngs_log <- app_env$fetchngs_latest_log("app_helper_smoke", fetchngs_root)
+waiting_fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_root, query_scheduler = FALSE)
+assert(
+  grepl("SLURM job 900002 is the current submission", waiting_fetchngs_log, fixed = TRUE) &&
+    !grepl("OLD FAILURE", waiting_fetchngs_log, fixed = TRUE) &&
+    identical(waiting_fetchngs_summary$Status[[1]], "Submitted; waiting for Slurm"),
+  "FetchNGS follows a newly recorded resume job while Slurm creates its current controller log"
+)
+writeLines("CURRENT RESUME LOG", file.path(fetchngs_log_dir, "controller-900002.out"))
+current_fetchngs_log <- app_env$fetchngs_latest_log("app_helper_smoke", fetchngs_root)
+assert(
+  grepl("Current SLURM job: 900002", current_fetchngs_log, fixed = TRUE) &&
+    grepl("CURRENT RESUME LOG", current_fetchngs_log, fixed = TRUE) &&
+    !grepl("OLD FAILURE", current_fetchngs_log, fixed = TRUE),
+  "FetchNGS displays only the current resumed job's controller logs"
+)
 assert(
   app_env$fetchngs_job_is_active("RUNNING") &&
     app_env$fetchngs_job_is_active("PENDING") &&
@@ -423,7 +443,12 @@ assert(
     grepl('fetchngs_unknown_size_ack', server_source, fixed = TRUE) &&
     grepl("fetchngs_download_preflight(accessions, results_root = results_root)", server_source, fixed = TRUE) &&
     grepl("Rechecking accession and download safety before resuming", server_source, fixed = TRUE) &&
-    grepl("manifest <- fetchngs_read_manifest(run_dir)", server_source, fixed = TRUE),
+    grepl("manifest <- fetchngs_read_manifest(run_dir)", server_source, fixed = TRUE) &&
+    grepl("Resume submitted for", server_source, fixed = TRUE) &&
+    grepl("job_id <- fetchngs_latest_job_id(context$run_dir)", server_source, fixed = TRUE) &&
+    grepl("body:not(:has(#analysis option[value='FetchNGS']:checked))", app_text, fixed = TRUE) &&
+    !grepl("codespring-tabs-initializing", app_text, fixed = TRUE) &&
+    !grepl("codespring-tabs-ready", app_text, fixed = TRUE),
   "the app exposes FetchNGS location, creation, status, output viewing, resume, and confirmed deletion controls"
 )
 
