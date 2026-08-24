@@ -123,7 +123,7 @@ normalize_csl_table_data <- function(df) {
   df
 }
 
-render_csl_table <- function(expr, page_length = 50, editable = FALSE, scroll_y = "520px", escape = TRUE) {
+render_csl_table <- function(expr, page_length = 50, editable = FALSE, scroll_y = "520px", escape = TRUE, selection = "multiple") {
   expr_call <- substitute(expr)
   expr_env <- parent.frame()
   if (DT_AVAILABLE) {
@@ -147,6 +147,7 @@ render_csl_table <- function(expr, page_length = 50, editable = FALSE, scroll_y 
         editable = editable,
         rownames = FALSE,
         escape = escape,
+        selection = selection,
         options = list(
           scrollX = TRUE,
           scrollY = scroll_y,
@@ -653,6 +654,15 @@ fetchngs_job_is_active <- function(state) {
 fetchngs_job_is_terminal <- function(state) {
   toupper(trimws(as.character(state %||% ""))) %in%
     c("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE", "REVOKED", "SPECIAL_EXIT")
+}
+
+fetchngs_job_submission_is_recent <- function(run_dir, seconds = 300) {
+  job_id_path <- file.path(run_dir, "job_id.txt")
+  if (!file.exists(job_id_path)) return(FALSE)
+  modified <- suppressWarnings(file.info(job_id_path)$mtime[[1L]])
+  if (length(modified) != 1L || is.na(modified)) return(FALSE)
+  age <- as.numeric(difftime(Sys.time(), modified, units = "secs"))
+  is.finite(age) && age >= 0 && age <= as.numeric(seconds)
 }
 
 fetchngs_human_size <- function(bytes) {
@@ -11966,9 +11976,7 @@ ui <- fluidPage(
                           tags$p(class = "muted small-note", "The default remains the current user's csl_results/fetchngs folder. Nextflow cache and work files are always kept separately."),
                           h4("Existing FetchNGS runs"),
                           uiOutput("fetchngs_run_select_ui"),
-                          div(class = "button-row",
-                              actionButton("resume_fetchngs", "Resume selected run"),
-                              actionButton("delete_fetchngs", "Delete selected run", class = "btn-danger")),
+                          uiOutput("fetchngs_run_actions_ui"),
                           br(),
                           table_output("fetchngs_runs_table"),
                           br(),
@@ -12620,13 +12628,87 @@ server <- function(input, output, session) {
     )
   })
 
+  output$fetchngs_run_actions_ui <- renderUI({
+    invalidateLater(15000, session)
+    fetchngs_refresh()
+    root <- safe_active_fetchngs_results_root()
+    if (!nzchar(root)) return(NULL)
+    runs <- rev(fetchngs_run_names(root))
+    if (!length(runs)) return(NULL)
+    selected <- input$fetchngs_selected_run %||% ""
+    if (!selected %in% runs) selected <- runs[[1L]]
+    run_dir <- fetchngs_run_dir(selected, root)
+    job_id <- fetchngs_latest_job_id(run_dir)
+    state <- fetchngs_scheduler_state(job_id)
+    active <- fetchngs_job_is_active(state)
+    recent <- nzchar(job_id) && !nzchar(state) && fetchngs_job_submission_is_recent(run_dir)
+    completed <- identical(toupper(trimws(state)), "COMPLETED")
+    resume_blocked <- active || recent || completed
+    delete_blocked <- active || recent
+    action_title <- if (active) {
+      paste("SLURM job", job_id, "is", state, "for this run.")
+    } else if (recent) {
+      paste("SLURM job", job_id, "was submitted recently and may still be registering.")
+    } else {
+      "Resume or delete the selected FetchNGS run."
+    }
+    resume_title <- if (completed) {
+      paste("SLURM job", job_id, "completed successfully. Resume is only available for failed or stopped runs.")
+    } else {
+      action_title
+    }
+    delete_title <- if (completed) {
+      "Delete the selected completed FetchNGS run."
+    } else {
+      action_title
+    }
+    div(
+      class = "button-row",
+      actionButton(
+        "resume_fetchngs", "Resume selected run",
+        disabled = if (resume_blocked) "disabled" else NULL,
+        `aria-disabled` = if (resume_blocked) "true" else "false",
+        title = resume_title
+      ),
+      actionButton(
+        "delete_fetchngs", "Delete selected run", class = "btn-danger",
+        disabled = if (delete_blocked) "disabled" else NULL,
+        `aria-disabled` = if (delete_blocked) "true" else "false",
+        title = delete_title
+      )
+    )
+  })
+
   output$fetchngs_runs_table <- render_csl_table({
     invalidateLater(15000, session)
     fetchngs_refresh()
     root <- safe_active_fetchngs_results_root()
     if (!nzchar(root)) return(data.frame())
     fetchngs_runs_table(root = root, query_scheduler = TRUE)
-  }, page_length = 10, scroll_y = "360px")
+  }, page_length = 10, scroll_y = "360px", selection = "single")
+
+  observeEvent(input$fetchngs_runs_table_rows_selected, {
+    selected_rows <- input$fetchngs_runs_table_rows_selected %||% integer(0)
+    if (!length(selected_rows)) return()
+
+    row_index <- suppressWarnings(as.integer(selected_rows[[1L]]))
+    if (is.na(row_index) || row_index < 1L) return()
+
+    root <- safe_active_fetchngs_results_root()
+    if (!nzchar(root)) return()
+
+    runs <- fetchngs_runs_table(root = root, query_scheduler = FALSE)
+    if (!NROW(runs) || row_index > NROW(runs) || !"Run" %in% names(runs)) return()
+
+    run_name <- trimws(as.character(runs$Run[[row_index]] %||% ""))
+    if (!nzchar(run_name)) return()
+
+    updateSelectInput(
+      session,
+      "fetchngs_selected_run",
+      selected = run_name
+    )
+  }, ignoreInit = TRUE)
 
   output$fetchngs_log_text <- renderText({
     invalidateLater(5000, session)

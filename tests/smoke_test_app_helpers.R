@@ -426,6 +426,30 @@ assert(
     !app_env$fetchngs_job_is_terminal("UNKNOWN_TRANSITION"),
   "FetchNGS deletion distinguishes active jobs from terminal jobs"
 )
+# Simulate a successful resume replacing the previous job ID.
+writeLines(c("111111", "222222"), file.path(fetchngs_run, "job_history.txt"))
+writeLines("222222", file.path(fetchngs_run, "job_id.txt"))
+dir.create(file.path(fetchngs_run, "logs"), recursive = TRUE, showWarnings = FALSE)
+writeLines("resumed controller log", file.path(fetchngs_run, "logs", "controller-222222.out"))
+original_fetchngs_scheduler_state <- app_env$fetchngs_scheduler_state
+app_env$fetchngs_scheduler_state <- function(job_id) if (identical(job_id, "222222")) "RUNNING" else ""
+resumed_fetchngs_summary <- app_env$fetchngs_run_summary("app_helper_smoke", fetchngs_root, query_scheduler = TRUE)
+resumed_fetchngs_log <- app_env$fetchngs_latest_log("app_helper_smoke", fetchngs_root)
+app_env$fetchngs_scheduler_state <- original_fetchngs_scheduler_state
+assert(
+  identical(resumed_fetchngs_summary$`Job ID`[[1]], "222222") &&
+    identical(resumed_fetchngs_summary$Status[[1]], "Running") &&
+    grepl("controller-222222.out", resumed_fetchngs_log, fixed = TRUE) &&
+    grepl("resumed controller log", resumed_fetchngs_log, fixed = TRUE) &&
+    isTRUE(app_env$fetchngs_job_submission_is_recent(fetchngs_run)),
+  "FetchNGS resume synchronization replaces the old job ID and follows the new status and controller log"
+)
+Sys.setFileTime(file.path(fetchngs_run, "job_id.txt"), Sys.time() - 600)
+assert(
+  !app_env$fetchngs_job_submission_is_recent(fetchngs_run),
+  "FetchNGS recent-submission protection expires after the scheduler registration window"
+)
+
 fetchngs_delete_message <- app_env$delete_fetchngs_run(
   "app_helper_smoke",
   results_root = fetchngs_root,
@@ -440,6 +464,7 @@ assert(
     dir.exists(fetchngs_root),
   "FetchNGS deletion removes only the selected result and work folders while keeping the results root"
 )
+initial_fetchngs_ui <- as.character(htmltools::renderTags(app_env$MAIN_UI)$html)
 assert(
     grepl('tabPanel("FetchNGS"', app_text, fixed = TRUE) &&
     grepl('tabPanel("FetchNGS Outputs"', app_text, fixed = TRUE) &&
@@ -448,8 +473,21 @@ assert(
     grepl('"fetchngs_results_mode", "FetchNGS results folder"', app_text, fixed = TRUE) &&
     grepl('actionButton("browse_fetchngs_results_root"', app_text, fixed = TRUE) &&
     grepl('actionButton("submit_fetchngs"', app_text, fixed = TRUE) &&
-    grepl('actionButton("resume_fetchngs"', app_text, fixed = TRUE) &&
-    grepl('actionButton("delete_fetchngs"', app_text, fixed = TRUE) &&
+    grepl('uiOutput("fetchngs_run_actions_ui")', app_text, fixed = TRUE) &&
+    grepl('selection = "single"', app_text, fixed = TRUE) &&
+    grepl("fetchngs_runs_table_rows_selected", app_text, fixed = TRUE) &&
+    grepl('updateSelectInput(session, "fetchngs_selected_run"', app_text, fixed = TRUE) &&
+    grepl('"resume_fetchngs", "Resume selected run"', server_source, fixed = TRUE) &&
+    grepl('"delete_fetchngs", "Delete selected run"', server_source, fixed = TRUE) &&
+    grepl('completed <- identical(toupper(trimws(state)), "COMPLETED")', app_text, fixed = TRUE) &&
+    grepl("resume_blocked <- active || recent || completed", app_text, fixed = TRUE) &&
+    grepl("delete_blocked <- active || recent", app_text, fixed = TRUE) &&
+    grepl('disabled = if (resume_blocked) "disabled" else NULL', app_text, fixed = TRUE) &&
+    grepl('disabled = if (delete_blocked) "disabled" else NULL', app_text, fixed = TRUE) &&
+    grepl("fetchngs_job_submission_is_recent(run_dir)", server_source, fixed = TRUE) &&
+    grepl("fetchngs_run_actions_ui", initial_fetchngs_ui, fixed = TRUE) &&
+    !grepl("resume_fetchngs", initial_fetchngs_ui, fixed = TRUE) &&
+    !grepl("delete_fetchngs", initial_fetchngs_ui, fixed = TRUE) &&
     grepl('actionButton("confirm_delete_fetchngs"', server_source, fixed = TRUE) &&
     grepl('tags$strong("Accepted accessions")', app_text, fixed = TRUE) &&
     grepl('tags$strong("Download safeguards")', app_text, fixed = TRUE) &&
