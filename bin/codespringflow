@@ -219,42 +219,137 @@ ensure_compatible_ena_metadata_fields() {
     printf "ena_metadata_fields: '%s'\n" "$DEFAULT_ENA_METADATA_FIELDS" >> "$params_file"
 }
 
+resume_run_script_is_valid() {
+    local run_script="$1"
+    local nf_run_name="$2"
+
+    [[ -s "$run_script" ]] || return 1
+    bash -n "$run_script" >/dev/null 2>&1 || return 1
+    grep -Fq "resume_args=(-name \"$nf_run_name\")" "$run_script" || return 1
+    grep -Fq 'resume_args=(-resume)' "$run_script" || return 1
+    grep -Fq '"${resume_args[@]}"' "$run_script" || return 1
+    ! grep -Eq "(^|[[:space:]])-name[[:space:]]+\"${nf_run_name}\"([[:space:]]|$)" "$run_script"
+}
+
 ensure_compatible_resume_cli() {
     local run_name="$1"
     local nf_run_name
     local run_script
     local backup_script
+    local source_script
     local migrated_script
 
     nf_run_name="${run_name//[^A-Za-z0-9_]/_}"
     run_script="$(run_dir_for "$run_name")/run.sbatch"
+    backup_script="${run_script}.pre-resume-cli-fix"
     [[ -f "$run_script" ]] || die "No generated run exists for '$run_name'."
 
-    # Older CodeSpringApp bundles always supplied -name and then added -resume.
-    # Nextflow rejects that combination because the run name already exists.
-    if grep -Fq 'resume_args=()' "$run_script" && grep -Fq "    -name \"$nf_run_name\"" "$run_script"; then
-        backup_script="${run_script}.pre-resume-cli-fix"
-        [[ -e "$backup_script" ]] || cp -p -- "$run_script" "$backup_script"
-        migrated_script="$(mktemp "${run_script}.migrate.XXXXXX")"
+    if resume_run_script_is_valid "$run_script" "$nf_run_name"; then
+        return
+    fi
+
+    source_script="$run_script"
+    if [[ ! -s "$run_script" ]]; then
+        [[ -s "$backup_script" ]] ||
+            die "The generated run script is empty and no non-empty recovery backup exists for '$run_name'."
+        source_script="$backup_script"
+    fi
+
+    migrated_script="$(mktemp "${run_script}.migrate.XXXXXX")"
+    if resume_run_script_is_valid "$source_script" "$nf_run_name"; then
+        cp -p -- "$source_script" "$migrated_script"
+    else
+        if ! grep -Fq 'resume_args=()' "$source_script" ||
+           ! grep -Eq "(^|[[:space:]])-name[[:space:]]+\"${nf_run_name}\"([[:space:]]|$)" "$source_script"; then
+            rm -f -- "$migrated_script"
+            die "The generated run script has an unsupported resume format for '$run_name'."
+        fi
         if ! awk -v run_name="$nf_run_name" '
             $0 == "resume_args=()" {
                 print "resume_args=(-name \"" run_name "\")"
                 next
             }
-            index($0, "    -name \"" run_name "\"") == 1 { next }
-            { print }
-        ' "$run_script" > "$migrated_script"; then
+            {
+                fixed_name = "-name \"" run_name "\""
+                position = index($0, fixed_name)
+                if (position > 0 && $0 !~ /^resume_args=/) {
+                    before = substr($0, 1, position - 1)
+                    after = substr($0, position + length(fixed_name))
+                    if (before ~ /^[[:space:]]*$/ && after ~ /^[[:space:]]*\\[[:space:]]*$/) next
+                    sub(/[[:space:]]+$/, "", before)
+                    sub(/^[[:space:]]+/, " ", after)
+                    print before after
+                    next
+                }
+                print
+            }
+        ' "$source_script" > "$migrated_script"; then
             rm -f -- "$migrated_script"
             die "Could not migrate the resume command for '$run_name'."
         fi
-        chmod 0750 "$migrated_script"
-        mv -- "$migrated_script" "$run_script"
     fi
 
-    grep -Fq "resume_args=(-name \"$nf_run_name\")" "$run_script" ||
-        die "The generated run script has an unsupported resume format for '$run_name'."
-    if grep -Fq "    -name \"$nf_run_name\"" "$run_script"; then
-        die "The generated run script still contains a conflicting fixed Nextflow run name for '$run_name'."
+    if ! resume_run_script_is_valid "$migrated_script" "$nf_run_name"; then
+        rm -f -- "$migrated_script"
+        die "The resume migration candidate failed validation for '$run_name'; the original run script was left unchanged."
+    fi
+
+    if [[ "$source_script" == "$run_script" && ! -e "$backup_script" ]]; then
+        cp -p -- "$run_script" "$backup_script"
+    fi
+    chmod 0750 "$migrated_script"
+    mv -- "$migrated_script" "$run_script"
+}
+
+fetchngs_scheduler_state_for_job() {
+    local job_id="$1"
+    local state=""
+
+    if command -v squeue >/dev/null 2>&1; then
+        state="$(squeue -h -j "$job_id" -o '%T' 2>/dev/null | awk 'NF { print toupper($1); exit }' || true)"
+    fi
+    if [[ -z "$state" ]] && command -v sacct >/dev/null 2>&1; then
+        state="$(sacct -n -X -j "$job_id" --format=State 2>/dev/null | awk '
+            NF {
+                state = toupper($1)
+                sub(/[+ ].*$/, "", state)
+                print state
+                exit
+            }
+        ' || true)"
+    fi
+    printf '%s\n' "$state"
+}
+
+fetchngs_scheduler_state_is_active() {
+    case "${1^^}" in
+        RUNNING|PENDING|CONFIGURING|COMPLETING|RESIZING|SUSPENDED) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_no_active_fetchngs_job() {
+    local run_name="$1"
+    local run_dir
+    local job_id_path
+    local job_id
+    local state
+
+    run_dir="$(run_dir_for "$run_name")"
+    job_id_path="$run_dir/job_id.txt"
+    [[ -s "$job_id_path" ]] || return 0
+    job_id="$(head -n 1 "$job_id_path")"
+    [[ "$job_id" =~ ^[0-9]+$ ]] || return 0
+
+    state="$(fetchngs_scheduler_state_for_job "$job_id")"
+    if fetchngs_scheduler_state_is_active "$state"; then
+        die "Run $run_name still has active SLURM job $job_id ($state). Wait for it to finish or cancel it before resuming."
+    fi
+    if [[ "${state^^}" == "COMPLETED" ]]; then
+        die "Run $run_name completed successfully as SLURM job $job_id. Resume is only available for failed or stopped runs."
+    fi
+    if [[ -z "$state" ]] && find "$job_id_path" -mmin -5 -print -quit | grep -q .; then
+        die "Run $run_name was submitted recently as SLURM job $job_id. Wait for Slurm to register it before trying Resume again."
     fi
 }
 
@@ -268,6 +363,7 @@ submit_run() {
     run_dir="$(run_dir_for "$run_name")"
     [[ -f "$run_dir/run.sbatch" ]] || die "No generated run exists for '$run_name'."
     if [[ "$resume_mode" == "true" ]]; then
+        ensure_no_active_fetchngs_job "$run_name"
         ensure_compatible_resume_cli "$run_name"
         ensure_compatible_ena_metadata_fields "$run_name"
     fi

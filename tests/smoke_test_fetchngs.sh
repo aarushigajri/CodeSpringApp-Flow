@@ -84,6 +84,9 @@ fake_bin="$test_root/fake-bin"
 mkdir -p "$fake_bin"
 printf '#!/usr/bin/env bash\nprintf "Submitted batch job 424242\\n"\n' > "$fake_bin/sbatch"
 chmod 0755 "$fake_bin/sbatch"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/squeue"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/sacct"
+chmod 0755 "$fake_bin/squeue" "$fake_bin/sacct"
 
 # Execute a generated controller script with fake cluster/Nextflow commands and
 # verify that initial and resumed runs receive mutually exclusive CLI options.
@@ -121,6 +124,7 @@ test "$(wc -l < "$submitted_run/job_history.txt")" -eq 1
 sed -i '/^ena_metadata_fields:/d' "$submitted_run/params.yml"
 sed -i 's/^resume_args=(-name "smoke_submit")$/resume_args=()/' "$submitted_run/run.sbatch"
 sed -i '/    -with-report/i\    -name "smoke_submit" \\' "$submitted_run/run.sbatch"
+touch -d '10 minutes ago' "$submitted_run/job_id.txt"
 PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
   "$repo_root/bin/codespringflow" resume smoke_submit
 test "$(wc -l < "$submitted_run/job_history.txt")" -eq 2
@@ -130,5 +134,105 @@ test "$(grep -c '^ena_metadata_fields:' "$submitted_run/params.yml")" -eq 1
 test -f "$submitted_run/run.sbatch.pre-resume-cli-fix"
 grep -Fq 'resume_args=(-name "smoke_submit")' "$submitted_run/run.sbatch"
 ! grep -Fq '    -name "smoke_submit"' "$submitted_run/run.sbatch"
+
+# Reproduce the real legacy layout where the fixed -name option was embedded
+# in the same physical line as the rest of the Nextflow command.
+HOME="$test_home" "$repo_root/bin/codespringflow" fetchngs \
+  --input "$input_file" \
+  --name smoke_inline_legacy \
+  --dry-run
+inline_legacy_run="$test_home/csl_results/fetchngs/smoke_inline_legacy"
+sed -i 's/^resume_args=(-name "smoke_inline_legacy")$/resume_args=()/' "$inline_legacy_run/run.sbatch"
+sed -i 's/    -with-report/    -name "smoke_inline_legacy"    -with-report/' "$inline_legacy_run/run.sbatch"
+PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_inline_legacy
+bash -n "$inline_legacy_run/run.sbatch"
+grep -Fq 'resume_args=(-name "smoke_inline_legacy")' "$inline_legacy_run/run.sbatch"
+! grep -Fq '    -name "smoke_inline_legacy"' "$inline_legacy_run/run.sbatch"
+grep -Fq -- '-with-report' "$inline_legacy_run/run.sbatch"
+
+# Recover an empty active script only from a validated non-empty backup.
+HOME="$test_home" "$repo_root/bin/codespringflow" fetchngs \
+  --input "$input_file" \
+  --name smoke_empty_recovery \
+  --dry-run
+empty_recovery_run="$test_home/csl_results/fetchngs/smoke_empty_recovery"
+cp -p -- "$empty_recovery_run/run.sbatch" "$empty_recovery_run/run.sbatch.pre-resume-cli-fix"
+: > "$empty_recovery_run/run.sbatch"
+PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_empty_recovery
+test -s "$empty_recovery_run/run.sbatch"
+bash -n "$empty_recovery_run/run.sbatch"
+grep -Fq 'resume_args=(-name "smoke_empty_recovery")' "$empty_recovery_run/run.sbatch"
+
+# An empty script without a usable backup must never reach sbatch.
+HOME="$test_home" "$repo_root/bin/codespringflow" fetchngs \
+  --input "$input_file" \
+  --name smoke_empty_reject \
+  --dry-run
+empty_reject_run="$test_home/csl_results/fetchngs/smoke_empty_reject"
+: > "$empty_reject_run/run.sbatch"
+empty_reject_error="$test_root/empty-reject.err"
+if PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_empty_reject >"$empty_reject_error" 2>&1; then
+  echo "An empty FetchNGS run script without a backup was submitted." >&2
+  exit 1
+fi
+grep -Fq "run script is empty and no non-empty recovery backup exists" "$empty_reject_error"
+test ! -e "$empty_reject_run/job_id.txt"
+
+# A scheduler-active job must block a second resume submission.
+printf '#!/usr/bin/env bash\nprintf "RUNNING\\n"\n' > "$fake_bin/squeue"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/sacct"
+chmod 0755 "$fake_bin/squeue" "$fake_bin/sacct"
+active_history_count="$(wc -l < "$submitted_run/job_history.txt")"
+active_error="$test_root/active-resume.err"
+if PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_submit >"$active_error" 2>&1; then
+  echo "An active FetchNGS run accepted a duplicate resume submission." >&2
+  exit 1
+fi
+grep -Fq "still has active SLURM job 424242 (RUNNING)" "$active_error"
+test "$(wc -l < "$submitted_run/job_history.txt")" -eq "$active_history_count"
+
+# If Slurm has not registered a fresh job yet, its recent job-id file still
+# blocks a rapid second click during the scheduler visibility delay.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/squeue"
+recent_error="$test_root/recent-resume.err"
+if PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_submit >"$recent_error" 2>&1; then
+  echo "A recently submitted FetchNGS run accepted a duplicate resume." >&2
+  exit 1
+fi
+grep -Fq "was submitted recently as SLURM job 424242" "$recent_error"
+test "$(wc -l < "$submitted_run/job_history.txt")" -eq "$active_history_count"
+
+# A successfully completed run must reject Resume before reaching sbatch.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/squeue"
+printf '#!/usr/bin/env bash\nprintf "COMPLETED\\n"\n' > "$fake_bin/sacct"
+chmod 0755 "$fake_bin/squeue" "$fake_bin/sacct"
+
+completed_history_count="$(wc -l < "$submitted_run/job_history.txt")"
+completed_error="$test_root/completed-resume.err"
+
+if PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_submit >"$completed_error" 2>&1; then
+  echo "A completed FetchNGS run incorrectly accepted Resume." >&2
+  exit 1
+fi
+
+grep -Fq "completed successfully as SLURM job 424242" "$completed_error"
+grep -Fq "Resume is only available for failed or stopped runs" "$completed_error"
+test "$(wc -l < "$submitted_run/job_history.txt")" -eq "$completed_history_count"
+
+# A failed terminal state must remain resumable.
+printf '#!/usr/bin/env bash\nprintf "FAILED\\n"\n' > "$fake_bin/sacct"
+chmod 0755 "$fake_bin/sacct"
+
+PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
+  "$repo_root/bin/codespringflow" resume smoke_submit >"$test_root/failed-resume.out"
+
+grep -Fq "Submitted batch job 424242" "$test_root/failed-resume.out"
+test "$(wc -l < "$submitted_run/job_history.txt")" -eq "$((completed_history_count + 1))"
 
 echo "CodeSpringApp FetchNGS bundle smoke tests passed."
