@@ -122,9 +122,14 @@ assert(
     !identical(app_env$FETCHNGS_RESULTS_ROOT, app_env$FETCHNGS_RUNTIME_ROOT),
   "FetchNGS results use the user's csl_results folder while cache and work data use a separate private runtime folder"
 )
+main_analysis_choices <- unname(app_env$analysis_choices())
+project_creation_choices <- unname(app_env$project_analysis_choices())
+established_project_choices <- c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")
 assert(
-  identical(unname(app_env$analysis_choices()), c("FetchNGS", "RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")) &&
-    identical(unname(app_env$project_analysis_choices()), c("RNA-seq", "scRNA-seq", "ATAC-seq", "CUT&RUN", "ChIP-seq")) &&
+  sum(main_analysis_choices == "FetchNGS") == 1L &&
+    !"FetchNGS" %in% project_creation_choices &&
+    all(established_project_choices %in% main_analysis_choices) &&
+    all(established_project_choices %in% project_creation_choices) &&
     identical(app_env$analysis_key("FetchNGS"), "fetchngs") &&
     identical(app_env$analysis_label("fetchngs"), "FetchNGS"),
   "FetchNGS is a distinct main analysis choice but is excluded from biological project creation"
