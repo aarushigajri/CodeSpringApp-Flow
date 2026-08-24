@@ -29,6 +29,9 @@ test -f "$fastq_run/input/accessions.csv"
 cmp "$input_file" "$fastq_run/input/accessions.csv"
 grep -Fq "input: '$fastq_run/input/accessions.csv'" "$fastq_run/params.yml"
 bash -n "$fastq_run/run.sbatch"
+grep -Fq 'resume_args=(-name "smoke_fastq")' "$fastq_run/run.sbatch"
+grep -Fq '    resume_args=(-resume)' "$fastq_run/run.sbatch"
+! grep -Fq '    -name "smoke_fastq"' "$fastq_run/run.sbatch"
 grep -Fq "download_method: 'sratools'" "$fastq_run/params.yml"
 grep -Fq "ena_metadata_fields: 'run_accession," "$fastq_run/params.yml"
 ! grep -Fq "parent_study" "$fastq_run/params.yml"
@@ -82,6 +85,29 @@ mkdir -p "$fake_bin"
 printf '#!/usr/bin/env bash\nprintf "Submitted batch job 424242\\n"\n' > "$fake_bin/sbatch"
 chmod 0755 "$fake_bin/sbatch"
 
+# Execute a generated controller script with fake cluster/Nextflow commands and
+# verify that initial and resumed runs receive mutually exclusive CLI options.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/module"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "$NEXTFLOW_ARGS_FILE"\n' > "$fake_bin/nextflow"
+chmod 0755 "$fake_bin/module" "$fake_bin/nextflow"
+PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN="$fake_bin/nextflow" \
+  "$repo_root/bin/codespringflow" fetchngs \
+  --input "$input_file" \
+  --name smoke_cli \
+  --dry-run
+cli_run="$test_home/csl_results/fetchngs/smoke_cli"
+initial_args="$test_root/nextflow-initial.args"
+resume_args="$test_root/nextflow-resume.args"
+PATH="$fake_bin:$PATH" NEXTFLOW_ARGS_FILE="$initial_args" SLURM_JOB_ID=1001 \
+  bash "$cli_run/run.sbatch"
+grep -Fxq -- '-name' "$initial_args"
+grep -Fxq -- 'smoke_cli' "$initial_args"
+! grep -Fxq -- '-resume' "$initial_args"
+PATH="$fake_bin:$PATH" NEXTFLOW_ARGS_FILE="$resume_args" SLURM_JOB_ID=1002 \
+  CODESPRINGFLOW_RESUME=true bash "$cli_run/run.sbatch"
+grep -Fxq -- '-resume' "$resume_args"
+! grep -Fxq -- '-name' "$resume_args"
+
 PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
   "$repo_root/bin/codespringflow" fetchngs \
   --input "$input_file" \
@@ -91,13 +117,18 @@ submitted_run="$test_home/csl_results/fetchngs/smoke_submit"
 test "$(<"$submitted_run/job_id.txt")" = "424242"
 test "$(wc -l < "$submitted_run/job_history.txt")" -eq 1
 
-# Simulate a bundle generated before the ENA parent_study compatibility fix.
+# Simulate a bundle generated before the ENA and resume-CLI compatibility fixes.
 sed -i '/^ena_metadata_fields:/d' "$submitted_run/params.yml"
+sed -i 's/^resume_args=(-name "smoke_submit")$/resume_args=()/' "$submitted_run/run.sbatch"
+sed -i '/    -with-report/i\    -name "smoke_submit" \\' "$submitted_run/run.sbatch"
 PATH="$fake_bin:$PATH" HOME="$test_home" NEXTFLOW_BIN=/bin/true \
   "$repo_root/bin/codespringflow" resume smoke_submit
 test "$(wc -l < "$submitted_run/job_history.txt")" -eq 2
 grep -Fq "ena_metadata_fields: 'run_accession," "$submitted_run/params.yml"
 ! grep -Fq "parent_study" "$submitted_run/params.yml"
 test "$(grep -c '^ena_metadata_fields:' "$submitted_run/params.yml")" -eq 1
+test -f "$submitted_run/run.sbatch.pre-resume-cli-fix"
+grep -Fq 'resume_args=(-name "smoke_submit")' "$submitted_run/run.sbatch"
+! grep -Fq '    -name "smoke_submit"' "$submitted_run/run.sbatch"
 
 echo "CodeSpringApp FetchNGS bundle smoke tests passed."

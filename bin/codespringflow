@@ -165,7 +165,7 @@ if [[ ! -x "\$NEXTFLOW_BIN" ]]; then
     exit 1
 fi
 
-resume_args=()
+resume_args=(-name "$nf_run_name")
 if [[ "\${CODESPRINGFLOW_RESUME:-false}" == "true" ]]; then
     resume_args=(-resume)
 fi
@@ -178,7 +178,6 @@ cd "\$RUN_DIR"
     -c "$CONFIG_FILE" \
     -params-file "\$RUN_DIR/params.yml" \
     -work-dir "\$WORK_DIR" \
-    -name "$nf_run_name" \
     -with-report "\$RUN_DIR/logs/report-\${SLURM_JOB_ID}.html" \
     -with-timeline "\$RUN_DIR/logs/timeline-\${SLURM_JOB_ID}.html" \
     -with-trace "\$RUN_DIR/logs/trace-\${SLURM_JOB_ID}.txt" \
@@ -220,6 +219,45 @@ ensure_compatible_ena_metadata_fields() {
     printf "ena_metadata_fields: '%s'\n" "$DEFAULT_ENA_METADATA_FIELDS" >> "$params_file"
 }
 
+ensure_compatible_resume_cli() {
+    local run_name="$1"
+    local nf_run_name
+    local run_script
+    local backup_script
+    local migrated_script
+
+    nf_run_name="${run_name//[^A-Za-z0-9_]/_}"
+    run_script="$(run_dir_for "$run_name")/run.sbatch"
+    [[ -f "$run_script" ]] || die "No generated run exists for '$run_name'."
+
+    # Older CodeSpringApp bundles always supplied -name and then added -resume.
+    # Nextflow rejects that combination because the run name already exists.
+    if grep -Fq 'resume_args=()' "$run_script" && grep -Fq "    -name \"$nf_run_name\"" "$run_script"; then
+        backup_script="${run_script}.pre-resume-cli-fix"
+        [[ -e "$backup_script" ]] || cp -p -- "$run_script" "$backup_script"
+        migrated_script="$(mktemp "${run_script}.migrate.XXXXXX")"
+        if ! awk -v run_name="$nf_run_name" '
+            $0 == "resume_args=()" {
+                print "resume_args=(-name \"" run_name "\")"
+                next
+            }
+            index($0, "    -name \"" run_name "\"") == 1 { next }
+            { print }
+        ' "$run_script" > "$migrated_script"; then
+            rm -f -- "$migrated_script"
+            die "Could not migrate the resume command for '$run_name'."
+        fi
+        chmod 0750 "$migrated_script"
+        mv -- "$migrated_script" "$run_script"
+    fi
+
+    grep -Fq "resume_args=(-name \"$nf_run_name\")" "$run_script" ||
+        die "The generated run script has an unsupported resume format for '$run_name'."
+    if grep -Fq "    -name \"$nf_run_name\"" "$run_script"; then
+        die "The generated run script still contains a conflicting fixed Nextflow run name for '$run_name'."
+    fi
+}
+
 submit_run() {
     local run_name="$1"
     local resume_mode="$2"
@@ -230,6 +268,7 @@ submit_run() {
     run_dir="$(run_dir_for "$run_name")"
     [[ -f "$run_dir/run.sbatch" ]] || die "No generated run exists for '$run_name'."
     if [[ "$resume_mode" == "true" ]]; then
+        ensure_compatible_resume_cli "$run_name"
         ensure_compatible_ena_metadata_fields "$run_name"
     fi
     require_command sbatch
