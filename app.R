@@ -11610,10 +11610,10 @@ select.form-control {
   line-height:1.2;
 }
 
-html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value="FetchNGS"]),
-html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value="FetchNGS Outputs"]),
-html.codespring-tabs-initializing .tab-content > .tab-pane[data-value="FetchNGS"],
-html.codespring-tabs-initializing .tab-content > .tab-pane[data-value="FetchNGS Outputs"] {
+html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value='FetchNGS']),
+html.codespring-tabs-initializing #web_main_tabs > li:has(> a[data-value='FetchNGS Outputs']),
+html.codespring-tabs-initializing .tab-content > .tab-pane[data-value='FetchNGS'],
+html.codespring-tabs-initializing .tab-content > .tab-pane[data-value='FetchNGS Outputs'] {
   display:none !important;
 }
 
