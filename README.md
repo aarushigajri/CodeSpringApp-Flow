@@ -1,6 +1,8 @@
 # CodeSpringApp
 
-CodeSpringApp is a Shiny-based control center for fetching public sequencing data and for running, monitoring, and reviewing CodeSpringLab RNA-seq, ATAC-seq, CUT&RUN, and ChIP-seq projects from one server port. It replaces notebook prompts with a button-driven interface for FetchNGS, project setup, design-matrix editing, SLURM submission, progress tracking, logs, methods, and assay-specific Results Explorers.
+CodeSpringApp is a Shiny-based control center for running, monitoring, and reviewing CodeSpringLab RNA-seq, ATAC-seq, CUT&RUN, and ChIP-seq projects from one server port. It replaces notebook prompts with a button-driven interface for project setup, design-matrix editing, SLURM submission, progress tracking, logs, methods, and assay-specific Results Explorers.
+
+CodeSpringApp-Flow extends the original application with standalone nf-core workflows for retrieving public sequencing data through FetchNGS and preparing, validating, submitting, monitoring, and reviewing nf-core Sarek WGS analyses. These additions are isolated from the original CodeSpringLab project workflows so the existing application behavior and documentation remain available.
 
 It is designed for shared HPC environments where analyses should continue running after the browser or app is closed.
 
@@ -187,6 +189,91 @@ export CSL_FETCHNGS_RUNTIME_ROOT=/path/to/private/fetchngs_runtime
 ./run_codespringweb.sh
 ```
 
+## Sarek WGS
+
+Choose **Sarek WGS** from the main **Analysis type** dropdown to open the
+standalone nf-core Sarek workspace. It supports germline, tumor-only, matched
+tumor-normal, and annotation-only project preparation. The input discovery
+layer accepts paired FASTQs, BAM/CRAM alignment files, and VCF/BCF variant
+files, allowing a project to begin from the processing stage where its data
+currently exists.
+
+The Sarek workspace is divided into three views:
+
+- **Prepare Job** discovers input files, builds an editable manifest, validates
+  the proposed analysis, and presents the final submission review.
+- **Active Status** shows the scheduler and Nextflow state of a selected active
+  run without requiring the browser to remain open for execution.
+- **View Results** discovers earlier run directories and lists the result files
+  available for review.
+
+### Manifest discovery and confirmation
+
+The app creates a best-guess manifest from the selected server files. It infers
+patient and sample identifiers, FASTQ read pairs and lanes, file format, sample
+role, index paths, and BAM processing evidence where possible. The manifest is
+displayed in a searchable editor so users can correct the inferred values.
+Automatic inference is never treated as final confirmation.
+
+Validation checks include:
+
+- readable and non-duplicated input paths;
+- exactly one R1 and one R2 for every included FASTQ sample lane;
+- consistent roles, formats, and processing states within each sample;
+- readable BAM/CRAM indexes and a known alignment processing state;
+- germline, tumor-only, or matched tumor-normal role requirements;
+- same-patient tumor-normal pairing for matched analyses;
+- VCF/BCF-only input for annotation-only analyses; and
+- absolute result and Nextflow work paths.
+
+Errors block confirmation. Warnings remain visible for conditions that require
+review but are not always fatal. After validation, the user must explicitly
+corroborate the manifest and acknowledge the final run summary before the
+submission button is enabled. Editing the manifest or analysis settings
+invalidates the earlier confirmation.
+
+### Lightweight BAM inspection
+
+For BAM input, the app can use the bundled `bin/sarek-samtools` launcher to run
+read-only `samtools quickcheck`, header inspection, and `idxstats`. These checks
+look for an accessible index, read-group sample names, coordinate sorting,
+sequence-dictionary evidence, and program records associated with duplicate
+marking or base-quality recalibration. The inspector does not modify the BAM,
+scan every alignment, or call variants. Its recommendations must still be
+reviewed and applied by the user.
+
+On the BSR cluster, the launcher loads `SAMtools/1.23.1-GCC-15.2.0` after the
+site module prerequisite. Administrators can point the app to another launcher
+with `CSL_SAREK_SAMTOOLS`.
+
+### Storage, conversion, and submission
+
+New Sarek runs default to user-owned locations:
+
+```text
+~/csl_results/sarek/<run-name>/
+~/csl_work/sarek/<run-name>/
+```
+
+The results directory contains durable workflow outputs and the `.codespring`
+run record. The work directory contains large Nextflow intermediate files used
+for task execution and `-resume`; it is not a second results directory. Users
+with limited home quotas should use the folder browser to select approved
+high-capacity storage.
+
+After confirmation, the manifest is converted into the samplesheet and
+parameters expected by nf-core Sarek. Internal JSON and other machine-readable
+files are retained under `.codespring` for reproducibility but are replaced in
+the normal interface by a readable run review. Submission launches a Slurm
+controller job, records the scheduler response, and leaves the workflow running
+independently of the browser session.
+
+The currently validated Sarek environment uses nf-core Sarek `3.9.0`, Nextflow
+`25.10.2`, the `singularity` profile, and the site Sarek configuration supplied
+by CodeSpringFlow. Site administrators can override the user storage, results,
+work, launcher, and samtools locations through the documented `CSL_SAREK_*`
+environment variables.
+
 ## Run On The Server
 
 Use the launcher script. It checks required packages, finds an open server port, starts Shiny, and prints the exact SSH tunnel command to run from your laptop.
@@ -227,6 +314,7 @@ Example launcher output. The port in your terminal may differ if the default por
 ## What It Does
 
 - Retrieves public sequencing data through a standalone nf-core/fetchngs SLURM workflow.
+- Prepares, validates, submits, monitors, and reviews standalone nf-core/sarek WGS workflows.
 
 ### Single-cell RNA-seq
 

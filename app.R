@@ -352,15 +352,24 @@ PROJECT_CONFIG_ROOT <- file.path(APP_HOME, "project_configs")
 DEFAULT_RESULTS_ROOT <- normalizePath(file.path(CURRENT_HOME, "csl_results"), winslash = "/", mustWork = FALSE)
 APP_ROOT <- normalizePath(Sys.getenv("CSL_WEB_APP_ROOT", unset = getwd()), winslash = "/", mustWork = FALSE)
 SAREK_MANIFEST_HELPERS <- file.path(APP_ROOT, "R", "sarek_manifest.R")
+SAREK_BAM_INSPECTOR_HELPERS <- file.path(APP_ROOT, "R", "sarek_bam_inspector.R")
+SAREK_NEXTFLOW_INPUT_HELPERS <- file.path(APP_ROOT, "R", "sarek_nextflow_input.R")
+SAREK_SUBMISSION_HELPERS <- file.path(APP_ROOT, "R", "sarek_submission.R")
 SAREK_MANIFEST_SHINY <- file.path(APP_ROOT, "R", "sarek_manifest_shiny.R")
 if (!file.exists(SAREK_MANIFEST_HELPERS)) stop("Sarek manifest helpers are missing: ", SAREK_MANIFEST_HELPERS)
+if (!file.exists(SAREK_BAM_INSPECTOR_HELPERS)) stop("Sarek BAM inspector helpers are missing: ", SAREK_BAM_INSPECTOR_HELPERS)
+if (!file.exists(SAREK_NEXTFLOW_INPUT_HELPERS)) stop("Sarek Nextflow input helpers are missing: ", SAREK_NEXTFLOW_INPUT_HELPERS)
+if (!file.exists(SAREK_SUBMISSION_HELPERS)) stop("Sarek submission helpers are missing: ", SAREK_SUBMISSION_HELPERS)
 if (!file.exists(SAREK_MANIFEST_SHINY)) stop("Sarek Shiny module is missing: ", SAREK_MANIFEST_SHINY)
 source(SAREK_MANIFEST_HELPERS, local = FALSE)
+source(SAREK_BAM_INSPECTOR_HELPERS, local = FALSE)
+source(SAREK_NEXTFLOW_INPUT_HELPERS, local = FALSE)
+source(SAREK_SUBMISSION_HELPERS, local = FALSE)
 source(SAREK_MANIFEST_SHINY, local = FALSE)
 SAREK_USER_STORAGE_ROOT <- normalizePath(
   Sys.getenv(
     "CSL_USER_STORAGE_ROOT",
-    unset = file.path("/grid/bsr/data/data", CURRENT_USER)
+    unset = CURRENT_HOME
   ),
   winslash = "/",
   mustWork = FALSE
@@ -368,7 +377,7 @@ SAREK_USER_STORAGE_ROOT <- normalizePath(
 SAREK_RESULTS_ROOT <- normalizePath(
   Sys.getenv(
     "CSL_SAREK_RESULTS_ROOT",
-    unset = file.path(DEFAULT_RESULTS_ROOT, "sarek")
+    unset = file.path(SAREK_USER_STORAGE_ROOT, "csl_results", "sarek")
   ),
   winslash = "/",
   mustWork = FALSE
@@ -381,6 +390,50 @@ SAREK_WORK_ROOT <- normalizePath(
   winslash = "/",
   mustWork = FALSE
 )
+SAREK_BACKEND_ROOT <- normalizePath(
+  Sys.getenv(
+    "CSL_SAREK_BACKEND_ROOT",
+    unset = "/grid/bsr/data/data/bsr_readable_data/CodeSpringFlow"
+  ),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_LAUNCHER <- normalizePath(
+  Sys.getenv("CSL_SAREK_LAUNCHER", unset = file.path(SAREK_BACKEND_ROOT, "bin", "nextflow-sarek")),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_CLUSTER_CONFIG <- normalizePath(
+  Sys.getenv(
+    "CSL_SAREK_CONFIG",
+    unset = file.path(SAREK_BACKEND_ROOT, "pipelines", "sarek", "conf", "cshl_sarek.config")
+  ),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_NXF_HOME <- normalizePath(
+  Sys.getenv("CSL_SAREK_NXF_HOME", unset = file.path(SAREK_BACKEND_ROOT, "runtime", "nextflow", "sarek")),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_SINGULARITY_CACHE <- normalizePath(
+  Sys.getenv("CSL_SAREK_SINGULARITY_CACHE", unset = file.path(SAREK_BACKEND_ROOT, "cache", "singularity")),
+  winslash = "/",
+  mustWork = FALSE
+)
+SAREK_NEXTFLOW_VERSION <- Sys.getenv("CSL_SAREK_NEXTFLOW_VERSION", unset = "25.10.2")
+SAREK_CONTROLLER_QUEUE <- Sys.getenv("CSL_SAREK_QUEUE", unset = "cpuq")
+SAREK_CONTROLLER_TIME <- Sys.getenv("CSL_SAREK_CONTROLLER_TIME", unset = "2-00:00:00")
+SAREK_SAMTOOLS <- Sys.getenv(
+  "CSL_SAREK_SAMTOOLS",
+  unset = file.path(APP_ROOT, "bin", "sarek-samtools")
+)
+SAREK_MAX_AUTO_BAM_INSPECTIONS <- suppressWarnings(as.integer(
+  Sys.getenv("CSL_SAREK_MAX_AUTO_BAM_INSPECTIONS", unset = "20")
+))
+if (!is.finite(SAREK_MAX_AUTO_BAM_INSPECTIONS) || SAREK_MAX_AUTO_BAM_INSPECTIONS < 0L) {
+  stop("CSL_SAREK_MAX_AUTO_BAM_INSPECTIONS must be a non-negative integer.")
+}
 FETCHNGS_RESULTS_ROOT <- normalizePath(
   Sys.getenv("CSL_FETCHNGS_RESULTS_ROOT", unset = file.path(DEFAULT_RESULTS_ROOT, "fetchngs")),
   winslash = "/",
@@ -11756,7 +11809,7 @@ ui <- fluidPage(
   div(class = "csl-header",
       div(class = "brand-lockup",
           if (file.exists(LOGO_PATH)) tags$img(src = file.path("codespring_logo", basename(LOGO_PATH))),
-          div(h2("CodeSpringApp"), div(class = "muted", "Developed by James Rouse, Rad Utama and Alex Dobin (Bioinformatics Shared Resource)"))
+          div(h2("CodeSpringApp"), div(class = "muted", "Developed by James Rouse, Rad Utama, Alex Dobin, and Aarushi Gajri (Bioinformatics Shared Resource)"))
       ),
       if (file.exists(LOGO_CSL_PATH)) tags$img(src = file.path("csl_logo", basename(LOGO_CSL_PATH)), style = "max-height:120px;max-width:300px;background:white;border-radius:8px;padding:10px;object-fit:contain;")
   ),
@@ -11998,7 +12051,31 @@ server <- function(input, output, session) {
     "sarek_manifest",
     default_results_root = SAREK_RESULTS_ROOT,
     default_work_root = SAREK_WORK_ROOT,
-    created_by = CURRENT_USER
+    created_by = CURRENT_USER,
+    samtools = SAREK_SAMTOOLS,
+    max_auto_bam_inspections = SAREK_MAX_AUTO_BAM_INSPECTIONS,
+    submit_handler = function(manifest, nextflow_input) {
+      sarek_submit_run(
+        manifest = manifest,
+        nextflow_input = nextflow_input,
+        launcher = SAREK_LAUNCHER,
+        config = SAREK_CLUSTER_CONFIG,
+        nxf_home = SAREK_NXF_HOME,
+        singularity_cache = SAREK_SINGULARITY_CACHE,
+        queue = SAREK_CONTROLLER_QUEUE,
+        controller_time = SAREK_CONTROLLER_TIME,
+        nextflow_version = SAREK_NEXTFLOW_VERSION
+      )
+    },
+    browse_handler = function(target, mode = "dir", current = "", input_type = "text", append = FALSE) {
+      open_server_browser(
+        target = target,
+        mode = mode,
+        current = current,
+        input_type = input_type,
+        append = append
+      )
+    }
   )
   # scRNA inputs live in a project-local manifest, separate from the bulk-RNA
   # design state. Keeping it reactive makes the same editable-table workflow
@@ -12066,7 +12143,10 @@ server <- function(input, output, session) {
   progress_refresh_busy <- reactiveVal(FALSE)
   cutrun_normalization_choice <- reactiveVal("spikein")
   genome_browser_mode_state <- reactiveVal("")
-  path_browser <- reactiveValues(target = "", mode = "dir", path = CURRENT_HOME, selected_file = "", message = "")
+  path_browser <- reactiveValues(
+    target = "", mode = "dir", path = CURRENT_HOME, selected_file = "", message = "",
+    input_type = "text", append = FALSE, prior_value = ""
+  )
   project_selection <- reactiveValues(rna = "", scrna = "", cutrun = "", atac = "", chip = "")
   new_fastq_folders <- reactiveVal(character(0))
 
@@ -12251,9 +12331,12 @@ server <- function(input, output, session) {
     }
   }
 
-  open_server_browser <- function(target, mode = "dir", current = "") {
+  open_server_browser <- function(target, mode = "dir", current = "", input_type = "text", append = FALSE) {
     path_browser$target <- target
     path_browser$mode <- mode
+    path_browser$input_type <- input_type
+    path_browser$append <- isTRUE(append)
+    path_browser$prior_value <- as.character(current %||% "")
     path_browser$path <- normalizePath(browser_start_path(current, mode), winslash = "/", mustWork = FALSE)
     path_browser$selected_file <- if (identical(mode, "file") && file.exists(path.expand(current)) && !dir.exists(path.expand(current))) {
       normalizePath(path.expand(current), winslash = "/", mustWork = FALSE)
@@ -12482,6 +12565,19 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$browser_use_current, {
+    update_browser_target <- function(value) {
+      if (identical(path_browser$input_type, "textarea")) {
+        prior <- trimws(as.character(path_browser$prior_value %||% ""))
+        if (isTRUE(path_browser$append) && nzchar(prior)) {
+          existing <- trimws(unlist(strsplit(prior, "\n", fixed = TRUE), use.names = FALSE))
+          existing <- existing[nzchar(existing)]
+          value <- paste(unique(c(existing, value)), collapse = "\n")
+        }
+        updateTextAreaInput(session, path_browser$target, value = value)
+      } else {
+        updateTextInput(session, path_browser$target, value = value)
+      }
+    }
     if (identical(path_browser$mode, "file")) {
       value <- input$browser_file_choice %||% path_browser$selected_file %||% ""
       value <- path.expand(trimws(value))
@@ -12490,7 +12586,7 @@ server <- function(input, output, session) {
         return()
       }
       value <- normalizePath(value, winslash = "/", mustWork = FALSE)
-      updateTextInput(session, path_browser$target, value = value)
+      update_browser_target(value)
       removeModal()
       return()
     }
@@ -12499,7 +12595,7 @@ server <- function(input, output, session) {
       path_browser$message <- paste("The app cannot use this folder:", value)
       return()
     }
-    updateTextInput(session, path_browser$target, value = value)
+    update_browser_target(value)
     removeModal()
   })
 
