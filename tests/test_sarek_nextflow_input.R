@@ -85,7 +85,6 @@ assert_true(fastq_input$samplesheet$sex[[1]] == "NA", "Missing sex should be rep
 assert_true(fastq_input$samplesheet$status[[1]] == 0L, "Germline status should map to 0.")
 assert_true(fastq_input$samplesheet$fastq_1[[1]] == fastq_r1, "R1 path was not assigned to fastq_1.")
 assert_true(fastq_input$samplesheet$fastq_2[[1]] == fastq_r2, "R2 path was not assigned to fastq_2.")
-
 samplesheet_path <- file.path(test_root, "generated", "samplesheet.csv")
 sarek_write_nextflow_samplesheet(fastq_input, samplesheet_path)
 written <- utils::read.csv(samplesheet_path, stringsAsFactors = FALSE, check.names = FALSE, na.strings = character(0))

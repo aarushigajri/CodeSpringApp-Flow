@@ -18,13 +18,15 @@ assert_true <- function(value, message) {
 
 app_lines <- readLines(file.path(repo_root, "app.R"), warn = FALSE)
 nextflow_source_line <- grep("source(SAREK_NEXTFLOW_INPUT_HELPERS, local = FALSE)", app_lines, fixed = TRUE)
+bam_inspector_source_line <- grep("source(SAREK_BAM_INSPECTOR_HELPERS, local = FALSE)", app_lines, fixed = TRUE)
 submission_source_line <- grep("source(SAREK_SUBMISSION_HELPERS, local = FALSE)", app_lines, fixed = TRUE)
 shiny_source_line <- grep("source(SAREK_MANIFEST_SHINY, local = FALSE)", app_lines, fixed = TRUE)
 assert_true(length(nextflow_source_line) == 1L, "app.R does not source the Sarek Nextflow input helpers.")
 assert_true(
-  length(submission_source_line) == 1L && length(shiny_source_line) == 1L &&
+  length(bam_inspector_source_line) == 1L && length(submission_source_line) == 1L && length(shiny_source_line) == 1L &&
+    bam_inspector_source_line[[1]] < nextflow_source_line[[1]] &&
     nextflow_source_line[[1]] < submission_source_line[[1]] && submission_source_line[[1]] < shiny_source_line[[1]],
-  "app.R must source the converter and submission helpers before the Sarek Shiny module."
+  "app.R must source the BAM inspector, converter, and submission helpers before the Sarek Shiny module."
 )
 assert_true(
   any(grepl("browse_handler = function", app_lines, fixed = TRUE)) &&
@@ -80,6 +82,22 @@ assert_true(
 assert_true(NROW(sample_display) == 1L && NCOL(sample_display) == 12L, "The one-sample display table collapsed during rendering.")
 assert_true(startsWith(sarek_fastq_pairing_status(table[1, , drop = FALSE]), "Needs attention:"), "A missing FASTQ mate was not surfaced before validation.")
 assert_true(sarek_recommend_analysis_mode(table) == "tumor_only", "Tumor FASTQs did not recommend tumor-only mode.")
+
+bam <- file.path(test_root, "patient_T.recalibrated.bam")
+bai <- paste0(bam, ".bai")
+invisible(file.create(bam, bai))
+bam_table <- sarek_build_discovery_table(bam, allowed_roots = test_root)
+bam_display <- sarek_sample_review_display_table(bam_table)
+assert_true(
+  identical(bam_display$Index[[1]], paste0("Detected: ", basename(bai))),
+  "The sample-facing table does not expose the detected BAM index."
+)
+assert_true(bam_display$`BAM inspection`[[1]] == "Not run", "An uninspected BAM has the wrong frontend status.")
+bam_validation <- sarek_validate_confirmation_table(bam_table)
+assert_true(
+  !isTRUE(bam_validation$valid) && any(grepl("processing state", bam_validation$errors, ignore.case = TRUE)),
+  "An unknown BAM processing state was not blocked during validation."
+)
 
 sample_key <- sarek_sample_key(table$patient_id[[1]], table$sample_id[[1]])
 sample_updated <- sarek_apply_sample_update(
@@ -153,6 +171,7 @@ assert_true(grepl("sarek-confirmation-table", ui_text, fixed = TRUE), "Manifest 
 assert_true(grepl("sarek-status-banner", ui_text, fixed = TRUE), "Manifest status is missing its visible banner style.")
 assert_true(grepl("sarek-review-checklist", ui_text, fixed = TRUE), "The pre-validation checklist is missing.")
 assert_true(grepl("sarek_test-sample_editor", ui_text, fixed = TRUE), "The sample-level editor output is missing.")
+assert_true(grepl("sarek_test-bam_inspection", ui_text, fixed = TRUE), "The BAM inspection panel output is missing.")
 assert_true(grepl("sarek_test-file_editor", ui_text, fixed = TRUE), "The FASTQ lane/read correction output is missing.")
 assert_true(grepl("Field definitions and rules", ui_text, fixed = TRUE), "The manifest field guide is missing.")
 assert_true(grepl("Results root", ui_text, fixed = TRUE) && grepl("Work root", ui_text, fixed = TRUE), "Storage fields are not explained.")
@@ -174,6 +193,7 @@ assert_true(grepl("sarek_test-browse_input_folder", ui_text, fixed = TRUE), "Inp
 assert_true(grepl("sarek_test-browse_results_root", ui_text, fixed = TRUE), "Results-root browsing is missing.")
 assert_true(grepl("sarek_test-browse_work_root", ui_text, fixed = TRUE), "Work-root browsing is missing.")
 assert_true(grepl("sarek-file-details", ui_text, fixed = TRUE), "Selected-file details do not have an isolated layout container.")
+assert_true(grepl("Show input and index paths", ui_text, fixed = TRUE), "The selected-file section does not advertise index visibility.")
 assert_true(!grepl("JSON", ui_text, fixed = TRUE), "Developer-facing JSON remains visible in the end-user UI.")
 assert_true(!grepl("download_manifest", ui_text, fixed = TRUE), "The end-user JSON download remains visible.")
 nextflow_position <- regexpr("sarek_test-nextflow_input", ui_text, fixed = TRUE)[[1]]
@@ -223,6 +243,23 @@ shiny::testServer(
     allowed_work_roots = test_root,
     max_files = 10L,
     run_refresh_ms = 60000L,
+    bam_inspector = function(path, index, samtools) {
+      sarek_bam_inspection_result(
+        path = path,
+        index = index,
+        status = "passed",
+        summary = "Inspection passed; suggested processing state: recalibrated (high confidence).",
+        quickcheck_ok = TRUE,
+        index_ok = TRUE,
+        sample_ids = "TUMOR_01",
+        sort_order = "coordinate",
+        grch38_compatible = TRUE,
+        reference_summary = "chr1 length matches GRCh38 and the contig naming matches GATK.GRCh38.",
+        recommendation = "recalibrated",
+        confidence = "high",
+        evidence = c("samtools quickcheck passed.", "Applied BQSR was detected.")
+      )
+    },
     browse_handler = function(target, mode, current, input_type, append) {
       browse_capture$count <- browse_capture$count + 1L
       browse_capture$target <- target
@@ -360,6 +397,41 @@ shiny::testServer(
     session$setInputs(preset = "changed_after_confirmation")
     session$flushReact()
     assert_true(is.null(confirmed_manifest()), "Changing settings should invalidate the prior confirmation.")
+
+    session$setInputs(
+      paths = bam,
+      analysis_mode = "tumor_only",
+      preset = "core"
+    )
+    session$setInputs(discover = 2L)
+    session$flushReact()
+    inspected_bam <- confirmation_state()
+    assert_true(NROW(inspected_bam) == 1L, "BAM discovery did not produce one input row.")
+    assert_true(inspected_bam$inspection_status[[1]] == "passed", "Automatic BAM inspection did not run during discovery.")
+    bam_table_html <- paste(as.character(output$sample_review_table), collapse = "\n")
+    assert_true(grepl(basename(bai), bam_table_html, fixed = TRUE), "The main sample table does not show the detected BAM index.")
+    bam_panel_html <- paste(as.character(output$bam_inspection), collapse = "\n")
+    assert_true(grepl("TUMOR_01", bam_panel_html, fixed = TRUE), "The BAM inspection panel does not show the header sample ID.")
+    assert_true(grepl("recalibrated", bam_panel_html, fixed = TRUE), "The BAM inspection recommendation is not visible.")
+    bam_editor_html <- paste(as.character(output$sample_editor), collapse = "\n")
+    assert_true(
+      grepl("not confirmed until you select Apply sample changes", bam_editor_html, fixed = TRUE),
+      "The UI does not explain that the BAM recommendation requires corroboration."
+    )
+    session$setInputs(
+      edit_include = TRUE,
+      edit_patient_id = inspected_bam$patient_id[[1]],
+      edit_sample_id = inspected_bam$sample_id[[1]],
+      edit_role = "tumor",
+      edit_matched_normal_id = "",
+      edit_processing_state = "recalibrated"
+    )
+    session$setInputs(apply_sample = 1L)
+    session$flushReact()
+    assert_true(
+      confirmation_state()$processing_state[[1]] == "recalibrated",
+      "The corroborated BAM processing state was not applied."
+    )
   }
 )
 
